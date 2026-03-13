@@ -12,6 +12,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
     private readonly int _remotePort;
     private readonly byte[] _sharedKey;
     private readonly TunnelCryptoPolicy _cryptoPolicy;
+    private readonly TunnelConnectionPolicy _connectionPolicy;
 
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -19,16 +20,26 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
 
     private TcpClient? _tcpClient;
     private Stream? _secureStream;
-    private CancellationTokenSource? _readLoopCts;
+    private CancellationTokenSource? _connectionCts;
     private Task? _readLoopTask;
+    private Task? _heartbeatLoopTask;
     private int _nextSessionId;
+    private long _lastIncomingUtcTicks;
+    private long _controlSendSequence;
 
-    public TunnelClientMultiplexer(string remoteHost, int remotePort, byte[] sharedKey, TunnelCryptoPolicy cryptoPolicy)
+    public TunnelClientMultiplexer(
+        string remoteHost,
+        int remotePort,
+        byte[] sharedKey,
+        TunnelCryptoPolicy cryptoPolicy,
+        TunnelConnectionPolicy connectionPolicy)
     {
         _remoteHost = remoteHost;
         _remotePort = remotePort;
         _sharedKey = sharedKey;
         _cryptoPolicy = cryptoPolicy;
+        _connectionPolicy = connectionPolicy;
+        TouchIncoming();
     }
 
     public async Task<(uint SessionId, byte ReplyCode, ChannelReader<byte[]> Reader)> OpenSessionAsync(
@@ -76,55 +87,41 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         if (_sessions.TryRemove(sessionId, out var state))
         {
             var sequence = state.TakeNextSendSequence();
-            await SendFrameAsync(
-                new ProtocolFrame(FrameType.Close, sessionId, sequence, ProtocolPayloadSerializer.SerializeClose(reasonCode)),
-                cancellationToken);
+            try
+            {
+                await SendFrameAsync(
+                    new ProtocolFrame(FrameType.Close, sessionId, sequence, ProtocolPayloadSerializer.SerializeClose(reasonCode)),
+                    cancellationToken);
+            }
+            catch
+            {
+            }
+
             state.ReaderWriter.Writer.TryComplete();
         }
     }
 
     public async ValueTask DisposeAsync()
     {
-        if (_readLoopCts is not null)
-        {
-            _readLoopCts.Cancel();
-        }
+        await HandleConnectionFaultAsync();
 
         if (_readLoopTask is not null)
         {
-            try
-            {
-                await _readLoopTask;
-            }
-            catch (OperationCanceledException)
-            {
-            }
+            try { await _readLoopTask; } catch { }
         }
 
-        foreach (var session in _sessions.Values)
+        if (_heartbeatLoopTask is not null)
         {
-                session.ReaderWriter.Writer.TryComplete();
+            try { await _heartbeatLoopTask; } catch { }
         }
 
-        _sessions.Clear();
-        _readLoopCts?.Dispose();
-        if (_secureStream is IAsyncDisposable asyncDisposable)
-        {
-            await asyncDisposable.DisposeAsync();
-        }
-        else
-        {
-            _secureStream?.Dispose();
-        }
-
-        _tcpClient?.Dispose();
         _connectLock.Dispose();
         _writeLock.Dispose();
     }
 
     private async Task EnsureConnectedAsync(CancellationToken cancellationToken)
     {
-        if (_secureStream is not null && _readLoopTask is { IsCompleted: false })
+        if (IsConnected())
         {
             return;
         }
@@ -132,30 +129,71 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         await _connectLock.WaitAsync(cancellationToken);
         try
         {
-            if (_secureStream is not null && _readLoopTask is { IsCompleted: false })
+            if (IsConnected())
             {
                 return;
             }
 
-            _tcpClient?.Dispose();
-            _tcpClient = new TcpClient();
-            await _tcpClient.ConnectAsync(_remoteHost, _remotePort, cancellationToken);
+            Exception? lastError = null;
+            for (var attempt = 1; attempt <= _connectionPolicy.ReconnectMaxAttempts; attempt++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    await ConnectOnceAsync(cancellationToken);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                    await HandleConnectionFaultAsync();
 
-            var networkStream = _tcpClient.GetStream();
-            _secureStream = await TunnelCryptoHandshake.AsClientAsync(
-                networkStream,
-                _sharedKey,
-                _cryptoPolicy,
-                cancellationToken);
+                    if (attempt == _connectionPolicy.ReconnectMaxAttempts)
+                    {
+                        break;
+                    }
 
-            _readLoopCts?.Dispose();
-            _readLoopCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _readLoopTask = Task.Run(() => ReadLoopAsync(_readLoopCts.Token), _readLoopCts.Token);
+                    var delayMs = Math.Min(
+                        _connectionPolicy.ReconnectMaxDelayMs,
+                        _connectionPolicy.ReconnectBaseDelayMs * (1 << Math.Min(attempt - 1, 6)));
+
+                    await Task.Delay(delayMs, cancellationToken);
+                }
+            }
+
+            throw new IOException($"Unable to connect tunnel after {_connectionPolicy.ReconnectMaxAttempts} attempts.", lastError);
         }
         finally
         {
             _connectLock.Release();
         }
+    }
+
+    private async Task ConnectOnceAsync(CancellationToken cancellationToken)
+    {
+        _tcpClient = new TcpClient();
+        await _tcpClient.ConnectAsync(_remoteHost, _remotePort, cancellationToken);
+
+        var networkStream = _tcpClient.GetStream();
+        _secureStream = await TunnelCryptoHandshake.AsClientAsync(
+            networkStream,
+            _sharedKey,
+            _cryptoPolicy,
+            cancellationToken);
+
+        _connectionCts = new CancellationTokenSource();
+        TouchIncoming();
+
+        _readLoopTask = Task.Run(() => ReadLoopAsync(_connectionCts.Token));
+        _heartbeatLoopTask = Task.Run(() => HeartbeatLoopAsync(_connectionCts.Token));
+    }
+
+    private bool IsConnected()
+    {
+        return _secureStream is not null
+            && _connectionCts is not null
+            && !_connectionCts.IsCancellationRequested
+            && _readLoopTask is { IsCompleted: false };
     }
 
     private async Task SendFrameAsync(ProtocolFrame frame, CancellationToken cancellationToken)
@@ -169,6 +207,11 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         try
         {
             await ProtocolFrameCodec.WriteAsync(_secureStream, frame, cancellationToken);
+        }
+        catch
+        {
+            await HandleConnectionFaultAsync();
+            throw;
         }
         finally
         {
@@ -204,6 +247,19 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                     break;
                 }
 
+                TouchIncoming();
+
+                if (frame.Value.SessionId == 0)
+                {
+                    if (frame.Value.Type == FrameType.Ping)
+                    {
+                        var sequence = (ulong)Interlocked.Increment(ref _controlSendSequence);
+                        await SendFrameAsync(new ProtocolFrame(FrameType.Pong, 0, sequence, frame.Value.Payload), cancellationToken);
+                    }
+
+                    continue;
+                }
+
                 if (!_sessions.TryGetValue(frame.Value.SessionId, out var state))
                 {
                     continue;
@@ -218,22 +274,18 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                 switch (frame.Value.Type)
                 {
                     case FrameType.Connect:
-                        if (frame.Value.Payload.Length >= 1)
-                        {
-                            state.ConnectReply.TrySetResult(frame.Value.Payload.Span[0]);
-                        }
-                        else
-                        {
-                            state.ConnectReply.TrySetResult(0x01);
-                        }
+                        state.ConnectReply.TrySetResult(frame.Value.Payload.Length >= 1 ? frame.Value.Payload.Span[0] : (byte)0x01);
                         break;
+
                     case FrameType.Data:
                         state.ReaderWriter.Writer.TryWrite(frame.Value.Payload.ToArray());
                         break;
+
                     case FrameType.Close:
                         state.ReaderWriter.Writer.TryComplete();
                         _sessions.TryRemove(frame.Value.SessionId, out _);
                         break;
+
                     case FrameType.Ping:
                         await SendSessionFrameAsync(frame.Value.SessionId, FrameType.Pong, frame.Value.Payload, cancellationToken);
                         break;
@@ -245,12 +297,70 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         }
         finally
         {
-            foreach (var (sessionId, state) in _sessions.ToArray())
+            await HandleConnectionFaultAsync();
+        }
+    }
+
+    private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
+    {
+        var interval = TimeSpan.FromSeconds(Math.Max(1, _connectionPolicy.HeartbeatIntervalSeconds));
+        var idleTimeout = TimeSpan.FromSeconds(Math.Max(5, _connectionPolicy.IdleTimeoutSeconds));
+
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
             {
-                state.ReaderWriter.Writer.TryComplete();
-                state.ConnectReply.TrySetResult(0x01);
-                _sessions.TryRemove(sessionId, out _);
+                await Task.Delay(interval, cancellationToken);
+
+                var idle = DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastIncomingUtcTicks), DateTimeKind.Utc);
+                if (idle > idleTimeout)
+                {
+                    throw new TimeoutException($"Tunnel idle timeout exceeded ({idleTimeout}).");
+                }
+
+                var seq = (ulong)Interlocked.Increment(ref _controlSendSequence);
+                await SendFrameAsync(new ProtocolFrame(FrameType.Ping, 0, seq, Array.Empty<byte>()), cancellationToken);
             }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch
+        {
+            await HandleConnectionFaultAsync();
+        }
+    }
+
+    private void TouchIncoming()
+    {
+        Interlocked.Exchange(ref _lastIncomingUtcTicks, DateTime.UtcNow.Ticks);
+    }
+
+    private async Task HandleConnectionFaultAsync()
+    {
+        _connectionCts?.Cancel();
+        _connectionCts?.Dispose();
+        _connectionCts = null;
+
+        if (_secureStream is IAsyncDisposable asyncDisposable)
+        {
+            try { await asyncDisposable.DisposeAsync(); } catch { }
+        }
+        else
+        {
+            try { _secureStream?.Dispose(); } catch { }
+        }
+
+        _secureStream = null;
+
+        try { _tcpClient?.Dispose(); } catch { }
+        _tcpClient = null;
+
+        foreach (var (sessionId, state) in _sessions.ToArray())
+        {
+            state.ReaderWriter.Writer.TryComplete();
+            state.ConnectReply.TrySetResult(0x01);
+            _sessions.TryRemove(sessionId, out _);
         }
     }
 

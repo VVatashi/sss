@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using SimpleShadowsocks.Client.Socks5;
+using SimpleShadowsocks.Client.Tunnel;
+using SimpleShadowsocks.Protocol.Crypto;
 using SimpleShadowsocks.Server.Tunnel;
 
 namespace SimpleShadowsocks.Client.Tests;
@@ -72,6 +74,53 @@ public sealed class TunnelIntegrationTests
         Assert.Equal(acceptedBefore + 1, tunnel.Server.AcceptedTunnelConnections);
     }
 
+    [Fact]
+    public async Task Socks5Client_ReconnectsTunnel_AfterServerRestart()
+    {
+        await using var echo = await StartEchoServerAsync();
+
+        var tunnelPort = AllocateUnusedPort();
+        var tunnel1 = await StartTunnelServerOnPortAsync(tunnelPort);
+        await using var socks = await StartSocksServerAsync(
+            tunnelPort,
+            new TunnelConnectionPolicy
+            {
+                HeartbeatIntervalSeconds = 1,
+                IdleTimeoutSeconds = 5,
+                ReconnectBaseDelayMs = 100,
+                ReconnectMaxDelayMs = 300,
+                ReconnectMaxAttempts = 20
+            });
+
+        await RunSingleSocksEchoRequestAsync(socks.Port, echo.Port, "phase-1");
+
+        await tunnel1.DisposeAsync();
+
+        var restartTask = Task.Run(async () =>
+        {
+            await Task.Delay(300);
+            return await StartTunnelServerOnPortAsync(tunnelPort);
+        });
+
+        var success = false;
+        for (var attempt = 0; attempt < 15; attempt++)
+        {
+            try
+            {
+                await RunSingleSocksEchoRequestAsync(socks.Port, echo.Port, "phase-2");
+                success = true;
+                break;
+            }
+            catch
+            {
+                await Task.Delay(150);
+            }
+        }
+
+        Assert.True(success, "Client did not reconnect tunnel in time.");
+        await using var tunnel2 = await restartTask;
+    }
+
     private static async Task<RunningTunnelServer> StartTunnelServerAsync()
     {
         var port = AllocateUnusedPort();
@@ -83,15 +132,55 @@ public sealed class TunnelIntegrationTests
         return new RunningTunnelServer(server, port, cts, runTask);
     }
 
-    private static async Task<RunningSocksServer> StartSocksServerAsync(int tunnelPort)
+    private static async Task<RunningTunnelServer> StartTunnelServerOnPortAsync(int port)
+    {
+        var server = new TunnelServer(IPAddress.Loopback, port);
+        var cts = new CancellationTokenSource();
+        var runTask = server.RunAsync(cts.Token);
+
+        await WaitUntilReachableAsync(port, cts.Token);
+        return new RunningTunnelServer(server, port, cts, runTask);
+    }
+
+    private static async Task<RunningSocksServer> StartSocksServerAsync(
+        int tunnelPort,
+        TunnelConnectionPolicy? connectionPolicy = null)
     {
         var port = AllocateUnusedPort();
-        var server = new Socks5Server(IPAddress.Loopback, port, "127.0.0.1", tunnelPort, "dev-shared-key");
+        var server = new Socks5Server(
+            IPAddress.Loopback,
+            port,
+            "127.0.0.1",
+            tunnelPort,
+            "dev-shared-key",
+            TunnelCryptoPolicy.Default,
+            connectionPolicy ?? TunnelConnectionPolicy.Default);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
         await WaitUntilReachableAsync(port, cts.Token);
         return new RunningSocksServer(port, cts, runTask);
+    }
+
+    private static async Task RunSingleSocksEchoRequestAsync(int socksPort, int echoPort, string message)
+    {
+        using var tcpClient = new TcpClient();
+        await tcpClient.ConnectAsync(IPAddress.Loopback, socksPort);
+        using var stream = tcpClient.GetStream();
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        var greeting = await ReadExactAsync(stream, 2);
+        Assert.Equal(new byte[] { 0x05, 0x00 }, greeting);
+
+        var connectRequest = BuildConnectRequestIPv4(IPAddress.Loopback, echoPort);
+        await stream.WriteAsync(connectRequest);
+        var connectResponse = await ReadExactAsync(stream, 10);
+        Assert.Equal((byte)0x00, connectResponse[1]);
+
+        var payload = Encoding.ASCII.GetBytes(message);
+        await stream.WriteAsync(payload);
+        var echoed = await ReadExactAsync(stream, payload.Length);
+        Assert.Equal(payload, echoed);
     }
 
     private static async Task<RunningEchoServer> StartEchoServerAsync()

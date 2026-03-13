@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <Compile Include="..\..\src\SimpleShadowsocks.Client\Socks5\Socks5Server.cs" Link="Socks5\Socks5Server.cs" />
+    <Compile Include="..\..\src\SimpleShadowsocks.Client\Tunnel\TunnelConnectionPolicy.cs" Link="Tunnel\TunnelConnectionPolicy.cs" />
     <Compile Include="..\..\src\SimpleShadowsocks.Client\Tunnel\TunnelClientMultiplexer.cs" Link="Tunnel\TunnelClientMultiplexer.cs" />
     <Compile Include="..\..\src\SimpleShadowsocks.Server\Tunnel\TunnelServer.cs" Link="Tunnel\TunnelServer.cs" />
   </ItemGroup>

@@ -22,6 +22,7 @@ public sealed class Socks5Server
     private readonly int _remoteServerPort;
     private readonly byte[] _sharedKey;
     private readonly TunnelCryptoPolicy _cryptoPolicy;
+    private readonly TunnelConnectionPolicy _connectionPolicy;
     private TunnelClientMultiplexer? _multiplexer;
 
     public Socks5Server(IPAddress listenAddress, int port)
@@ -29,6 +30,7 @@ public sealed class Socks5Server
         _listener = new TcpListener(listenAddress, port);
         _sharedKey = PreSharedKey.Derive32Bytes("dev-shared-key");
         _cryptoPolicy = TunnelCryptoPolicy.Default;
+        _connectionPolicy = TunnelConnectionPolicy.Default;
     }
 
     public Socks5Server(
@@ -37,13 +39,15 @@ public sealed class Socks5Server
         string remoteServerHost,
         int remoteServerPort,
         string sharedKey,
-        TunnelCryptoPolicy? cryptoPolicy = null)
+        TunnelCryptoPolicy? cryptoPolicy = null,
+        TunnelConnectionPolicy? connectionPolicy = null)
     {
         _listener = new TcpListener(listenAddress, port);
         _remoteServerHost = remoteServerHost;
         _remoteServerPort = remoteServerPort;
         _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
         _cryptoPolicy = cryptoPolicy ?? TunnelCryptoPolicy.Default;
+        _connectionPolicy = connectionPolicy ?? TunnelConnectionPolicy.Default;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -51,7 +55,7 @@ public sealed class Socks5Server
         _listener.Start();
         _multiplexer = string.IsNullOrWhiteSpace(_remoteServerHost)
             ? null
-            : new TunnelClientMultiplexer(_remoteServerHost, _remoteServerPort, _sharedKey, _cryptoPolicy);
+            : new TunnelClientMultiplexer(_remoteServerHost, _remoteServerPort, _sharedKey, _cryptoPolicy, _connectionPolicy);
 
         try
         {

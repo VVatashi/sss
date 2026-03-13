@@ -32,6 +32,13 @@ dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
 - `HandshakeMaxClockSkewSeconds` - максимально допустимое расхождение времени при handshake.
 - `ReplayWindowSeconds` - окно хранения идентификаторов handshake для защиты от повторов.
 
+Параметры connection policy (в `appsettings.json` клиента):
+- `HeartbeatIntervalSeconds` - интервал heartbeat (`Ping`) по туннелю.
+- `IdleTimeoutSeconds` - максимальный простой без входящих кадров до принудительного разрыва туннеля.
+- `ReconnectBaseDelayMs` - базовая задержка reconnect.
+- `ReconnectMaxDelayMs` - верхняя граница задержки reconnect.
+- `ReconnectMaxAttempts` - число попыток reconnect перед ошибкой.
+
 ### 3) Запуск
 
 Сначала сервер туннеля:
@@ -75,6 +82,8 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - передача трафика через туннель `Client <-> Server`
 - мультиплексирование нескольких `sessionId` в одном TCP-туннеле
 - ordering/replay policy на уровне прикладных кадров через монотонный `Sequence` per session
+- heartbeat/idle timeout: клиент отправляет `Ping`, контролирует отсутствие входящего трафика и сбрасывает зависшее туннельное соединение
+- reconnect policy: повторные подключения с экспоненциальной задержкой в пределах настроек policy
 
 - Поточное шифрование туннеля:
 - алгоритм `ChaCha20-Poly1305 (AEAD)` (BouncyCastle)
@@ -95,7 +104,8 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - Тесты:
 - unit + integration тесты SOCKS5, протокола и туннеля
 - есть проверка multiplexing: две сессии через один туннель
-- текущий набор: `14` тестов, проходят
+- есть проверка reconnect после перезапуска tunnel-сервера
+- текущий набор: `15` тестов, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
 - `bin/<ProjectName>/...`
@@ -128,10 +138,11 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 
 - Нет ротации ключей.
 - При нарушении sequence policy сессия закрывается без механизма selective recovery/retransmit.
+- Reconnect не восстанавливает уже открытые SOCKS5-сессии: активные сессии закрываются и клиентские приложения должны открыть новое соединение.
 
 ## Следующие шаги
 
-1. Добавить heartbeat/idle timeout и reconnect policy.
-2. Добавить ротацию pre-shared key и процедуру key update.
-3. Добавить backpressure/лимиты на число сессий и буферов в multiplexer.
-4. Добавить метрики по sequence violations и отказам сессий.
+1. Добавить ротацию pre-shared key и процедуру key update.
+2. Добавить backpressure/лимиты на число сессий и буферов в multiplexer.
+3. Добавить метрики по sequence violations и отказам сессий.
+4. Добавить persist replay-cache (или distributed replay-cache) для multi-instance server deployment.

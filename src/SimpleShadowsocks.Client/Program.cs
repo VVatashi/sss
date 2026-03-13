@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text.Json;
 using SimpleShadowsocks.Client.Socks5;
+using SimpleShadowsocks.Client.Tunnel;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
 
@@ -13,6 +14,14 @@ var cryptoPolicy = new TunnelCryptoPolicy
 {
     HandshakeMaxClockSkewSeconds = config.HandshakeMaxClockSkewSeconds,
     ReplayWindowSeconds = config.ReplayWindowSeconds
+};
+var connectionPolicy = new TunnelConnectionPolicy
+{
+    HeartbeatIntervalSeconds = config.HeartbeatIntervalSeconds,
+    IdleTimeoutSeconds = config.IdleTimeoutSeconds,
+    ReconnectBaseDelayMs = config.ReconnectBaseDelayMs,
+    ReconnectMaxDelayMs = config.ReconnectMaxDelayMs,
+    ReconnectMaxAttempts = config.ReconnectMaxAttempts
 };
 
 if (args.Length > 0 && int.TryParse(args[0], out var parsedPort))
@@ -48,7 +57,14 @@ Console.WriteLine($"Tunnel server: {remoteHost}:{remotePort}");
 Console.WriteLine($"Protocol version: {ProtocolConstants.Version}");
 Console.WriteLine("Press Ctrl+C to stop.");
 
-var server = new Socks5Server(IPAddress.Loopback, listenPort, remoteHost, remotePort, sharedKey, cryptoPolicy);
+var server = new Socks5Server(
+    IPAddress.Loopback,
+    listenPort,
+    remoteHost,
+    remotePort,
+    sharedKey,
+    cryptoPolicy,
+    connectionPolicy);
 await server.RunAsync(cts.Token);
 
 internal sealed class ClientConfig
@@ -59,6 +75,11 @@ internal sealed class ClientConfig
     public string SharedKey { get; init; } = "dev-shared-key";
     public int HandshakeMaxClockSkewSeconds { get; init; } = 60;
     public int ReplayWindowSeconds { get; init; } = 300;
+    public int HeartbeatIntervalSeconds { get; init; } = 10;
+    public int IdleTimeoutSeconds { get; init; } = 45;
+    public int ReconnectBaseDelayMs { get; init; } = 200;
+    public int ReconnectMaxDelayMs { get; init; } = 2000;
+    public int ReconnectMaxAttempts { get; init; } = 12;
 
     public static ClientConfig Load()
     {
