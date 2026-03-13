@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using SimpleShadowsocks.Protocol;
+using SimpleShadowsocks.Protocol.Crypto;
 
 namespace SimpleShadowsocks.Client.Socks5;
 
@@ -17,17 +18,20 @@ public sealed class Socks5Server
     private readonly TcpListener _listener;
     private readonly string? _remoteServerHost;
     private readonly int _remoteServerPort;
+    private readonly byte[] _sharedKey;
 
     public Socks5Server(IPAddress listenAddress, int port)
     {
         _listener = new TcpListener(listenAddress, port);
+        _sharedKey = PreSharedKey.Derive32Bytes("dev-shared-key");
     }
 
-    public Socks5Server(IPAddress listenAddress, int port, string remoteServerHost, int remoteServerPort)
+    public Socks5Server(IPAddress listenAddress, int port, string remoteServerHost, int remoteServerPort, string sharedKey)
     {
         _listener = new TcpListener(listenAddress, port);
         _remoteServerHost = remoteServerHost;
         _remoteServerPort = remoteServerPort;
+        _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -139,17 +143,18 @@ public sealed class Socks5Server
         }
 
         using var tunnelStream = tunnelClient.GetStream();
+        await using var secureStream = await TunnelCryptoHandshake.AsClientAsync(tunnelStream, _sharedKey, cancellationToken);
         const uint sessionId = 1;
 
         var connectRequest = new ConnectRequest(ToProtocolAddressType(request.AddressType), request.Host, (ushort)request.Port);
         var connectPayload = ProtocolPayloadSerializer.SerializeConnectRequest(connectRequest);
 
         await ProtocolFrameCodec.WriteAsync(
-            tunnelStream,
+            secureStream,
             new ProtocolFrame(FrameType.Connect, sessionId, connectPayload),
             cancellationToken);
 
-        var connectReply = await ProtocolFrameCodec.ReadAsync(tunnelStream, cancellationToken);
+        var connectReply = await ProtocolFrameCodec.ReadAsync(secureStream, cancellationToken);
         if (connectReply is null || connectReply.Value.Type != FrameType.Connect || connectReply.Value.Payload.Length < 1)
         {
             Console.WriteLine($"[socks5] tunnel protocol error for {request.Host}:{request.Port}");
@@ -166,12 +171,12 @@ public sealed class Socks5Server
         }
 
         await SendReplyAsync(clientStream, replyCode: 0x00, new IPEndPoint(IPAddress.Any, 0), cancellationToken);
-        await RelayViaTunnelAsync(clientStream, tunnelStream, sessionId, cancellationToken);
+        await RelayViaTunnelAsync(clientStream, secureStream, sessionId, cancellationToken);
     }
 
     private static async Task RelayViaTunnelAsync(
         NetworkStream clientStream,
-        NetworkStream tunnelStream,
+        Stream tunnelStream,
         uint sessionId,
         CancellationToken cancellationToken)
     {

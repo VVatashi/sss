@@ -4,6 +4,12 @@
     <ProjectReference Include="..\SimpleShadowsocks.Protocol\SimpleShadowsocks.Protocol.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net9.0</TargetFramework>

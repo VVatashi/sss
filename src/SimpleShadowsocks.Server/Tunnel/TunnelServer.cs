@@ -1,16 +1,25 @@
 using System.Net;
 using System.Net.Sockets;
 using SimpleShadowsocks.Protocol;
+using SimpleShadowsocks.Protocol.Crypto;
 
 namespace SimpleShadowsocks.Server.Tunnel;
 
 public sealed class TunnelServer
 {
     private readonly TcpListener _listener;
+    private readonly byte[] _sharedKey;
 
     public TunnelServer(IPAddress listenAddress, int port)
     {
         _listener = new TcpListener(listenAddress, port);
+        _sharedKey = PreSharedKey.Derive32Bytes("dev-shared-key");
+    }
+
+    public TunnelServer(IPAddress listenAddress, int port, string sharedKey)
+    {
+        _listener = new TcpListener(listenAddress, port);
+        _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -22,7 +31,7 @@ public sealed class TunnelServer
             while (!cancellationToken.IsCancellationRequested)
             {
                 var tunnelClient = await _listener.AcceptTcpClientAsync(cancellationToken);
-                _ = Task.Run(() => HandleTunnelSafelyAsync(tunnelClient, cancellationToken), cancellationToken);
+                _ = Task.Run(() => HandleTunnelSafelyAsync(tunnelClient, _sharedKey, cancellationToken), cancellationToken);
             }
         }
         catch (OperationCanceledException)
@@ -34,13 +43,13 @@ public sealed class TunnelServer
         }
     }
 
-    private static async Task HandleTunnelSafelyAsync(TcpClient tunnelClient, CancellationToken cancellationToken)
+    private static async Task HandleTunnelSafelyAsync(TcpClient tunnelClient, byte[] sharedKey, CancellationToken cancellationToken)
     {
         using (tunnelClient)
         {
             try
             {
-                await HandleTunnelAsync(tunnelClient, cancellationToken);
+                await HandleTunnelAsync(tunnelClient, sharedKey, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -52,10 +61,12 @@ public sealed class TunnelServer
         }
     }
 
-    private static async Task HandleTunnelAsync(TcpClient tunnelClient, CancellationToken cancellationToken)
+    private static async Task HandleTunnelAsync(TcpClient tunnelClient, byte[] sharedKey, CancellationToken cancellationToken)
     {
         using var tunnelStream = tunnelClient.GetStream();
-        var firstFrame = await ProtocolFrameCodec.ReadAsync(tunnelStream, cancellationToken);
+        await using var secureStream = await TunnelCryptoHandshake.AsServerAsync(tunnelStream, sharedKey, cancellationToken);
+
+        var firstFrame = await ProtocolFrameCodec.ReadAsync(secureStream, cancellationToken);
         if (firstFrame is null || firstFrame.Value.Type != FrameType.Connect)
         {
             return;
@@ -70,7 +81,7 @@ public sealed class TunnelServer
         }
         catch (Exception)
         {
-            await SendConnectReplyAsync(tunnelStream, sessionId, replyCode: 0x08, cancellationToken);
+            await SendConnectReplyAsync(secureStream, sessionId, replyCode: 0x08, cancellationToken);
             return;
         }
 
@@ -83,11 +94,11 @@ public sealed class TunnelServer
         catch (Exception ex)
         {
             Console.WriteLine($"[tunnel] connect failed {request.Address}:{request.Port} ({ex.Message})");
-            await SendConnectReplyAsync(tunnelStream, sessionId, replyCode: 0x05, cancellationToken);
+            await SendConnectReplyAsync(secureStream, sessionId, replyCode: 0x05, cancellationToken);
             return;
         }
 
-        await SendConnectReplyAsync(tunnelStream, sessionId, replyCode: 0x00, cancellationToken);
+        await SendConnectReplyAsync(secureStream, sessionId, replyCode: 0x00, cancellationToken);
         Console.WriteLine($"[tunnel] proxy {request.Address}:{request.Port}");
 
         using var upstreamStream = upstream.GetStream();
@@ -99,7 +110,7 @@ public sealed class TunnelServer
         {
             while (!relayToken.IsCancellationRequested)
             {
-                var frame = await ProtocolFrameCodec.ReadAsync(tunnelStream, relayToken);
+                var frame = await ProtocolFrameCodec.ReadAsync(secureStream, relayToken);
                 if (frame is null)
                 {
                     break;
@@ -123,10 +134,10 @@ public sealed class TunnelServer
                         return;
                     case FrameType.Ping:
                         await SendFrameLockedAsync(
-                            tunnelStream,
-                            new ProtocolFrame(FrameType.Pong, sessionId, frame.Value.Payload),
-                            writeLock,
-                            relayToken);
+                    secureStream,
+                    new ProtocolFrame(FrameType.Pong, sessionId, frame.Value.Payload),
+                    writeLock,
+                    relayToken);
                         break;
                 }
             }
@@ -146,7 +157,7 @@ public sealed class TunnelServer
                 var payload = new byte[read];
                 Buffer.BlockCopy(buffer, 0, payload, 0, read);
                 await SendFrameLockedAsync(
-                    tunnelStream,
+                    secureStream,
                     new ProtocolFrame(FrameType.Data, sessionId, payload),
                     writeLock,
                     relayToken);
@@ -158,7 +169,7 @@ public sealed class TunnelServer
         try
         {
             await SendFrameLockedAsync(
-                tunnelStream,
+                secureStream,
                 new ProtocolFrame(FrameType.Close, sessionId, ProtocolPayloadSerializer.SerializeClose(0x00)),
                 writeLock,
                 relayToken);
@@ -194,7 +205,7 @@ public sealed class TunnelServer
     }
 
     private static Task SendConnectReplyAsync(
-        NetworkStream stream,
+        Stream stream,
         uint sessionId,
         byte replyCode,
         CancellationToken cancellationToken)
@@ -206,7 +217,7 @@ public sealed class TunnelServer
     }
 
     private static async Task SendFrameLockedAsync(
-        NetworkStream stream,
+        Stream stream,
         ProtocolFrame frame,
         SemaphoreSlim writeLock,
         CancellationToken cancellationToken)

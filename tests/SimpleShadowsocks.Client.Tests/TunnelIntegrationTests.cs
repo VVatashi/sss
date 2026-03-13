@@ -49,7 +49,7 @@ public sealed class TunnelIntegrationTests
     private static async Task<RunningSocksServer> StartSocksServerAsync(int tunnelPort)
     {
         var port = AllocateUnusedPort();
-        var server = new Socks5Server(IPAddress.Loopback, port, "127.0.0.1", tunnelPort);
+        var server = new Socks5Server(IPAddress.Loopback, port, "127.0.0.1", tunnelPort, "dev-shared-key");
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
