@@ -74,6 +74,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - кадры `Connect/Data/Close/Ping/Pong`
 - передача трафика через туннель `Client <-> Server`
 - мультиплексирование нескольких `sessionId` в одном TCP-туннеле
+- ordering/replay policy на уровне прикладных кадров через монотонный `Sequence` per session
 
 - Поточное шифрование туннеля:
 - алгоритм `ChaCha20-Poly1305 (AEAD)` (BouncyCastle)
@@ -110,26 +111,27 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 ## Формат кадра протокола
 
 ```text
-+--------+----------+------------+-----------+--------------+
-| VER(1) | TYPE(1)  | SESSION(4) | LEN(4)    | PAYLOAD(N)   |
-+--------+----------+------------+-----------+--------------+
++--------+----------+------------+-------------+-----------+--------------+
+| VER(1) | TYPE(1)  | SESSION(4) | SEQUENCE(8) | LEN(4)    | PAYLOAD(N)   |
++--------+----------+------------+-------------+-----------+--------------+
 ```
 
 Поля:
 - `VER` - версия протокола.
 - `TYPE` - `Connect`, `Data`, `Close`, `Ping`, `Pong`.
 - `SESSION` - идентификатор логической сессии.
+- `SEQUENCE` - монотонный счетчик кадров в рамках `SESSION`.
 - `LEN` - длина payload.
 - `PAYLOAD` - полезные данные.
 
 ## Ограничения текущей версии
 
 - Нет ротации ключей.
-- Replay protection реализован для этапа handshake, но не для каждого прикладного кадра протокола поверх активной сессии.
+- При нарушении sequence policy сессия закрывается без механизма selective recovery/retransmit.
 
 ## Следующие шаги
 
-1. Добавить replay/ordering policy на уровне прикладных кадров (не только handshake).
-2. Добавить heartbeat/idle timeout и reconnect policy.
-3. Добавить ротацию pre-shared key и процедуру key update.
-4. Добавить backpressure/лимиты на число сессий и буферов в multiplexer.
+1. Добавить heartbeat/idle timeout и reconnect policy.
+2. Добавить ротацию pre-shared key и процедуру key update.
+3. Добавить backpressure/лимиты на число сессий и буферов в multiplexer.
+4. Добавить метрики по sequence violations и отказам сессий.

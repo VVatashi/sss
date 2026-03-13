@@ -3,7 +3,7 @@ namespace SimpleShadowsocks.Protocol;
 public static class ProtocolConstants
 {
     public const byte Version = 1;
-    public const int HeaderSize = 10;
+    public const int HeaderSize = 18;
     public const int MaxPayloadLength = 1024 * 1024;
 }
 
@@ -25,4 +25,4 @@ public enum AddressType : byte
 
 public readonly record struct ConnectRequest(AddressType AddressType, string Address, ushort Port);
 public readonly record struct DataChunk(uint SessionId, ReadOnlyMemory<byte> Payload);
-public readonly record struct ProtocolFrame(FrameType Type, uint SessionId, ReadOnlyMemory<byte> Payload);
+public readonly record struct ProtocolFrame(FrameType Type, uint SessionId, ulong Sequence, ReadOnlyMemory<byte> Payload);

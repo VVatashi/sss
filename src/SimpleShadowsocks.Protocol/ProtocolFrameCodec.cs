@@ -20,7 +20,8 @@ public static class ProtocolFrameCodec
         header[0] = ProtocolConstants.Version;
         header[1] = (byte)frame.Type;
         BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(2, 4), frame.SessionId);
-        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(6, 4), (uint)frame.Payload.Length);
+        BinaryPrimitives.WriteUInt64BigEndian(header.AsSpan(6, 8), frame.Sequence);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(14, 4), (uint)frame.Payload.Length);
 
         await stream.WriteAsync(header, cancellationToken);
         if (!frame.Payload.IsEmpty)
@@ -57,7 +58,8 @@ public static class ProtocolFrameCodec
 
         var frameType = (FrameType)header[1];
         var sessionId = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(2, 4));
-        var payloadLength = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(6, 4));
+        var sequence = BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(6, 8));
+        var payloadLength = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(14, 4));
 
         if (payloadLength > ProtocolConstants.MaxPayloadLength)
         {
@@ -73,7 +75,7 @@ public static class ProtocolFrameCodec
             await ReadExactlyAsync(stream, payload, cancellationToken);
         }
 
-        return new ProtocolFrame(frameType, sessionId, payload);
+        return new ProtocolFrame(frameType, sessionId, sequence, payload);
     }
 
     private static async ValueTask<int> ReadExactlyOrToEndAsync(

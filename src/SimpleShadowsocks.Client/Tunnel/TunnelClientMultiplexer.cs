@@ -47,7 +47,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         try
         {
             var payload = ProtocolPayloadSerializer.SerializeConnectRequest(connectRequest);
-            await SendFrameAsync(new ProtocolFrame(FrameType.Connect, sessionId, payload), cancellationToken);
+            await SendSessionFrameAsync(sessionId, FrameType.Connect, payload, cancellationToken);
 
             var replyCode = await state.ConnectReply.Task.WaitAsync(cancellationToken);
             if (replyCode != 0x00)
@@ -68,17 +68,17 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
 
     public Task SendDataAsync(uint sessionId, byte[] payload, CancellationToken cancellationToken)
     {
-        return SendFrameAsync(new ProtocolFrame(FrameType.Data, sessionId, payload), cancellationToken);
+        return SendSessionFrameAsync(sessionId, FrameType.Data, payload, cancellationToken);
     }
 
     public async Task CloseSessionAsync(uint sessionId, byte reasonCode, CancellationToken cancellationToken)
     {
-        await SendFrameAsync(
-            new ProtocolFrame(FrameType.Close, sessionId, ProtocolPayloadSerializer.SerializeClose(reasonCode)),
-            cancellationToken);
-
         if (_sessions.TryRemove(sessionId, out var state))
         {
+            var sequence = state.TakeNextSendSequence();
+            await SendFrameAsync(
+                new ProtocolFrame(FrameType.Close, sessionId, sequence, ProtocolPayloadSerializer.SerializeClose(reasonCode)),
+                cancellationToken);
             state.ReaderWriter.Writer.TryComplete();
         }
     }
@@ -176,6 +176,17 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         }
     }
 
+    private Task SendSessionFrameAsync(uint sessionId, FrameType frameType, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
+    {
+        if (!_sessions.TryGetValue(sessionId, out var state))
+        {
+            throw new InvalidOperationException($"Session {sessionId} is not active.");
+        }
+
+        var sequence = state.TakeNextSendSequence();
+        return SendFrameAsync(new ProtocolFrame(frameType, sessionId, sequence, payload), cancellationToken);
+    }
+
     private async Task ReadLoopAsync(CancellationToken cancellationToken)
     {
         try
@@ -195,6 +206,12 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
 
                 if (!_sessions.TryGetValue(frame.Value.SessionId, out var state))
                 {
+                    continue;
+                }
+
+                if (!state.TryAcceptIncomingSequence(frame.Value.Sequence))
+                {
+                    await CloseSessionAsync(frame.Value.SessionId, 0x21, CancellationToken.None);
                     continue;
                 }
 
@@ -218,9 +235,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                         _sessions.TryRemove(frame.Value.SessionId, out _);
                         break;
                     case FrameType.Ping:
-                        await SendFrameAsync(
-                            new ProtocolFrame(FrameType.Pong, frame.Value.SessionId, frame.Value.Payload),
-                            cancellationToken);
+                        await SendSessionFrameAsync(frame.Value.SessionId, FrameType.Pong, frame.Value.Payload, cancellationToken);
                         break;
                 }
             }
@@ -241,6 +256,10 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
 
     private sealed class SessionState
     {
+        private readonly object _sequenceLock = new();
+        private ulong _nextSendSequence;
+        private ulong _nextExpectedIncomingSequence;
+
         public TaskCompletionSource<byte> ConnectReply { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -250,5 +269,27 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                 SingleReader = true,
                 SingleWriter = false
             });
+
+        public ulong TakeNextSendSequence()
+        {
+            lock (_sequenceLock)
+            {
+                return _nextSendSequence++;
+            }
+        }
+
+        public bool TryAcceptIncomingSequence(ulong sequence)
+        {
+            lock (_sequenceLock)
+            {
+                if (sequence != _nextExpectedIncomingSequence)
+                {
+                    return false;
+                }
+
+                _nextExpectedIncomingSequence++;
+                return true;
+            }
+        }
     }
 }

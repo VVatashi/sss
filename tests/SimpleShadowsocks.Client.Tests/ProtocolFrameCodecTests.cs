@@ -11,6 +11,7 @@ public sealed class ProtocolFrameCodecTests
         var frame = new ProtocolFrame(
             FrameType.Data,
             SessionId: 42,
+            Sequence: 7,
             Payload: new byte[] { 1, 2, 3, 4, 5 });
 
         await using var stream = new MemoryStream();
@@ -22,6 +23,7 @@ public sealed class ProtocolFrameCodecTests
         Assert.True(decoded.HasValue);
         Assert.Equal(frame.Type, decoded.Value.Type);
         Assert.Equal(frame.SessionId, decoded.Value.SessionId);
+        Assert.Equal(frame.Sequence, decoded.Value.Sequence);
         Assert.Equal(frame.Payload.ToArray(), decoded.Value.Payload.ToArray());
     }
 
