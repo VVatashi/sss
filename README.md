@@ -15,21 +15,42 @@ dotnet build src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj
 dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
 ```
 
-### 2) Запуск
+### 2) Настройка ключа
+
+Клиент и сервер должны использовать одинаковый `SharedKey`.
+
+Файлы конфигурации:
+- `src/SimpleShadowsocks.Client/appsettings.json`
+- `src/SimpleShadowsocks.Server/appsettings.json`
+
+Поддерживаемые форматы `SharedKey`:
+- `hex:<64 hex символа>` (ровно 32 байта)
+- `base64:<...>` (должно декодироваться ровно в 32 байта)
+- обычная строка-пароль (из нее вычисляется `SHA-256`, 32 байта)
+
+Параметры crypto policy (в `appsettings.json` клиента и сервера):
+- `HandshakeMaxClockSkewSeconds` - максимально допустимое расхождение времени при handshake.
+- `ReplayWindowSeconds` - окно хранения идентификаторов handshake для защиты от повторов.
+
+### 3) Запуск
 
 Сначала сервер туннеля:
 ```powershell
 dotnet run --project src\SimpleShadowsocks.Server -- 8388
 ```
 
-Потом клиентский SOCKS5-прокси (порт SOCKS5 + host/port сервера туннеля):
+Потом клиентский SOCKS5-прокси:
 ```powershell
 dotnet run --project src\SimpleShadowsocks.Client -- 1080 127.0.0.1 8388
 ```
 
 После запуска клиент слушает `127.0.0.1:1080`.
 
-### 3) Тесты
+Аргументы:
+- Client: `<listenPort> <remoteHost> <remotePort> [sharedKey]`
+- Server: `<listenPort> [sharedKey]`
+
+### 4) Тесты
 
 ```powershell
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj
@@ -42,7 +63,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - `SimpleShadowsocks.Server`
 - `SimpleShadowsocks.Protocol`
 
-- Клиентский SOCKS5-сервер:
+- Клиентский SOCKS5:
 - handshake `VER=5`, метод `NO AUTH (0x00)`
 - `CONNECT (0x01)`
 - адреса `IPv4`, `IPv6`, `Domain`
@@ -51,18 +72,25 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - Внутренний протокол клиент<->сервер:
 - framing/serialization (`ProtocolFrameCodec`, `ProtocolPayloadSerializer`)
 - кадры `Connect/Data/Close/Ping/Pong`
-- `CONNECT` запрос отправляется клиентом на сервер туннеля
-- двунаправленная ретрансляция `DATA` через туннель
-- корректное завершение через `CLOSE`
+- передача трафика через туннель `Client <-> Server`
+
+- Поточное шифрование туннеля:
+- алгоритм `ChaCha20-Poly1305 (AEAD)` (BouncyCastle)
+- pre-shared key из конфигурации
+- защищенный nonce-handshake (HMAC + timestamp + handshake counter)
+- последующий обмен всеми кадрами в зашифрованном и аутентифицированном виде
+- nonce policy: уникальный nonce на каждый AEAD-record через base nonce + counter
+- защита от повторного использования nonce при исчерпании счетчика (требуется re-key)
+- replay protection на сервере для handshake (cache + replay window)
 
 - Сервер туннеля:
 - принимает `CONNECT` кадр
 - подключается к целевому хосту
 - возвращает код результата
-- передает трафик в обе стороны
+- передает `DATA` в обе стороны
 
 - Тесты:
-- unit + integration тесты протокола/SOCKS5/туннеля
+- unit + integration тесты SOCKS5, протокола и туннеля
 - текущий набор: `13` тестов, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
@@ -73,7 +101,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 
 - `src/SimpleShadowsocks.Client` - локальный SOCKS5-proxy, клиент туннеля.
 - `src/SimpleShadowsocks.Server` - сервер туннеля.
-- `src/SimpleShadowsocks.Protocol` - модели и кодек бинарного протокола.
+- `src/SimpleShadowsocks.Protocol` - модели протокола, кодек и crypto-утилиты.
 - `tests/SimpleShadowsocks.Client.Tests` - unit/integration тесты.
 
 ## Формат кадра протокола
@@ -93,13 +121,13 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 
 ## Ограничения текущей версии
 
-- Пока нет шифрования и аутентификации туннеля.
 - В текущем сервере обрабатывается одна логическая сессия на одно туннельное TCP-подключение.
-- Нет конфигурации через `appsettings.json` (параметры через аргументы командной строки).
+- Нет ротации ключей.
+- Replay protection реализован для этапа handshake, но не для каждого прикладного кадра протокола поверх активной сессии.
 
 ## Следующие шаги
 
-1. Добавить шифрование канала (MVP: pre-shared key + AEAD).
-2. Добавить мультиплексирование нескольких `sessionId` в одном туннеле.
-3. Добавить heartbeat/idle timeout и политику reconnect.
-4. Добавить конфигурацию через `appsettings.json` и structured logging.
+1. Добавить мультиплексирование нескольких `sessionId` в одном туннеле.
+2. Добавить replay/ordering policy на уровне прикладных кадров (не только handshake).
+3. Добавить heartbeat/idle timeout и reconnect policy.
+4. Добавить ротацию pre-shared key и процедуру key update.

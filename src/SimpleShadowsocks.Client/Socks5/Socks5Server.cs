@@ -19,19 +19,28 @@ public sealed class Socks5Server
     private readonly string? _remoteServerHost;
     private readonly int _remoteServerPort;
     private readonly byte[] _sharedKey;
+    private readonly TunnelCryptoPolicy _cryptoPolicy;
 
     public Socks5Server(IPAddress listenAddress, int port)
     {
         _listener = new TcpListener(listenAddress, port);
         _sharedKey = PreSharedKey.Derive32Bytes("dev-shared-key");
+        _cryptoPolicy = TunnelCryptoPolicy.Default;
     }
 
-    public Socks5Server(IPAddress listenAddress, int port, string remoteServerHost, int remoteServerPort, string sharedKey)
+    public Socks5Server(
+        IPAddress listenAddress,
+        int port,
+        string remoteServerHost,
+        int remoteServerPort,
+        string sharedKey,
+        TunnelCryptoPolicy? cryptoPolicy = null)
     {
         _listener = new TcpListener(listenAddress, port);
         _remoteServerHost = remoteServerHost;
         _remoteServerPort = remoteServerPort;
         _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
+        _cryptoPolicy = cryptoPolicy ?? TunnelCryptoPolicy.Default;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -143,7 +152,11 @@ public sealed class Socks5Server
         }
 
         using var tunnelStream = tunnelClient.GetStream();
-        await using var secureStream = await TunnelCryptoHandshake.AsClientAsync(tunnelStream, _sharedKey, cancellationToken);
+        await using var secureStream = await TunnelCryptoHandshake.AsClientAsync(
+            tunnelStream,
+            _sharedKey,
+            _cryptoPolicy,
+            cancellationToken);
         const uint sessionId = 1;
 
         var connectRequest = new ConnectRequest(ToProtocolAddressType(request.AddressType), request.Host, (ushort)request.Port);

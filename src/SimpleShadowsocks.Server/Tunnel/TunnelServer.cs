@@ -9,17 +9,20 @@ public sealed class TunnelServer
 {
     private readonly TcpListener _listener;
     private readonly byte[] _sharedKey;
+    private readonly TunnelCryptoPolicy _cryptoPolicy;
 
     public TunnelServer(IPAddress listenAddress, int port)
     {
         _listener = new TcpListener(listenAddress, port);
         _sharedKey = PreSharedKey.Derive32Bytes("dev-shared-key");
+        _cryptoPolicy = TunnelCryptoPolicy.Default;
     }
 
-    public TunnelServer(IPAddress listenAddress, int port, string sharedKey)
+    public TunnelServer(IPAddress listenAddress, int port, string sharedKey, TunnelCryptoPolicy? cryptoPolicy = null)
     {
         _listener = new TcpListener(listenAddress, port);
         _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
+        _cryptoPolicy = cryptoPolicy ?? TunnelCryptoPolicy.Default;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -31,7 +34,9 @@ public sealed class TunnelServer
             while (!cancellationToken.IsCancellationRequested)
             {
                 var tunnelClient = await _listener.AcceptTcpClientAsync(cancellationToken);
-                _ = Task.Run(() => HandleTunnelSafelyAsync(tunnelClient, _sharedKey, cancellationToken), cancellationToken);
+                _ = Task.Run(
+                    () => HandleTunnelSafelyAsync(tunnelClient, _sharedKey, _cryptoPolicy, cancellationToken),
+                    cancellationToken);
             }
         }
         catch (OperationCanceledException)
@@ -43,13 +48,17 @@ public sealed class TunnelServer
         }
     }
 
-    private static async Task HandleTunnelSafelyAsync(TcpClient tunnelClient, byte[] sharedKey, CancellationToken cancellationToken)
+    private static async Task HandleTunnelSafelyAsync(
+        TcpClient tunnelClient,
+        byte[] sharedKey,
+        TunnelCryptoPolicy cryptoPolicy,
+        CancellationToken cancellationToken)
     {
         using (tunnelClient)
         {
             try
             {
-                await HandleTunnelAsync(tunnelClient, sharedKey, cancellationToken);
+                await HandleTunnelAsync(tunnelClient, sharedKey, cryptoPolicy, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -61,10 +70,18 @@ public sealed class TunnelServer
         }
     }
 
-    private static async Task HandleTunnelAsync(TcpClient tunnelClient, byte[] sharedKey, CancellationToken cancellationToken)
+    private static async Task HandleTunnelAsync(
+        TcpClient tunnelClient,
+        byte[] sharedKey,
+        TunnelCryptoPolicy cryptoPolicy,
+        CancellationToken cancellationToken)
     {
         using var tunnelStream = tunnelClient.GetStream();
-        await using var secureStream = await TunnelCryptoHandshake.AsServerAsync(tunnelStream, sharedKey, cancellationToken);
+        await using var secureStream = await TunnelCryptoHandshake.AsServerAsync(
+            tunnelStream,
+            sharedKey,
+            cryptoPolicy,
+            cancellationToken);
 
         var firstFrame = await ProtocolFrameCodec.ReadAsync(secureStream, cancellationToken);
         if (firstFrame is null || firstFrame.Value.Type != FrameType.Connect)
