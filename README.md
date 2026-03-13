@@ -73,6 +73,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - framing/serialization (`ProtocolFrameCodec`, `ProtocolPayloadSerializer`)
 - кадры `Connect/Data/Close/Ping/Pong`
 - передача трафика через туннель `Client <-> Server`
+- мультиплексирование нескольких `sessionId` в одном TCP-туннеле
 
 - Поточное шифрование туннеля:
 - алгоритм `ChaCha20-Poly1305 (AEAD)` (BouncyCastle)
@@ -88,10 +89,12 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - подключается к целевому хосту
 - возвращает код результата
 - передает `DATA` в обе стороны
+- держит несколько независимых upstream-сессий в одном соединении с клиентом
 
 - Тесты:
 - unit + integration тесты SOCKS5, протокола и туннеля
-- текущий набор: `13` тестов, проходят
+- есть проверка multiplexing: две сессии через один туннель
+- текущий набор: `14` тестов, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
 - `bin/<ProjectName>/...`
@@ -121,13 +124,12 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 
 ## Ограничения текущей версии
 
-- В текущем сервере обрабатывается одна логическая сессия на одно туннельное TCP-подключение.
 - Нет ротации ключей.
 - Replay protection реализован для этапа handshake, но не для каждого прикладного кадра протокола поверх активной сессии.
 
 ## Следующие шаги
 
-1. Добавить мультиплексирование нескольких `sessionId` в одном туннеле.
-2. Добавить replay/ordering policy на уровне прикладных кадров (не только handshake).
-3. Добавить heartbeat/idle timeout и reconnect policy.
-4. Добавить ротацию pre-shared key и процедуру key update.
+1. Добавить replay/ordering policy на уровне прикладных кадров (не только handshake).
+2. Добавить heartbeat/idle timeout и reconnect policy.
+3. Добавить ротацию pre-shared key и процедуру key update.
+4. Добавить backpressure/лимиты на число сессий и буферов в multiplexer.

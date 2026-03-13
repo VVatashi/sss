@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Channels;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
+using SimpleShadowsocks.Client.Tunnel;
 
 namespace SimpleShadowsocks.Client.Socks5;
 
@@ -20,6 +22,7 @@ public sealed class Socks5Server
     private readonly int _remoteServerPort;
     private readonly byte[] _sharedKey;
     private readonly TunnelCryptoPolicy _cryptoPolicy;
+    private TunnelClientMultiplexer? _multiplexer;
 
     public Socks5Server(IPAddress listenAddress, int port)
     {
@@ -46,6 +49,9 @@ public sealed class Socks5Server
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         _listener.Start();
+        _multiplexer = string.IsNullOrWhiteSpace(_remoteServerHost)
+            ? null
+            : new TunnelClientMultiplexer(_remoteServerHost, _remoteServerPort, _sharedKey, _cryptoPolicy);
 
         try
         {
@@ -60,6 +66,11 @@ public sealed class Socks5Server
         }
         finally
         {
+            if (_multiplexer is not null)
+            {
+                await _multiplexer.DisposeAsync();
+            }
+
             _listener.Stop();
         }
     }
@@ -138,11 +149,19 @@ public sealed class Socks5Server
         Socks5ConnectRequest request,
         CancellationToken cancellationToken)
     {
-        using var tunnelClient = new TcpClient();
+        if (_multiplexer is null)
+        {
+            await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
+            return;
+        }
 
+        var connectRequest = new ConnectRequest(ToProtocolAddressType(request.AddressType), request.Host, (ushort)request.Port);
+        uint sessionId;
+        byte replyCode;
+        ChannelReader<byte[]> reader;
         try
         {
-            await tunnelClient.ConnectAsync(_remoteServerHost!, _remoteServerPort, cancellationToken);
+            (sessionId, replyCode, reader) = await _multiplexer.OpenSessionAsync(connectRequest, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -151,31 +170,6 @@ public sealed class Socks5Server
             return;
         }
 
-        using var tunnelStream = tunnelClient.GetStream();
-        await using var secureStream = await TunnelCryptoHandshake.AsClientAsync(
-            tunnelStream,
-            _sharedKey,
-            _cryptoPolicy,
-            cancellationToken);
-        const uint sessionId = 1;
-
-        var connectRequest = new ConnectRequest(ToProtocolAddressType(request.AddressType), request.Host, (ushort)request.Port);
-        var connectPayload = ProtocolPayloadSerializer.SerializeConnectRequest(connectRequest);
-
-        await ProtocolFrameCodec.WriteAsync(
-            secureStream,
-            new ProtocolFrame(FrameType.Connect, sessionId, connectPayload),
-            cancellationToken);
-
-        var connectReply = await ProtocolFrameCodec.ReadAsync(secureStream, cancellationToken);
-        if (connectReply is null || connectReply.Value.Type != FrameType.Connect || connectReply.Value.Payload.Length < 1)
-        {
-            Console.WriteLine($"[socks5] tunnel protocol error for {request.Host}:{request.Port}");
-            await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
-            return;
-        }
-
-        var replyCode = connectReply.Value.Payload.Span[0];
         if (replyCode != 0x00)
         {
             Console.WriteLine($"[socks5] connect failed {request.Host}:{request.Port} (remote reply={replyCode})");
@@ -184,12 +178,13 @@ public sealed class Socks5Server
         }
 
         await SendReplyAsync(clientStream, replyCode: 0x00, new IPEndPoint(IPAddress.Any, 0), cancellationToken);
-        await RelayViaTunnelAsync(clientStream, secureStream, sessionId, cancellationToken);
+        await RelayViaTunnelAsync(clientStream, _multiplexer, reader, sessionId, cancellationToken);
     }
 
     private static async Task RelayViaTunnelAsync(
         NetworkStream clientStream,
-        Stream tunnelStream,
+        TunnelClientMultiplexer multiplexer,
+        ChannelReader<byte[]> reader,
         uint sessionId,
         CancellationToken cancellationToken)
     {
@@ -204,48 +199,24 @@ public sealed class Socks5Server
                 var read = await clientStream.ReadAsync(buffer, relayToken);
                 if (read == 0)
                 {
-                    await ProtocolFrameCodec.WriteAsync(
-                        tunnelStream,
-                        new ProtocolFrame(FrameType.Close, sessionId, ProtocolPayloadSerializer.SerializeClose(0x00)),
-                        relayToken);
+                    await multiplexer.CloseSessionAsync(sessionId, 0x00, relayToken);
                     break;
                 }
 
                 var payload = new byte[read];
                 Buffer.BlockCopy(buffer, 0, payload, 0, read);
-                await ProtocolFrameCodec.WriteAsync(
-                    tunnelStream,
-                    new ProtocolFrame(FrameType.Data, sessionId, payload),
-                    relayToken);
+                await multiplexer.SendDataAsync(sessionId, payload, relayToken);
             }
         }, relayToken);
 
         var tunnelToClient = Task.Run(async () =>
         {
-            while (!relayToken.IsCancellationRequested)
+            await foreach (var data in reader.ReadAllAsync(relayToken))
             {
-                var frame = await ProtocolFrameCodec.ReadAsync(tunnelStream, relayToken);
-                if (frame is null)
+                if (data.Length > 0)
                 {
-                    break;
-                }
-
-                if (frame.Value.SessionId != sessionId)
-                {
-                    continue;
-                }
-
-                switch (frame.Value.Type)
-                {
-                    case FrameType.Data:
-                        if (!frame.Value.Payload.IsEmpty)
-                        {
-                            await clientStream.WriteAsync(frame.Value.Payload, relayToken);
-                            await clientStream.FlushAsync(relayToken);
-                        }
-                        break;
-                    case FrameType.Close:
-                        return;
+                    await clientStream.WriteAsync(data, relayToken);
+                    await clientStream.FlushAsync(relayToken);
                 }
             }
         }, relayToken);
@@ -259,6 +230,16 @@ public sealed class Socks5Server
         }
         catch (OperationCanceledException)
         {
+        }
+        finally
+        {
+            try
+            {
+                await multiplexer.CloseSessionAsync(sessionId, 0x00, CancellationToken.None);
+            }
+            catch
+            {
+            }
         }
     }
 

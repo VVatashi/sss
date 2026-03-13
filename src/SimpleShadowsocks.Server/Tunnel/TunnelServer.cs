@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using SimpleShadowsocks.Protocol;
@@ -10,6 +11,9 @@ public sealed class TunnelServer
     private readonly TcpListener _listener;
     private readonly byte[] _sharedKey;
     private readonly TunnelCryptoPolicy _cryptoPolicy;
+    private int _acceptedTunnelConnections;
+
+    public int AcceptedTunnelConnections => Volatile.Read(ref _acceptedTunnelConnections);
 
     public TunnelServer(IPAddress listenAddress, int port)
     {
@@ -34,6 +38,7 @@ public sealed class TunnelServer
             while (!cancellationToken.IsCancellationRequested)
             {
                 var tunnelClient = await _listener.AcceptTcpClientAsync(cancellationToken);
+                Interlocked.Increment(ref _acceptedTunnelConnections);
                 _ = Task.Run(
                     () => HandleTunnelSafelyAsync(tunnelClient, _sharedKey, _cryptoPolicy, cancellationToken),
                     cancellationToken);
@@ -83,130 +88,141 @@ public sealed class TunnelServer
             cryptoPolicy,
             cancellationToken);
 
-        var firstFrame = await ProtocolFrameCodec.ReadAsync(secureStream, cancellationToken);
-        if (firstFrame is null || firstFrame.Value.Type != FrameType.Connect)
-        {
-            return;
-        }
-
-        var sessionId = firstFrame.Value.SessionId;
-        ConnectRequest request;
-
-        try
-        {
-            request = ProtocolPayloadSerializer.DeserializeConnectRequest(firstFrame.Value.Payload.Span);
-        }
-        catch (Exception)
-        {
-            await SendConnectReplyAsync(secureStream, sessionId, replyCode: 0x08, cancellationToken);
-            return;
-        }
-
-        using var upstream = new TcpClient();
-
-        try
-        {
-            await ConnectUpstreamAsync(upstream, request, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[tunnel] connect failed {request.Address}:{request.Port} ({ex.Message})");
-            await SendConnectReplyAsync(secureStream, sessionId, replyCode: 0x05, cancellationToken);
-            return;
-        }
-
-        await SendConnectReplyAsync(secureStream, sessionId, replyCode: 0x00, cancellationToken);
-        Console.WriteLine($"[tunnel] proxy {request.Address}:{request.Port}");
-
-        using var upstreamStream = upstream.GetStream();
         using var writeLock = new SemaphoreSlim(1, 1);
-        using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var relayToken = relayCts.Token;
+        var sessions = new ConcurrentDictionary<uint, SessionContext>();
 
-        var tunnelToUpstream = Task.Run(async () =>
+        try
         {
-            while (!relayToken.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var frame = await ProtocolFrameCodec.ReadAsync(secureStream, relayToken);
+                var frame = await ProtocolFrameCodec.ReadAsync(secureStream, cancellationToken);
                 if (frame is null)
                 {
                     break;
                 }
 
-                if (frame.Value.SessionId != sessionId)
-                {
-                    continue;
-                }
-
                 switch (frame.Value.Type)
                 {
+                    case FrameType.Connect:
+                        await HandleConnectFrameAsync(secureStream, writeLock, sessions, frame.Value, cancellationToken);
+                        break;
+
                     case FrameType.Data:
-                        if (!frame.Value.Payload.IsEmpty)
+                        if (sessions.TryGetValue(frame.Value.SessionId, out var session) && !frame.Value.Payload.IsEmpty)
                         {
-                            await upstreamStream.WriteAsync(frame.Value.Payload, relayToken);
-                            await upstreamStream.FlushAsync(relayToken);
+                            await session.UpstreamStream.WriteAsync(frame.Value.Payload, cancellationToken);
+                            await session.UpstreamStream.FlushAsync(cancellationToken);
                         }
                         break;
+
                     case FrameType.Close:
-                        return;
+                        await CloseSessionAsync(sessions, frame.Value.SessionId, sendCloseToClient: false, secureStream, writeLock, cancellationToken);
+                        break;
+
                     case FrameType.Ping:
                         await SendFrameLockedAsync(
-                    secureStream,
-                    new ProtocolFrame(FrameType.Pong, sessionId, frame.Value.Payload),
-                    writeLock,
-                    relayToken);
+                            secureStream,
+                            new ProtocolFrame(FrameType.Pong, frame.Value.SessionId, frame.Value.Payload),
+                            writeLock,
+                            cancellationToken);
                         break;
                 }
             }
-        }, relayToken);
+        }
+        finally
+        {
+            foreach (var sessionId in sessions.Keys)
+            {
+                await CloseSessionAsync(sessions, sessionId, sendCloseToClient: false, secureStream, writeLock, CancellationToken.None);
+            }
+        }
+    }
 
-        var upstreamToTunnel = Task.Run(async () =>
+    private static async Task HandleConnectFrameAsync(
+        Stream secureStream,
+        SemaphoreSlim writeLock,
+        ConcurrentDictionary<uint, SessionContext> sessions,
+        ProtocolFrame frame,
+        CancellationToken cancellationToken)
+    {
+        if (sessions.ContainsKey(frame.SessionId))
+        {
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
+            return;
+        }
+
+        ConnectRequest request;
+        try
+        {
+            request = ProtocolPayloadSerializer.DeserializeConnectRequest(frame.Payload.Span);
+        }
+        catch
+        {
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x08, writeLock, cancellationToken);
+            return;
+        }
+
+        var upstreamClient = new TcpClient();
+        try
+        {
+            await ConnectUpstreamAsync(upstreamClient, request, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            upstreamClient.Dispose();
+            Console.WriteLine($"[tunnel] connect failed {request.Address}:{request.Port} ({ex.Message})");
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x05, writeLock, cancellationToken);
+            return;
+        }
+
+        var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var context = new SessionContext(frame.SessionId, upstreamClient, upstreamClient.GetStream(), sessionCts);
+        if (!sessions.TryAdd(frame.SessionId, context))
+        {
+            context.Dispose();
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
+            return;
+        }
+
+        context.UpstreamToClientTask = Task.Run(async () =>
         {
             var buffer = new byte[16 * 1024];
-            while (!relayToken.IsCancellationRequested)
+            try
             {
-                var read = await upstreamStream.ReadAsync(buffer, relayToken);
-                if (read == 0)
+                while (!context.Cancellation.Token.IsCancellationRequested)
                 {
-                    break;
+                    var read = await context.UpstreamStream.ReadAsync(buffer, context.Cancellation.Token);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    var payload = new byte[read];
+                    Buffer.BlockCopy(buffer, 0, payload, 0, read);
+                    await SendFrameLockedAsync(
+                        secureStream,
+                        new ProtocolFrame(FrameType.Data, context.SessionId, payload),
+                        writeLock,
+                        context.Cancellation.Token);
                 }
-
-                var payload = new byte[read];
-                Buffer.BlockCopy(buffer, 0, payload, 0, read);
-                await SendFrameLockedAsync(
-                    secureStream,
-                    new ProtocolFrame(FrameType.Data, sessionId, payload),
-                    writeLock,
-                    relayToken);
             }
-        }, relayToken);
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                await CloseSessionAsync(
+                    sessions,
+                    context.SessionId,
+                    sendCloseToClient: true,
+                    secureStream,
+                    writeLock,
+                    CancellationToken.None);
+            }
+        }, context.Cancellation.Token);
 
-        await Task.WhenAny(tunnelToUpstream, upstreamToTunnel);
-
-        try
-        {
-            await SendFrameLockedAsync(
-                secureStream,
-                new ProtocolFrame(FrameType.Close, sessionId, ProtocolPayloadSerializer.SerializeClose(0x00)),
-                writeLock,
-                relayToken);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (IOException)
-        {
-        }
-
-        relayCts.Cancel();
-
-        try
-        {
-            await Task.WhenAll(tunnelToUpstream, upstreamToTunnel);
-        }
-        catch (OperationCanceledException)
-        {
-        }
+        Console.WriteLine($"[tunnel] proxy {request.Address}:{request.Port} session={frame.SessionId}");
+        await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x00, writeLock, cancellationToken);
     }
 
     private static async Task ConnectUpstreamAsync(TcpClient upstream, ConnectRequest request, CancellationToken cancellationToken)
@@ -225,12 +241,46 @@ public sealed class TunnelServer
         Stream stream,
         uint sessionId,
         byte replyCode,
+        SemaphoreSlim writeLock,
         CancellationToken cancellationToken)
     {
-        return ProtocolFrameCodec.WriteAsync(
+        return SendFrameLockedAsync(
             stream,
             new ProtocolFrame(FrameType.Connect, sessionId, new[] { replyCode }),
-            cancellationToken).AsTask();
+            writeLock,
+            cancellationToken);
+    }
+
+    private static async Task CloseSessionAsync(
+        ConcurrentDictionary<uint, SessionContext> sessions,
+        uint sessionId,
+        bool sendCloseToClient,
+        Stream secureStream,
+        SemaphoreSlim writeLock,
+        CancellationToken cancellationToken)
+    {
+        if (!sessions.TryRemove(sessionId, out var context))
+        {
+            return;
+        }
+
+        context.Cancellation.Cancel();
+        context.Dispose();
+
+        if (sendCloseToClient)
+        {
+            try
+            {
+                await SendFrameLockedAsync(
+                    secureStream,
+                    new ProtocolFrame(FrameType.Close, sessionId, ProtocolPayloadSerializer.SerializeClose(0x00)),
+                    writeLock,
+                    cancellationToken);
+            }
+            catch
+            {
+            }
+        }
     }
 
     private static async Task SendFrameLockedAsync(
@@ -247,6 +297,30 @@ public sealed class TunnelServer
         finally
         {
             writeLock.Release();
+        }
+    }
+
+    private sealed class SessionContext : IDisposable
+    {
+        public SessionContext(uint sessionId, TcpClient upstreamClient, NetworkStream upstreamStream, CancellationTokenSource cancellation)
+        {
+            SessionId = sessionId;
+            UpstreamClient = upstreamClient;
+            UpstreamStream = upstreamStream;
+            Cancellation = cancellation;
+        }
+
+        public uint SessionId { get; }
+        public TcpClient UpstreamClient { get; }
+        public NetworkStream UpstreamStream { get; }
+        public CancellationTokenSource Cancellation { get; }
+        public Task? UpstreamToClientTask { get; set; }
+
+        public void Dispose()
+        {
+            try { UpstreamStream.Dispose(); } catch { }
+            try { UpstreamClient.Dispose(); } catch { }
+            try { Cancellation.Dispose(); } catch { }
         }
     }
 }

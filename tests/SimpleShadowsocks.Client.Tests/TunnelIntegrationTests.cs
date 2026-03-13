@@ -35,6 +35,43 @@ public sealed class TunnelIntegrationTests
         Assert.Equal(payload, echoed);
     }
 
+    [Fact]
+    public async Task Socks5Client_MultiplexesMultipleSessions_OverSingleTunnelConnection()
+    {
+        await using var echo = await StartEchoServerAsync();
+        await using var tunnel = await StartTunnelServerAsync();
+        await using var socks = await StartSocksServerAsync(tunnel.Port);
+        var acceptedBefore = tunnel.Server.AcceptedTunnelConnections;
+
+        async Task RunClientAsync(string message)
+        {
+            using var tcpClient = new TcpClient();
+            await tcpClient.ConnectAsync(IPAddress.Loopback, socks.Port);
+            using var stream = tcpClient.GetStream();
+
+            await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+            var greeting = await ReadExactAsync(stream, 2);
+            Assert.Equal(new byte[] { 0x05, 0x00 }, greeting);
+
+            var connectRequest = BuildConnectRequestIPv4(IPAddress.Loopback, echo.Port);
+            await stream.WriteAsync(connectRequest);
+            var connectResponse = await ReadExactAsync(stream, 10);
+            Assert.Equal((byte)0x00, connectResponse[1]);
+
+            var payload = Encoding.ASCII.GetBytes(message);
+            await stream.WriteAsync(payload);
+            var echoed = await ReadExactAsync(stream, payload.Length);
+            Assert.Equal(payload, echoed);
+        }
+
+        await Task.WhenAll(
+            RunClientAsync("first-stream-through-multiplexer"),
+            RunClientAsync("second-stream-through-multiplexer"));
+
+        await Task.Delay(200);
+        Assert.Equal(acceptedBefore + 1, tunnel.Server.AcceptedTunnelConnections);
+    }
+
     private static async Task<RunningTunnelServer> StartTunnelServerAsync()
     {
         var port = AllocateUnusedPort();
@@ -43,7 +80,7 @@ public sealed class TunnelIntegrationTests
         var runTask = server.RunAsync(cts.Token);
 
         await WaitUntilReachableAsync(port, cts.Token);
-        return new RunningTunnelServer(port, cts, runTask);
+        return new RunningTunnelServer(server, port, cts, runTask);
     }
 
     private static async Task<RunningSocksServer> StartSocksServerAsync(int tunnelPort)
@@ -192,13 +229,15 @@ public sealed class TunnelIntegrationTests
 
     private sealed class RunningTunnelServer : IAsyncDisposable
     {
-        public RunningTunnelServer(int port, CancellationTokenSource cts, Task runTask)
+        public RunningTunnelServer(TunnelServer server, int port, CancellationTokenSource cts, Task runTask)
         {
+            Server = server;
             Port = port;
             _cts = cts;
             _runTask = runTask;
         }
 
+        public TunnelServer Server { get; }
         public int Port { get; }
         private readonly CancellationTokenSource _cts;
         private readonly Task _runTask;
