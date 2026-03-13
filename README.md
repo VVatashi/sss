@@ -1,5 +1,7 @@
 # SimpleShadowsocks
 
+Простой Shadowsocks-подобный протокол.
+
 ## Быстрый старт (сборка, запуск, тесты)
 
 Требования:
@@ -13,6 +15,83 @@
 dotnet build src\SimpleShadowsocks.Protocol\SimpleShadowsocks.Protocol.csproj
 dotnet build src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj
 dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
+```
+
+### 1.1) Сборка Release-бинарников (Windows/macOS/Linux)
+
+Ниже команды `framework-dependent` publish (требуется установленный .NET runtime на целевой машине).
+
+```powershell
+# Windows x64
+dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r win-x64 --self-contained false
+dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r win-x64 --self-contained false
+
+# Linux x64
+dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r linux-x64 --self-contained false
+dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r linux-x64 --self-contained false
+
+# macOS x64
+dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r osx-x64 --self-contained false
+dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r osx-x64 --self-contained false
+
+# macOS ARM64 (Apple Silicon)
+dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r osx-arm64 --self-contained false
+dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r osx-arm64 --self-contained false
+```
+
+Результат publish:
+- `bin/SimpleShadowsocks.Server/Release/net9.0/<RID>/publish`
+- `bin/SimpleShadowsocks.Client/Release/net9.0/<RID>/publish`
+
+### 1.2) Пример запуска сервера как systemd unit (Linux)
+
+Пример для `linux-x64` publish.
+
+1. Опубликовать сервер:
+
+```bash
+dotnet publish src/SimpleShadowsocks.Server/SimpleShadowsocks.Server.csproj -c Release -r linux-x64 --self-contained false
+```
+
+2. Скопировать publish-директорию на сервер, например в `/opt/simple-shadowsocks/server`.
+
+3. Создать unit-файл `/etc/systemd/system/simple-shadowsocks-server.service`:
+
+```ini
+[Unit]
+Description=SimpleShadowsocks Tunnel Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+WorkingDirectory=/opt/simple-shadowsocks/server
+ExecStart=/usr/bin/dotnet /opt/simple-shadowsocks/server/SimpleShadowsocks.Server.dll 8388
+Restart=always
+RestartSec=2
+Environment=DOTNET_ENVIRONMENT=Production
+
+# Опционально поднять лимит файловых дескрипторов под нагрузкой
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+4. Применить и запустить:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now simple-shadowsocks-server
+sudo systemctl status simple-shadowsocks-server
+```
+
+5. Смотреть логи:
+
+```bash
+journalctl -u simple-shadowsocks-server -f
 ```
 
 ### 2) Настройка ключа
@@ -69,6 +148,12 @@ dotnet run --project src\SimpleShadowsocks.Client -- 1080 127.0.0.1 8388
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj
 ```
 
+Отдельно perf-замер (Release):
+
+```powershell
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~PerformanceMeasurementsTests" --logger "console;verbosity=detailed"
+```
+
 ## Что уже реализовано
 
 - Решение и проекты на `.NET 9`:
@@ -92,7 +177,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - reconnect policy: повторные подключения с экспоненциальной задержкой в пределах настроек policy
 
 - Поточное шифрование туннеля:
-- алгоритм `ChaCha20-Poly1305 (AEAD)` (BouncyCastle)
+- алгоритм `ChaCha20-Poly1305 (AEAD)`: приоритет `System.Security.Cryptography.ChaCha20Poly1305`, fallback на BouncyCastle при недоступности платформенной реализации
 - pre-shared key из конфигурации
 - защищенный handshake (HMAC + timestamp + handshake counter) c проверкой времени на обеих сторонах
 - HKDF-разделение ключевого материала: отдельный ключ для MAC handshake и отдельный transport key для AEAD
@@ -114,7 +199,8 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - есть проверка multiplexing: две сессии через один туннель
 - есть проверка reconnect после перезапуска tunnel-сервера
 - есть проверка ограничения сессий на сервере и валидации reconnect policy
-- текущий набор: `18` тестов, проходят
+- есть perf-тест для измерения throughput/allocations
+- текущий набор: `19` тестов, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
 - `bin/<ProjectName>/...`

@@ -207,9 +207,7 @@ public sealed class Socks5Server
                     break;
                 }
 
-                var payload = new byte[read];
-                Buffer.BlockCopy(buffer, 0, payload, 0, read);
-                await multiplexer.SendDataAsync(sessionId, payload, relayToken);
+                await multiplexer.SendDataAsync(sessionId, buffer.AsMemory(0, read), relayToken);
             }
         }, relayToken);
 
@@ -220,7 +218,6 @@ public sealed class Socks5Server
                 if (data.Length > 0)
                 {
                     await clientStream.WriteAsync(data, relayToken);
-                    await clientStream.FlushAsync(relayToken);
                 }
             }
         }, relayToken);
@@ -447,7 +444,6 @@ public sealed class Socks5Server
             }
 
             await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-            await destination.FlushAsync(cancellationToken);
         }
     }
 

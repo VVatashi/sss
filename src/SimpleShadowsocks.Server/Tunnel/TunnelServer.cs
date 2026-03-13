@@ -57,13 +57,12 @@ public sealed class TunnelServer
             while (!cancellationToken.IsCancellationRequested)
             {
                 var tunnelClient = await _listener.AcceptTcpClientAsync(cancellationToken);
-                if (Volatile.Read(ref _activeTunnelConnections) >= _serverPolicy.MaxConcurrentTunnels)
+                if (!TryAcquireTunnelSlot())
                 {
                     tunnelClient.Dispose();
                     continue;
                 }
 
-                Interlocked.Increment(ref _activeTunnelConnections);
                 Interlocked.Increment(ref _acceptedTunnelConnections);
                 _ = Task.Run(
                     () => HandleTunnelSafelyAsync(tunnelClient, cancellationToken),
@@ -282,12 +281,10 @@ public sealed class TunnelServer
                         break;
                     }
 
-                    var payload = new byte[read];
-                    Buffer.BlockCopy(buffer, 0, payload, 0, read);
                     var sequence = context.TakeNextSendSequence();
                     await SendFrameLockedAsync(
                         secureStream,
-                        new ProtocolFrame(FrameType.Data, context.SessionId, sequence, payload),
+                        new ProtocolFrame(FrameType.Data, context.SessionId, sequence, buffer.AsMemory(0, read)),
                         writeLock,
                         context.Cancellation.Token);
                 }
@@ -455,6 +452,23 @@ public sealed class TunnelServer
         if (policy.MaxSessionsPerTunnel <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(policy.MaxSessionsPerTunnel), "MaxSessionsPerTunnel must be > 0.");
+        }
+    }
+
+    private bool TryAcquireTunnelSlot()
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _activeTunnelConnections);
+            if (current >= _serverPolicy.MaxConcurrentTunnels)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _activeTunnelConnections, current + 1, current) == current)
+            {
+                return true;
+            }
         }
     }
 }

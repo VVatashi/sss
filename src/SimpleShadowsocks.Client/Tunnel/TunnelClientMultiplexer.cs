@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.IO.Pipelines;
+using System.Runtime.InteropServices;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using SimpleShadowsocks.Protocol;
@@ -15,14 +17,15 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
     private readonly TunnelConnectionPolicy _connectionPolicy;
 
     private readonly SemaphoreSlim _connectLock = new(1, 1);
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly ConcurrentDictionary<uint, SessionState> _sessions = new();
 
     private TcpClient? _tcpClient;
     private Stream? _secureStream;
     private CancellationTokenSource? _connectionCts;
     private Task? _readLoopTask;
+    private Task? _writeLoopTask;
     private Task? _heartbeatLoopTask;
+    private Channel<OutboundFrame>? _outboundFrames;
     private int _nextSessionId;
     private long _lastIncomingUtcTicks;
     private long _controlSendSequence;
@@ -83,7 +86,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         }
     }
 
-    public Task SendDataAsync(uint sessionId, byte[] payload, CancellationToken cancellationToken)
+    public Task SendDataAsync(uint sessionId, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
         return SendSessionFrameAsync(sessionId, FrameType.Data, payload, cancellationToken);
     }
@@ -121,8 +124,12 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
             try { await _heartbeatLoopTask; } catch { }
         }
 
+        if (_writeLoopTask is not null)
+        {
+            try { await _writeLoopTask; } catch { }
+        }
+
         _connectLock.Dispose();
-        _writeLock.Dispose();
     }
 
     private async Task EnsureConnectedAsync(CancellationToken cancellationToken)
@@ -188,8 +195,14 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
             cancellationToken);
 
         _connectionCts = new CancellationTokenSource();
+        _outboundFrames = Channel.CreateUnbounded<OutboundFrame>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false
+        });
         TouchIncoming();
 
+        _writeLoopTask = Task.Run(() => WriteLoopAsync(_connectionCts.Token));
         _readLoopTask = Task.Run(() => ReadLoopAsync(_connectionCts.Token));
         _heartbeatLoopTask = Task.Run(() => HeartbeatLoopAsync(_connectionCts.Token));
     }
@@ -197,32 +210,28 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
     private bool IsConnected()
     {
         return _secureStream is not null
+            && _outboundFrames is not null
             && _connectionCts is not null
             && !_connectionCts.IsCancellationRequested
-            && _readLoopTask is { IsCompleted: false };
+            && _readLoopTask is { IsCompleted: false }
+            && _writeLoopTask is { IsCompleted: false };
     }
 
     private async Task SendFrameAsync(ProtocolFrame frame, CancellationToken cancellationToken)
     {
-        if (_secureStream is null)
+        var outboundFrames = _outboundFrames;
+        if (outboundFrames is null || _connectionCts is null || _connectionCts.IsCancellationRequested)
         {
             throw new InvalidOperationException("Tunnel is not connected.");
         }
 
-        await _writeLock.WaitAsync(cancellationToken);
-        try
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!outboundFrames.Writer.TryWrite(new OutboundFrame(frame, completion)))
         {
-            await ProtocolFrameCodec.WriteAsync(_secureStream, frame, cancellationToken);
+            throw new IOException("Failed to enqueue outbound frame.");
         }
-        catch
-        {
-            await HandleConnectionFaultAsync();
-            throw;
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
+
+        await completion.Task.WaitAsync(cancellationToken);
     }
 
     private Task SendSessionFrameAsync(uint sessionId, FrameType frameType, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
@@ -284,7 +293,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                         break;
 
                     case FrameType.Data:
-                        await state.ReaderWriter.Writer.WriteAsync(frame.Value.Payload.ToArray(), cancellationToken);
+                        await state.ReaderWriter.Writer.WriteAsync(DetachPayload(frame.Value.Payload), cancellationToken);
                         break;
 
                     case FrameType.Close:
@@ -303,6 +312,84 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         }
         finally
         {
+            await HandleConnectionFaultAsync();
+        }
+    }
+
+    private async Task WriteLoopAsync(CancellationToken cancellationToken)
+    {
+        var outboundFrames = _outboundFrames;
+        if (_secureStream is null || outboundFrames is null)
+        {
+            return;
+        }
+
+        var writer = PipeWriter.Create(_secureStream, new StreamPipeWriterOptions(leaveOpen: true));
+        var batch = new List<OutboundFrame>(64);
+        const int maxBatchFrames = 64;
+        const int maxBatchBytes = 512 * 1024;
+
+        Exception? terminalError = null;
+        try
+        {
+            while (await outboundFrames.Reader.WaitToReadAsync(cancellationToken))
+            {
+                batch.Clear();
+                var accumulatedBytes = 0;
+                while (outboundFrames.Reader.TryRead(out var outbound))
+                {
+                    try
+                    {
+                        ProtocolFrameCodec.WriteTo(writer, outbound.Frame);
+                        batch.Add(outbound);
+                        accumulatedBytes += ProtocolConstants.HeaderSize + outbound.Frame.Payload.Length;
+
+                        if (batch.Count >= maxBatchFrames || accumulatedBytes >= maxBatchBytes)
+                        {
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        outbound.Completion.TrySetException(ex);
+                        throw;
+                    }
+                }
+
+                if (batch.Count == 0)
+                {
+                    continue;
+                }
+
+                var flushResult = await writer.FlushAsync(cancellationToken);
+                if (flushResult.IsCanceled)
+                {
+                    throw new OperationCanceledException("Outbound tunnel writer flush was canceled.");
+                }
+
+                foreach (var sent in batch)
+                {
+                    sent.Completion.TrySetResult(true);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            terminalError = new OperationCanceledException("Outbound tunnel writer was canceled.");
+        }
+        catch (Exception ex)
+        {
+            terminalError = ex;
+        }
+        finally
+        {
+            try { await writer.CompleteAsync(); } catch { }
+
+            while (outboundFrames.Reader.TryRead(out var outbound))
+            {
+                outbound.Completion.TrySetException(terminalError ?? new IOException("Tunnel writer stopped."));
+            }
+
             await HandleConnectionFaultAsync();
         }
     }
@@ -374,11 +461,36 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         }
     }
 
+    private static byte[] DetachPayload(ReadOnlyMemory<byte> payload)
+    {
+        if (MemoryMarshal.TryGetArray(payload, out var segment)
+            && segment.Array is not null
+            && segment.Offset == 0
+            && segment.Count == segment.Array.Length)
+        {
+            return segment.Array;
+        }
+
+        return payload.ToArray();
+    }
+
     private async Task HandleConnectionFaultAsync()
     {
         _connectionCts?.Cancel();
         _connectionCts?.Dispose();
         _connectionCts = null;
+
+        var outboundFrames = _outboundFrames;
+        if (outboundFrames is not null)
+        {
+            outboundFrames.Writer.TryComplete();
+            while (outboundFrames.Reader.TryRead(out var pending))
+            {
+                pending.Completion.TrySetException(new IOException("Tunnel connection fault."));
+            }
+        }
+
+        _outboundFrames = null;
 
         if (_secureStream is IAsyncDisposable asyncDisposable)
         {
@@ -445,4 +557,6 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
             }
         }
     }
+
+    private readonly record struct OutboundFrame(ProtocolFrame Frame, TaskCompletionSource<bool> Completion);
 }
