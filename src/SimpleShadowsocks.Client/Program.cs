@@ -9,6 +9,10 @@ var config = ClientConfig.Load();
 var listenPort = config.ListenPort;
 var remoteHost = config.RemoteHost;
 var remotePort = config.RemotePort;
+var remoteServers = (config.RemoteServers ?? [])
+    .Where(s => !string.IsNullOrWhiteSpace(s.Host) && s.Port > 0)
+    .Select(s => (s.Host.Trim(), s.Port))
+    .ToList();
 var sharedKey = config.SharedKey;
 var cryptoPolicy = new TunnelCryptoPolicy
 {
@@ -34,11 +38,13 @@ if (args.Length > 0 && int.TryParse(args[0], out var parsedPort))
 if (args.Length > 1 && !string.IsNullOrWhiteSpace(args[1]))
 {
     remoteHost = args[1];
+    remoteServers.Clear();
 }
 
 if (args.Length > 2 && int.TryParse(args[2], out var parsedRemotePort))
 {
     remotePort = parsedRemotePort;
+    remoteServers.Clear();
 }
 
 if (args.Length > 3 && !string.IsNullOrWhiteSpace(args[3]))
@@ -55,18 +61,33 @@ Console.CancelKeyPress += (_, eventArgs) =>
 
 Console.WriteLine("SimpleShadowsocks.Client");
 Console.WriteLine($"SOCKS5 listen: 127.0.0.1:{listenPort}");
-Console.WriteLine($"Tunnel server: {remoteHost}:{remotePort}");
+if (remoteServers.Count > 0)
+{
+    Console.WriteLine($"Tunnel servers ({remoteServers.Count}): {string.Join(", ", remoteServers.Select(s => $"{s.Item1}:{s.Item2}"))}");
+}
+else
+{
+    Console.WriteLine($"Tunnel server: {remoteHost}:{remotePort}");
+}
 Console.WriteLine($"Protocol version: {ProtocolConstants.Version}");
 Console.WriteLine("Press Ctrl+C to stop.");
 
-var server = new Socks5Server(
-    IPAddress.Loopback,
-    listenPort,
-    remoteHost,
-    remotePort,
-    sharedKey,
-    cryptoPolicy,
-    connectionPolicy);
+var server = remoteServers.Count > 0
+    ? new Socks5Server(
+        IPAddress.Loopback,
+        listenPort,
+        remoteServers,
+        sharedKey,
+        cryptoPolicy,
+        connectionPolicy)
+    : new Socks5Server(
+        IPAddress.Loopback,
+        listenPort,
+        remoteHost,
+        remotePort,
+        sharedKey,
+        cryptoPolicy,
+        connectionPolicy);
 await server.RunAsync(cts.Token);
 
 internal sealed class ClientConfig
@@ -84,6 +105,7 @@ internal sealed class ClientConfig
     public int ReconnectMaxAttempts { get; init; } = 12;
     public int MaxConcurrentSessions { get; init; } = 1024;
     public int SessionReceiveChannelCapacity { get; init; } = 256;
+    public List<RemoteServerConfig>? RemoteServers { get; init; }
 
     public static ClientConfig Load()
     {
@@ -95,5 +117,11 @@ internal sealed class ClientConfig
 
         var json = File.ReadAllText(path);
         return JsonSerializer.Deserialize<ClientConfig>(json) ?? new ClientConfig();
+    }
+
+    public sealed class RemoteServerConfig
+    {
+        public string Host { get; init; } = string.Empty;
+        public int Port { get; init; }
     }
 }

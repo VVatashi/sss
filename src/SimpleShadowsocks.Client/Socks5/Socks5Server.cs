@@ -18,12 +18,12 @@ public sealed class Socks5Server
     private const byte AddressTypeIPv6 = 0x04;
 
     private readonly TcpListener _listener;
-    private readonly string? _remoteServerHost;
-    private readonly int _remoteServerPort;
+    private readonly List<(string Host, int Port)> _remoteServers = new();
     private readonly byte[] _sharedKey;
     private readonly TunnelCryptoPolicy _cryptoPolicy;
     private readonly TunnelConnectionPolicy _connectionPolicy;
-    private TunnelClientMultiplexer? _multiplexer;
+    private List<TunnelClientMultiplexer>? _multiplexers;
+    private int _nextMultiplexerIndex = -1;
 
     public Socks5Server(IPAddress listenAddress, int port)
     {
@@ -43,8 +43,31 @@ public sealed class Socks5Server
         TunnelConnectionPolicy? connectionPolicy = null)
     {
         _listener = new TcpListener(listenAddress, port);
-        _remoteServerHost = remoteServerHost;
-        _remoteServerPort = remoteServerPort;
+        _remoteServers.Add((remoteServerHost, remoteServerPort));
+        _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
+        _cryptoPolicy = cryptoPolicy ?? TunnelCryptoPolicy.Default;
+        _connectionPolicy = connectionPolicy ?? TunnelConnectionPolicy.Default;
+    }
+
+    public Socks5Server(
+        IPAddress listenAddress,
+        int port,
+        IReadOnlyList<(string Host, int Port)> remoteServers,
+        string sharedKey,
+        TunnelCryptoPolicy? cryptoPolicy = null,
+        TunnelConnectionPolicy? connectionPolicy = null)
+    {
+        _listener = new TcpListener(listenAddress, port);
+        foreach (var (host, serverPort) in remoteServers)
+        {
+            if (string.IsNullOrWhiteSpace(host))
+            {
+                continue;
+            }
+
+            _remoteServers.Add((host, serverPort));
+        }
+
         _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
         _cryptoPolicy = cryptoPolicy ?? TunnelCryptoPolicy.Default;
         _connectionPolicy = connectionPolicy ?? TunnelConnectionPolicy.Default;
@@ -53,9 +76,14 @@ public sealed class Socks5Server
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         _listener.Start();
-        _multiplexer = string.IsNullOrWhiteSpace(_remoteServerHost)
-            ? null
-            : new TunnelClientMultiplexer(_remoteServerHost, _remoteServerPort, _sharedKey, _cryptoPolicy, _connectionPolicy);
+        if (_remoteServers.Count > 0)
+        {
+            _multiplexers = new List<TunnelClientMultiplexer>(_remoteServers.Count);
+            foreach (var (host, serverPort) in _remoteServers)
+            {
+                _multiplexers.Add(new TunnelClientMultiplexer(host, serverPort, _sharedKey, _cryptoPolicy, _connectionPolicy));
+            }
+        }
 
         try
         {
@@ -70,9 +98,12 @@ public sealed class Socks5Server
         }
         finally
         {
-            if (_multiplexer is not null)
+            if (_multiplexers is not null)
             {
-                await _multiplexer.DisposeAsync();
+                foreach (var multiplexer in _multiplexers)
+                {
+                    await multiplexer.DisposeAsync();
+                }
             }
 
             _listener.Stop();
@@ -100,6 +131,7 @@ public sealed class Socks5Server
     private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
     {
         using var clientStream = client.GetStream();
+        var selectedMultiplexer = SelectMultiplexerForClient();
 
         if (!await HandleGreetingAsync(clientStream, cancellationToken))
         {
@@ -114,13 +146,13 @@ public sealed class Socks5Server
 
         Console.WriteLine($"[socks5] proxy {request.Value.Host}:{request.Value.Port}");
 
-        if (string.IsNullOrWhiteSpace(_remoteServerHost))
+        if (selectedMultiplexer is null)
         {
             await HandleDirectAsync(clientStream, request.Value, cancellationToken);
             return;
         }
 
-        await HandleViaTunnelAsync(clientStream, request.Value, cancellationToken);
+        await HandleViaTunnelAsync(clientStream, request.Value, selectedMultiplexer, cancellationToken);
     }
 
     private static async Task HandleDirectAsync(
@@ -151,25 +183,20 @@ public sealed class Socks5Server
     private async Task HandleViaTunnelAsync(
         NetworkStream clientStream,
         Socks5ConnectRequest request,
+        TunnelClientMultiplexer multiplexer,
         CancellationToken cancellationToken)
     {
-        if (_multiplexer is null)
-        {
-            await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
-            return;
-        }
-
         var connectRequest = new ConnectRequest(ToProtocolAddressType(request.AddressType), request.Host, (ushort)request.Port);
         uint sessionId;
         byte replyCode;
         ChannelReader<byte[]> reader;
         try
         {
-            (sessionId, replyCode, reader) = await _multiplexer.OpenSessionAsync(connectRequest, cancellationToken);
+            (sessionId, replyCode, reader) = await multiplexer.OpenSessionAsync(connectRequest, cancellationToken);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[socks5] tunnel connect failed {_remoteServerHost}:{_remoteServerPort} ({ex.Message})");
+            Console.WriteLine($"[socks5] tunnel connect failed ({ex.Message})");
             await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
             return;
         }
@@ -182,7 +209,20 @@ public sealed class Socks5Server
         }
 
         await SendReplyAsync(clientStream, replyCode: 0x00, new IPEndPoint(IPAddress.Any, 0), cancellationToken);
-        await RelayViaTunnelAsync(clientStream, _multiplexer, reader, sessionId, cancellationToken);
+        await RelayViaTunnelAsync(clientStream, multiplexer, reader, sessionId, cancellationToken);
+    }
+
+    private TunnelClientMultiplexer? SelectMultiplexerForClient()
+    {
+        var multiplexers = _multiplexers;
+        if (multiplexers is null || multiplexers.Count == 0)
+        {
+            return null;
+        }
+
+        var index = Interlocked.Increment(ref _nextMultiplexerIndex);
+        var normalizedIndex = (index & int.MaxValue) % multiplexers.Count;
+        return multiplexers[normalizedIndex];
     }
 
     private static async Task RelayViaTunnelAsync(

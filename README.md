@@ -120,6 +120,15 @@ journalctl -u simple-shadowsocks-server -f
 - `MaxConcurrentSessions` - лимит активных мультиплексированных сессий на один клиентский туннель.
 - `SessionReceiveChannelCapacity` - размер буфера входящих DATA-кадров на сессию (backpressure).
 
+Параметры выбора tunnel-серверов (в `appsettings.json` клиента):
+- `RemoteHost`, `RemotePort` - одиночный сервер (обратная совместимость).
+- `RemoteServers` - список серверов для балансировки `round-robin`, формат:
+  - `{ "Host": "1.2.3.4", "Port": 8388 }`
+  - `{ "Host": "tunnel-2.example.org", "Port": 8388 }`
+
+Если `RemoteServers` не пустой, клиент использует именно его.  
+Если переданы CLI-аргументы `remoteHost/remotePort`, они переопределяют список и включают режим одиночного сервера.
+
 Параметры server policy (в `appsettings.json` сервера):
 - `MaxConcurrentTunnels` - лимит одновременных tunnel-соединений.
 - `MaxSessionsPerTunnel` - лимит сессий в одном tunnel-соединении.
@@ -175,6 +184,8 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - ordering/replay policy на уровне прикладных кадров через монотонный `Sequence` per session
 - heartbeat/idle timeout: клиент отправляет `Ping`, контролирует отсутствие входящего трафика и сбрасывает зависшее туннельное соединение
 - reconnect policy: повторные подключения с экспоненциальной задержкой в пределах настроек policy
+- клиент поддерживает группу tunnel-серверов с выбором `round-robin`
+- привязка TCP-сессии SOCKS5 к выбранному tunnel-серверу (sticky per client TCP session)
 
 - Поточное шифрование туннеля:
 - алгоритм `ChaCha20-Poly1305 (AEAD)`: приоритет `System.Security.Cryptography.ChaCha20Poly1305`, fallback на BouncyCastle при недоступности платформенной реализации
@@ -199,8 +210,9 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - есть проверка multiplexing: две сессии через один туннель
 - есть проверка reconnect после перезапуска tunnel-сервера
 - есть проверка ограничения сессий на сервере и валидации reconnect policy
+- есть проверка round-robin распределения по группе tunnel-серверов
 - есть perf-тест для измерения throughput/allocations
-- текущий набор: `19` тестов, проходят
+- текущий набор: `20` тестов, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
 - `bin/<ProjectName>/...`

@@ -75,6 +75,29 @@ public sealed class TunnelIntegrationTests
     }
 
     [Fact]
+    public async Task Socks5Client_RoundRobinAcrossTunnelServers_PerTcpSessionBinding()
+    {
+        await using var echo = await StartEchoServerAsync();
+        await using var tunnelA = await StartTunnelServerAsync();
+        await using var tunnelB = await StartTunnelServerAsync();
+        await using var socks = await StartSocksServerAsync(
+            new (string Host, int Port)[]
+            {
+                ("127.0.0.1", tunnelA.Port),
+                ("127.0.0.1", tunnelB.Port)
+            });
+
+        for (var i = 0; i < 6; i++)
+        {
+            await RunSingleSocksEchoRequestAsync(socks.Port, echo.Port, $"rr-{i}");
+        }
+
+        await Task.Delay(300);
+        Assert.True(tunnelA.Server.AcceptedTunnelConnections >= 1, "First tunnel server was not used.");
+        Assert.True(tunnelB.Server.AcceptedTunnelConnections >= 1, "Second tunnel server was not used.");
+    }
+
+    [Fact]
     public async Task Socks5Client_ReconnectsTunnel_AfterServerRestart()
     {
         await using var echo = await StartEchoServerAsync();
@@ -199,6 +222,25 @@ public sealed class TunnelIntegrationTests
             port,
             "127.0.0.1",
             tunnelPort,
+            "dev-shared-key",
+            TunnelCryptoPolicy.Default,
+            connectionPolicy ?? TunnelConnectionPolicy.Default);
+        var cts = new CancellationTokenSource();
+        var runTask = server.RunAsync(cts.Token);
+
+        await WaitUntilReachableAsync(port, cts.Token);
+        return new RunningSocksServer(port, cts, runTask);
+    }
+
+    private static async Task<RunningSocksServer> StartSocksServerAsync(
+        IReadOnlyList<(string Host, int Port)> tunnelServers,
+        TunnelConnectionPolicy? connectionPolicy = null)
+    {
+        var port = AllocateUnusedPort();
+        var server = new Socks5Server(
+            IPAddress.Loopback,
+            port,
+            tunnelServers,
             "dev-shared-key",
             TunnelCryptoPolicy.Default,
             connectionPolicy ?? TunnelConnectionPolicy.Default);
