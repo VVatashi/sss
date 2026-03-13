@@ -1,0 +1,17 @@
+# Auto-detect text files and normalize line endings in repo
+* text=auto
+
+# Keep Windows script line endings
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Common binary formats
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.pfx binary
+*.snk binary
