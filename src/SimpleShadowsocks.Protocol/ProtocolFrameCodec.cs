@@ -57,6 +57,11 @@ public static class ProtocolFrameCodec
         }
 
         var frameType = (FrameType)header[1];
+        if (!Enum.IsDefined(frameType))
+        {
+            throw new InvalidDataException($"Unsupported frame type: {(byte)frameType}.");
+        }
+
         var sessionId = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(2, 4));
         var sequence = BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(6, 8));
         var payloadLength = BinaryPrimitives.ReadUInt32BigEndian(header.AsSpan(14, 4));

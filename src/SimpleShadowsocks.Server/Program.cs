@@ -12,6 +12,11 @@ var cryptoPolicy = new TunnelCryptoPolicy
     HandshakeMaxClockSkewSeconds = config.HandshakeMaxClockSkewSeconds,
     ReplayWindowSeconds = config.ReplayWindowSeconds
 };
+var serverPolicy = new TunnelServerPolicy
+{
+    MaxConcurrentTunnels = config.MaxConcurrentTunnels,
+    MaxSessionsPerTunnel = config.MaxSessionsPerTunnel
+};
 
 if (args.Length > 0 && int.TryParse(args[0], out var parsedPort))
 {
@@ -35,7 +40,7 @@ Console.WriteLine($"Tunnel listen: 0.0.0.0:{listenPort}");
 Console.WriteLine($"Protocol version: {ProtocolConstants.Version}");
 Console.WriteLine("Press Ctrl+C to stop.");
 
-var server = new TunnelServer(IPAddress.Any, listenPort, sharedKey, cryptoPolicy);
+var server = new TunnelServer(IPAddress.Any, listenPort, sharedKey, cryptoPolicy, serverPolicy);
 await server.RunAsync(cts.Token);
 
 internal sealed class ServerConfig
@@ -44,6 +49,8 @@ internal sealed class ServerConfig
     public string SharedKey { get; init; } = "dev-shared-key";
     public int HandshakeMaxClockSkewSeconds { get; init; } = 60;
     public int ReplayWindowSeconds { get; init; } = 300;
+    public int MaxConcurrentTunnels { get; init; } = 1024;
+    public int MaxSessionsPerTunnel { get; init; } = 1024;
 
     public static ServerConfig Load()
     {

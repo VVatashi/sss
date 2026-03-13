@@ -21,7 +21,9 @@ var connectionPolicy = new TunnelConnectionPolicy
     IdleTimeoutSeconds = config.IdleTimeoutSeconds,
     ReconnectBaseDelayMs = config.ReconnectBaseDelayMs,
     ReconnectMaxDelayMs = config.ReconnectMaxDelayMs,
-    ReconnectMaxAttempts = config.ReconnectMaxAttempts
+    ReconnectMaxAttempts = config.ReconnectMaxAttempts,
+    MaxConcurrentSessions = config.MaxConcurrentSessions,
+    SessionReceiveChannelCapacity = config.SessionReceiveChannelCapacity
 };
 
 if (args.Length > 0 && int.TryParse(args[0], out var parsedPort))
@@ -80,6 +82,8 @@ internal sealed class ClientConfig
     public int ReconnectBaseDelayMs { get; init; } = 200;
     public int ReconnectMaxDelayMs { get; init; } = 2000;
     public int ReconnectMaxAttempts { get; init; } = 12;
+    public int MaxConcurrentSessions { get; init; } = 1024;
+    public int SessionReceiveChannelCapacity { get; init; } = 256;
 
     public static ClientConfig Load()
     {

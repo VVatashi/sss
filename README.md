@@ -38,6 +38,12 @@ dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
 - `ReconnectBaseDelayMs` - базовая задержка reconnect.
 - `ReconnectMaxDelayMs` - верхняя граница задержки reconnect.
 - `ReconnectMaxAttempts` - число попыток reconnect перед ошибкой.
+- `MaxConcurrentSessions` - лимит активных мультиплексированных сессий на один клиентский туннель.
+- `SessionReceiveChannelCapacity` - размер буфера входящих DATA-кадров на сессию (backpressure).
+
+Параметры server policy (в `appsettings.json` сервера):
+- `MaxConcurrentTunnels` - лимит одновременных tunnel-соединений.
+- `MaxSessionsPerTunnel` - лимит сессий в одном tunnel-соединении.
 
 ### 3) Запуск
 
@@ -88,11 +94,12 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - Поточное шифрование туннеля:
 - алгоритм `ChaCha20-Poly1305 (AEAD)` (BouncyCastle)
 - pre-shared key из конфигурации
-- защищенный nonce-handshake (HMAC + timestamp + handshake counter)
+- защищенный handshake (HMAC + timestamp + handshake counter) c проверкой времени на обеих сторонах
+- HKDF-разделение ключевого материала: отдельный ключ для MAC handshake и отдельный transport key для AEAD
 - последующий обмен всеми кадрами в зашифрованном и аутентифицированном виде
 - nonce policy: уникальный nonce на каждый AEAD-record через base nonce + counter
 - защита от повторного использования nonce при исчерпании счетчика (требуется re-key)
-- replay protection на сервере для handshake (cache + replay window)
+- replay protection на сервере для handshake (bounded cache + replay window)
 
 - Сервер туннеля:
 - принимает `CONNECT` кадр
@@ -100,12 +107,14 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - возвращает код результата
 - передает `DATA` в обе стороны
 - держит несколько независимых upstream-сессий в одном соединении с клиентом
+- ограничивает число tunnel-соединений и число сессий на туннель (hard limits)
 
 - Тесты:
 - unit + integration тесты SOCKS5, протокола и туннеля
 - есть проверка multiplexing: две сессии через один туннель
 - есть проверка reconnect после перезапуска tunnel-сервера
-- текущий набор: `15` тестов, проходят
+- есть проверка ограничения сессий на сервере и валидации reconnect policy
+- текущий набор: `18` тестов, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
 - `bin/<ProjectName>/...`
@@ -143,6 +152,6 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 ## Следующие шаги
 
 1. Добавить ротацию pre-shared key и процедуру key update.
-2. Добавить backpressure/лимиты на число сессий и буферов в multiplexer.
-3. Добавить метрики по sequence violations и отказам сессий.
-4. Добавить persist replay-cache (или distributed replay-cache) для multi-instance server deployment.
+2. Добавить метрики по sequence violations и отказам сессий.
+3. Добавить persist replay-cache (или distributed replay-cache) для multi-instance server deployment.
+4. Добавить graceful session migration/resume при reconnect (сейчас сессии закрываются).

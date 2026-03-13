@@ -39,6 +39,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         _sharedKey = sharedKey;
         _cryptoPolicy = cryptoPolicy;
         _connectionPolicy = connectionPolicy;
+        ValidatePolicy(_connectionPolicy);
         TouchIncoming();
     }
 
@@ -47,9 +48,14 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         await EnsureConnectedAsync(cancellationToken);
+        if (_sessions.Count >= _connectionPolicy.MaxConcurrentSessions)
+        {
+            throw new InvalidOperationException(
+                $"Max concurrent sessions limit reached: {_connectionPolicy.MaxConcurrentSessions}.");
+        }
 
         var sessionId = (uint)Interlocked.Increment(ref _nextSessionId);
-        var state = new SessionState();
+        var state = new SessionState(_connectionPolicy.SessionReceiveChannelCapacity);
         if (!_sessions.TryAdd(sessionId, state))
         {
             throw new InvalidOperationException("Failed to register tunnel session.");
@@ -278,7 +284,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                         break;
 
                     case FrameType.Data:
-                        state.ReaderWriter.Writer.TryWrite(frame.Value.Payload.ToArray());
+                        await state.ReaderWriter.Writer.WriteAsync(frame.Value.Payload.ToArray(), cancellationToken);
                         break;
 
                     case FrameType.Close:
@@ -336,6 +342,38 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         Interlocked.Exchange(ref _lastIncomingUtcTicks, DateTime.UtcNow.Ticks);
     }
 
+    private static void ValidatePolicy(TunnelConnectionPolicy policy)
+    {
+        if (policy.ReconnectMaxAttempts <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy.ReconnectMaxAttempts), "ReconnectMaxAttempts must be > 0.");
+        }
+
+        if (policy.ReconnectBaseDelayMs <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy.ReconnectBaseDelayMs), "ReconnectBaseDelayMs must be > 0.");
+        }
+
+        if (policy.ReconnectMaxDelayMs < policy.ReconnectBaseDelayMs)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(policy.ReconnectMaxDelayMs),
+                "ReconnectMaxDelayMs must be >= ReconnectBaseDelayMs.");
+        }
+
+        if (policy.MaxConcurrentSessions <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy.MaxConcurrentSessions), "MaxConcurrentSessions must be > 0.");
+        }
+
+        if (policy.SessionReceiveChannelCapacity <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(policy.SessionReceiveChannelCapacity),
+                "SessionReceiveChannelCapacity must be > 0.");
+        }
+    }
+
     private async Task HandleConnectionFaultAsync()
     {
         _connectionCts?.Cancel();
@@ -373,12 +411,17 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         public TaskCompletionSource<byte> ConnectReply { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public Channel<byte[]> ReaderWriter { get; } =
-            Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions
+        public Channel<byte[]> ReaderWriter { get; }
+
+        public SessionState(int receiveChannelCapacity)
+        {
+            ReaderWriter = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(receiveChannelCapacity)
             {
                 SingleReader = true,
-                SingleWriter = false
+                SingleWriter = true,
+                FullMode = BoundedChannelFullMode.Wait
             });
+        }
 
         public ulong TakeNextSendSequence()
         {

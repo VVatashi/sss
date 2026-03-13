@@ -47,6 +47,17 @@ public sealed class ProtocolFrameCodecTests
     }
 
     [Fact]
+    public async Task FrameCodec_InvalidFrameType_ThrowsInvalidDataException()
+    {
+        var raw = new byte[ProtocolConstants.HeaderSize];
+        raw[0] = ProtocolConstants.Version;
+        raw[1] = 0xFF;
+
+        await using var stream = new MemoryStream(raw);
+        await Assert.ThrowsAsync<InvalidDataException>(async () => _ = await ProtocolFrameCodec.ReadAsync(stream));
+    }
+
+    [Fact]
     public void ConnectPayload_Domain_RoundTrip()
     {
         var request = new ConnectRequest(AddressType.Domain, "example.org", 443);

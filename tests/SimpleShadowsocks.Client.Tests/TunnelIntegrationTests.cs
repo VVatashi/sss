@@ -121,10 +121,57 @@ public sealed class TunnelIntegrationTests
         await using var tunnel2 = await restartTask;
     }
 
-    private static async Task<RunningTunnelServer> StartTunnelServerAsync()
+    [Fact]
+    public async Task Socks5Client_SecondSessionIsRejected_WhenServerSessionLimitReached()
+    {
+        await using var echo = await StartEchoServerAsync();
+        await using var tunnel = await StartTunnelServerAsync(new TunnelServerPolicy
+        {
+            MaxConcurrentTunnels = 32,
+            MaxSessionsPerTunnel = 1
+        });
+        await using var socks = await StartSocksServerAsync(tunnel.Port);
+
+        using var tcpClient1 = new TcpClient();
+        await tcpClient1.ConnectAsync(IPAddress.Loopback, socks.Port);
+        using var stream1 = tcpClient1.GetStream();
+        await stream1.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        Assert.Equal(new byte[] { 0x05, 0x00 }, await ReadExactAsync(stream1, 2));
+        await stream1.WriteAsync(BuildConnectRequestIPv4(IPAddress.Loopback, echo.Port));
+        var firstConnect = await ReadExactAsync(stream1, 10);
+        Assert.Equal((byte)0x00, firstConnect[1]);
+
+        using var tcpClient2 = new TcpClient();
+        await tcpClient2.ConnectAsync(IPAddress.Loopback, socks.Port);
+        using var stream2 = tcpClient2.GetStream();
+        await stream2.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        Assert.Equal(new byte[] { 0x05, 0x00 }, await ReadExactAsync(stream2, 2));
+        await stream2.WriteAsync(BuildConnectRequestIPv4(IPAddress.Loopback, echo.Port));
+        var secondConnect = await ReadExactAsync(stream2, 10);
+        Assert.NotEqual((byte)0x00, secondConnect[1]);
+    }
+
+    [Fact]
+    public void TunnelClientMultiplexer_InvalidReconnectPolicy_Throws()
+    {
+        var policy = new TunnelConnectionPolicy
+        {
+            ReconnectMaxAttempts = 0
+        };
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new TunnelClientMultiplexer(
+                "127.0.0.1",
+                12345,
+                System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("dev-shared-key")),
+                TunnelCryptoPolicy.Default,
+                policy));
+    }
+
+    private static async Task<RunningTunnelServer> StartTunnelServerAsync(TunnelServerPolicy? serverPolicy = null)
     {
         var port = AllocateUnusedPort();
-        var server = new TunnelServer(IPAddress.Loopback, port);
+        var server = new TunnelServer(IPAddress.Loopback, port, "dev-shared-key", TunnelCryptoPolicy.Default, serverPolicy);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 

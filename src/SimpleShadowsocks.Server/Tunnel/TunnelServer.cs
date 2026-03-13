@@ -6,12 +6,22 @@ using SimpleShadowsocks.Protocol.Crypto;
 
 namespace SimpleShadowsocks.Server.Tunnel;
 
+public sealed class TunnelServerPolicy
+{
+    public static TunnelServerPolicy Default { get; } = new();
+
+    public int MaxConcurrentTunnels { get; init; } = 1024;
+    public int MaxSessionsPerTunnel { get; init; } = 1024;
+}
+
 public sealed class TunnelServer
 {
     private readonly TcpListener _listener;
     private readonly byte[] _sharedKey;
     private readonly TunnelCryptoPolicy _cryptoPolicy;
+    private readonly TunnelServerPolicy _serverPolicy;
     private int _acceptedTunnelConnections;
+    private int _activeTunnelConnections;
 
     public int AcceptedTunnelConnections => Volatile.Read(ref _acceptedTunnelConnections);
 
@@ -20,13 +30,22 @@ public sealed class TunnelServer
         _listener = new TcpListener(listenAddress, port);
         _sharedKey = PreSharedKey.Derive32Bytes("dev-shared-key");
         _cryptoPolicy = TunnelCryptoPolicy.Default;
+        _serverPolicy = TunnelServerPolicy.Default;
+        ValidatePolicy(_serverPolicy);
     }
 
-    public TunnelServer(IPAddress listenAddress, int port, string sharedKey, TunnelCryptoPolicy? cryptoPolicy = null)
+    public TunnelServer(
+        IPAddress listenAddress,
+        int port,
+        string sharedKey,
+        TunnelCryptoPolicy? cryptoPolicy = null,
+        TunnelServerPolicy? serverPolicy = null)
     {
         _listener = new TcpListener(listenAddress, port);
         _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
         _cryptoPolicy = cryptoPolicy ?? TunnelCryptoPolicy.Default;
+        _serverPolicy = serverPolicy ?? TunnelServerPolicy.Default;
+        ValidatePolicy(_serverPolicy);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -38,9 +57,16 @@ public sealed class TunnelServer
             while (!cancellationToken.IsCancellationRequested)
             {
                 var tunnelClient = await _listener.AcceptTcpClientAsync(cancellationToken);
+                if (Volatile.Read(ref _activeTunnelConnections) >= _serverPolicy.MaxConcurrentTunnels)
+                {
+                    tunnelClient.Dispose();
+                    continue;
+                }
+
+                Interlocked.Increment(ref _activeTunnelConnections);
                 Interlocked.Increment(ref _acceptedTunnelConnections);
                 _ = Task.Run(
-                    () => HandleTunnelSafelyAsync(tunnelClient, _sharedKey, _cryptoPolicy, cancellationToken),
+                    () => HandleTunnelSafelyAsync(tunnelClient, cancellationToken),
                     cancellationToken);
             }
         }
@@ -53,17 +79,13 @@ public sealed class TunnelServer
         }
     }
 
-    private static async Task HandleTunnelSafelyAsync(
-        TcpClient tunnelClient,
-        byte[] sharedKey,
-        TunnelCryptoPolicy cryptoPolicy,
-        CancellationToken cancellationToken)
+    private async Task HandleTunnelSafelyAsync(TcpClient tunnelClient, CancellationToken cancellationToken)
     {
         using (tunnelClient)
         {
             try
             {
-                await HandleTunnelAsync(tunnelClient, sharedKey, cryptoPolicy, cancellationToken);
+                await HandleTunnelAsync(tunnelClient, _sharedKey, _cryptoPolicy, _serverPolicy, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -72,6 +94,10 @@ public sealed class TunnelServer
             {
                 Console.WriteLine($"[tunnel] client failed: {ex.Message}");
             }
+            finally
+            {
+                Interlocked.Decrement(ref _activeTunnelConnections);
+            }
         }
     }
 
@@ -79,6 +105,7 @@ public sealed class TunnelServer
         TcpClient tunnelClient,
         byte[] sharedKey,
         TunnelCryptoPolicy cryptoPolicy,
+        TunnelServerPolicy serverPolicy,
         CancellationToken cancellationToken)
     {
         using var tunnelStream = tunnelClient.GetStream();
@@ -104,7 +131,7 @@ public sealed class TunnelServer
                 switch (frame.Value.Type)
                 {
                     case FrameType.Connect:
-                        await HandleConnectFrameAsync(secureStream, writeLock, sessions, frame.Value, cancellationToken);
+                        await HandleConnectFrameAsync(secureStream, writeLock, sessions, frame.Value, serverPolicy, cancellationToken);
                         break;
 
                     case FrameType.Data:
@@ -187,8 +214,15 @@ public sealed class TunnelServer
         SemaphoreSlim writeLock,
         ConcurrentDictionary<uint, SessionContext> sessions,
         ProtocolFrame frame,
+        TunnelServerPolicy serverPolicy,
         CancellationToken cancellationToken)
     {
+        if (sessions.Count >= serverPolicy.MaxSessionsPerTunnel)
+        {
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
+            return;
+        }
+
         if (sessions.ContainsKey(frame.SessionId))
         {
             await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
@@ -408,6 +442,19 @@ public sealed class TunnelServer
             try { UpstreamStream.Dispose(); } catch { }
             try { UpstreamClient.Dispose(); } catch { }
             try { Cancellation.Dispose(); } catch { }
+        }
+    }
+
+    private static void ValidatePolicy(TunnelServerPolicy policy)
+    {
+        if (policy.MaxConcurrentTunnels <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy.MaxConcurrentTunnels), "MaxConcurrentTunnels must be > 0.");
+        }
+
+        if (policy.MaxSessionsPerTunnel <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy.MaxSessionsPerTunnel), "MaxSessionsPerTunnel must be > 0.");
         }
     }
 }

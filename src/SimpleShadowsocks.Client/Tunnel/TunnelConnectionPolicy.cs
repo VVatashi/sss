@@ -9,4 +9,6 @@ public sealed class TunnelConnectionPolicy
     public int ReconnectBaseDelayMs { get; init; } = 200;
     public int ReconnectMaxDelayMs { get; init; } = 2000;
     public int ReconnectMaxAttempts { get; init; } = 12;
+    public int MaxConcurrentSessions { get; init; } = 1024;
+    public int SessionReceiveChannelCapacity { get; init; } = 256;
 }
