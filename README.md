@@ -1,55 +1,86 @@
 # SimpleShadowsocks
 
-Прототип клиент-серверного TCP-туннеля, похожего по идее на Shadowsocks:
-- на клиенте поднимается локальный SOCKS5-сервер;
-- клиент устанавливает TCP-сессию с удалённым сервером;
-- сервер проксирует трафик к целевым хостам от имени клиента.
+## Быстрый старт (сборка, запуск, тесты)
 
-## Статус
+Требования:
+- `.NET SDK 9.0+`
 
-Инициализировано `.NET 9` решение с 3 проектами:
-- `src/SimpleShadowsocks.Client` - консольный клиент (локальный SOCKS5 endpoint);
-- `src/SimpleShadowsocks.Server` - консольный сервер-туннель;
-- `src/SimpleShadowsocks.Protocol` - общие модели и константы протокола.
+Команды выполнять из корня репозитория.
 
-## Архитектура
+### 1) Сборка
 
-### 1) Компоненты
+```powershell
+dotnet build src\SimpleShadowsocks.Protocol\SimpleShadowsocks.Protocol.csproj
+dotnet build src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj
+dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
+```
+
+### 2) Запуск
+
+Сервер (пока каркас):
+```powershell
+dotnet run --project src\SimpleShadowsocks.Server -- 8388
+```
+
+Клиентский SOCKS5-прокси:
+```powershell
+dotnet run --project src\SimpleShadowsocks.Client -- 1080
+```
+
+После запуска клиент слушает `127.0.0.1:1080`.
+
+### 3) Тесты
+
+```powershell
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj
+```
+
+## Что уже реализовано
+
+- Инициализировано решение `.NET 9`.
+- Реализован рабочий SOCKS5-сервер в клиенте:
+- handshake `VER=5`, только метод `NO AUTH (0x00)`;
+- поддержка `CONNECT (0x01)`;
+- поддержка адресов `IPv4`, `IPv6`, `Domain`;
+- корректные SOCKS5 reply-коды для ошибок;
+- двунаправленный TCP relay (клиент <-> целевой хост).
+- Добавлены unit-тесты SOCKS5 (5 сценариев), тесты проходят.
+- Настроен общий вывод сборки всех проектов в корневые каталоги:
+- `bin/<ProjectName>/...`
+- `obj/<ProjectName>/...`
+
+## Текущая структура проекта
+
+- `src/SimpleShadowsocks.Client` - клиент, локальный SOCKS5-proxy.
+- `src/SimpleShadowsocks.Server` - сервер туннеля (пока точка входа/каркас).
+- `src/SimpleShadowsocks.Protocol` - общие типы и константы протокола.
+- `tests/SimpleShadowsocks.Client.Tests` - unit-тесты SOCKS5-клиента.
+
+## Архитектура (целевая)
+
+### Компоненты
 
 1. `Client (Local Proxy)`
-- Слушает `127.0.0.1:1080` (по умолчанию).
-- Выполняет SOCKS5 handshake с приложением пользователя.
-- Извлекает `DST.ADDR`/`DST.PORT` из SOCKS5 `CONNECT`.
-- Упаковывает запрос в внутренний протокол и шифрует полезную нагрузку.
-- Передаёт кадры серверу по TCP.
+- принимает локальные SOCKS5-подключения;
+- формирует запросы к удаленному серверу по внутреннему протоколу.
 
 2. `Server (Remote Relay)`
-- Слушает порт туннеля (например, `:8388`).
-- Аутентифицирует клиента и расшифровывает кадры.
-- Для `CONNECT` создаёт исходящее TCP-подключение к целевому хосту.
-- Для `DATA` пересылает байты в целевой сокет.
-- Читает ответы от целевого хоста и отправляет обратно клиенту `DATA`-кадрами.
+- принимает туннельные подключения от клиента;
+- открывает исходящие TCP-соединения к целевым хостам;
+- возвращает данные клиенту.
 
 3. `Protocol (Shared Contract)`
-- Версия протокола.
-- Типы кадров (`Connect`, `Data`, `Close`, `Ping`, `Pong`).
-- Типы адресов (`IPv4`, `Domain`, `IPv6`).
-- DTO/record-структуры для межпроектного контракта.
+- общий контракт между клиентом и сервером;
+- версия протокола, типы кадров и адресов.
 
-### 2) Поток данных
+### Поток данных (цель)
 
-1. Приложение -> SOCKS5 `Client` (локально).
-2. `Client` -> `Server` (один или несколько TCP-каналов туннеля).
-3. `Server` -> целевой ресурс (обычный TCP).
-4. Ответ идёт в обратном направлении тем же маршрутом.
+1. Приложение -> локальный SOCKS5 (`Client`).
+2. `Client` -> `Server` по TCP (позже: шифрованный канал).
+3. `Server` -> целевой хост.
+4. Ответ в обратном направлении.
 
-### 3) Модель сессий
-
-- Каждому SOCKS5 `CONNECT` соответствует `sessionId`.
-- Внутри одного TCP-туннеля можно мультиплексировать несколько `sessionId`.
-- `Close` завершает конкретную сессию без разрыва всего туннеля.
-
-### 4) Внутренний кадр протокола (предложение)
+## Внутренний протокол (черновой формат)
 
 ```text
 +--------+----------+------------+-----------+--------------+
@@ -57,51 +88,21 @@
 +--------+----------+------------+-----------+--------------+
 ```
 
-- `VER` - версия протокола.
-- `TYPE` - тип кадра.
-- `SESSION` - идентификатор логической TCP-сессии.
-- `LEN` - длина payload.
-- `PAYLOAD` - данные (`CONNECT` метаданные или сырой TCP data).
+Где:
+- `VER` - версия;
+- `TYPE` - `Connect/Data/Close/Ping/Pong`;
+- `SESSION` - идентификатор логической сессии;
+- `LEN` - длина payload;
+- `PAYLOAD` - полезные данные.
 
-### 5) Безопасность (MVP -> Production)
+## Ограничения текущего состояния
 
-MVP:
-- pre-shared key;
-- шифрование `AES-256-GCM` на payload/кадр;
-- защита от replay через nonce + счётчик пакетов.
+- Клиент уже реализует SOCKS5 и relay, но пока подключается к целевому хосту напрямую.
+- Реальная передача через `Client <-> Server` туннель и шифрование еще не реализованы.
 
-Дальше:
-- ротация ключей;
-- ограничение по IP/ACL;
-- rate limiting;
-- optional obfuscation/маскировка трафика.
+## Следующие шаги
 
-### 6) Конфигурация
-
-Рекомендуемый `appsettings.json` для клиента и сервера:
-- `ListenHost`, `ListenPort`;
-- `RemoteHost`, `RemotePort` (для клиента);
-- `SharedKey`;
-- `ConnectTimeoutMs`, `IdleTimeoutMs`;
-- `MaxConcurrentSessions`.
-
-## План реализации
-
-1. Реализовать SOCKS5 handshake (`NO AUTH`, `CONNECT`) в клиенте.
-2. Реализовать framing + сериализацию в `Protocol`.
-3. Реализовать канал `Client <-> Server` с шифрованием.
-4. Реализовать session manager и мультиплексирование.
-5. Добавить heartbeat (`Ping/Pong`) и idle timeout.
-6. Добавить интеграционные тесты (локальный echo-сервер).
-7. Добавить метрики/логи (`Microsoft.Extensions.Logging`).
-
-## Быстрый старт
-
-```powershell
-dotnet build SimpleShadowsocks.sln
-
-dotnet run --project src/SimpleShadowsocks.Server -- 8388
-dotnet run --project src/SimpleShadowsocks.Client -- 1080
-```
-
-Сейчас `Client` и `Server` являются каркасом с точками входа и базовым контрактом протокола.
+1. Реализовать framing/serialization в `Protocol`.
+2. Переключить клиент с прямого `CONNECT` на отправку `CONNECT/DATA/CLOSE` кадрами серверу.
+3. Реализовать обработку сессий на сервере.
+4. Добавить шифрование канала (MVP: pre-shared key + AEAD).

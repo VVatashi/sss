@@ -14,6 +14,7 @@
 # Logs
 *.log
 msbuild.log
+test-build.log
 
 # Local .NET CLI home/cache used in this workspace
 .dotnet/
