@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using SimpleShadowsocks.Protocol;
 
 namespace SimpleShadowsocks.Client.Socks5;
 
@@ -14,10 +15,19 @@ public sealed class Socks5Server
     private const byte AddressTypeIPv6 = 0x04;
 
     private readonly TcpListener _listener;
+    private readonly string? _remoteServerHost;
+    private readonly int _remoteServerPort;
 
     public Socks5Server(IPAddress listenAddress, int port)
     {
         _listener = new TcpListener(listenAddress, port);
+    }
+
+    public Socks5Server(IPAddress listenAddress, int port, string remoteServerHost, int remoteServerPort)
+    {
+        _listener = new TcpListener(listenAddress, port);
+        _remoteServerHost = remoteServerHost;
+        _remoteServerPort = remoteServerPort;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -41,7 +51,7 @@ public sealed class Socks5Server
         }
     }
 
-    private static async Task HandleClientSafelyAsync(TcpClient client, CancellationToken cancellationToken)
+    private async Task HandleClientSafelyAsync(TcpClient client, CancellationToken cancellationToken)
     {
         using (client)
         {
@@ -59,7 +69,7 @@ public sealed class Socks5Server
         }
     }
 
-    private static async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
+    private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
     {
         using var clientStream = client.GetStream();
 
@@ -74,15 +84,31 @@ public sealed class Socks5Server
             return;
         }
 
+        Console.WriteLine($"[socks5] proxy {request.Value.Host}:{request.Value.Port}");
+
+        if (string.IsNullOrWhiteSpace(_remoteServerHost))
+        {
+            await HandleDirectAsync(clientStream, request.Value, cancellationToken);
+            return;
+        }
+
+        await HandleViaTunnelAsync(clientStream, request.Value, cancellationToken);
+    }
+
+    private static async Task HandleDirectAsync(
+        NetworkStream clientStream,
+        Socks5ConnectRequest request,
+        CancellationToken cancellationToken)
+    {
         using var upstream = new TcpClient();
 
         try
         {
-            await ConnectAsync(upstream, request.Value, cancellationToken);
+            await ConnectDirectAsync(upstream, request, cancellationToken);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[socks5] connect failed {request.Value.Host}:{request.Value.Port} ({ex.Message})");
+            Console.WriteLine($"[socks5] connect failed {request.Host}:{request.Port} ({ex.Message})");
             await SendReplyAsync(clientStream, replyCode: 0x05, null, cancellationToken);
             return;
         }
@@ -90,9 +116,132 @@ public sealed class Socks5Server
         var boundEndPoint = upstream.Client.LocalEndPoint as IPEndPoint;
         await SendReplyAsync(clientStream, replyCode: 0x00, boundEndPoint, cancellationToken);
 
-        Console.WriteLine($"[socks5] proxy {request.Value.Host}:{request.Value.Port}");
         using var upstreamStream = upstream.GetStream();
-        await RelayAsync(clientStream, upstreamStream, cancellationToken);
+        await RelayRawAsync(clientStream, upstreamStream, cancellationToken);
+    }
+
+    private async Task HandleViaTunnelAsync(
+        NetworkStream clientStream,
+        Socks5ConnectRequest request,
+        CancellationToken cancellationToken)
+    {
+        using var tunnelClient = new TcpClient();
+
+        try
+        {
+            await tunnelClient.ConnectAsync(_remoteServerHost!, _remoteServerPort, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[socks5] tunnel connect failed {_remoteServerHost}:{_remoteServerPort} ({ex.Message})");
+            await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
+            return;
+        }
+
+        using var tunnelStream = tunnelClient.GetStream();
+        const uint sessionId = 1;
+
+        var connectRequest = new ConnectRequest(ToProtocolAddressType(request.AddressType), request.Host, (ushort)request.Port);
+        var connectPayload = ProtocolPayloadSerializer.SerializeConnectRequest(connectRequest);
+
+        await ProtocolFrameCodec.WriteAsync(
+            tunnelStream,
+            new ProtocolFrame(FrameType.Connect, sessionId, connectPayload),
+            cancellationToken);
+
+        var connectReply = await ProtocolFrameCodec.ReadAsync(tunnelStream, cancellationToken);
+        if (connectReply is null || connectReply.Value.Type != FrameType.Connect || connectReply.Value.Payload.Length < 1)
+        {
+            Console.WriteLine($"[socks5] tunnel protocol error for {request.Host}:{request.Port}");
+            await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
+            return;
+        }
+
+        var replyCode = connectReply.Value.Payload.Span[0];
+        if (replyCode != 0x00)
+        {
+            Console.WriteLine($"[socks5] connect failed {request.Host}:{request.Port} (remote reply={replyCode})");
+            await SendReplyAsync(clientStream, replyCode, null, cancellationToken);
+            return;
+        }
+
+        await SendReplyAsync(clientStream, replyCode: 0x00, new IPEndPoint(IPAddress.Any, 0), cancellationToken);
+        await RelayViaTunnelAsync(clientStream, tunnelStream, sessionId, cancellationToken);
+    }
+
+    private static async Task RelayViaTunnelAsync(
+        NetworkStream clientStream,
+        NetworkStream tunnelStream,
+        uint sessionId,
+        CancellationToken cancellationToken)
+    {
+        using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var relayToken = relayCts.Token;
+
+        var clientToTunnel = Task.Run(async () =>
+        {
+            var buffer = new byte[16 * 1024];
+            while (!relayToken.IsCancellationRequested)
+            {
+                var read = await clientStream.ReadAsync(buffer, relayToken);
+                if (read == 0)
+                {
+                    await ProtocolFrameCodec.WriteAsync(
+                        tunnelStream,
+                        new ProtocolFrame(FrameType.Close, sessionId, ProtocolPayloadSerializer.SerializeClose(0x00)),
+                        relayToken);
+                    break;
+                }
+
+                var payload = new byte[read];
+                Buffer.BlockCopy(buffer, 0, payload, 0, read);
+                await ProtocolFrameCodec.WriteAsync(
+                    tunnelStream,
+                    new ProtocolFrame(FrameType.Data, sessionId, payload),
+                    relayToken);
+            }
+        }, relayToken);
+
+        var tunnelToClient = Task.Run(async () =>
+        {
+            while (!relayToken.IsCancellationRequested)
+            {
+                var frame = await ProtocolFrameCodec.ReadAsync(tunnelStream, relayToken);
+                if (frame is null)
+                {
+                    break;
+                }
+
+                if (frame.Value.SessionId != sessionId)
+                {
+                    continue;
+                }
+
+                switch (frame.Value.Type)
+                {
+                    case FrameType.Data:
+                        if (!frame.Value.Payload.IsEmpty)
+                        {
+                            await clientStream.WriteAsync(frame.Value.Payload, relayToken);
+                            await clientStream.FlushAsync(relayToken);
+                        }
+                        break;
+                    case FrameType.Close:
+                        return;
+                }
+            }
+        }, relayToken);
+
+        await Task.WhenAny(clientToTunnel, tunnelToClient);
+        relayCts.Cancel();
+
+        try
+        {
+            await Task.WhenAll(clientToTunnel, tunnelToClient);
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 
     private static async Task<bool> HandleGreetingAsync(NetworkStream stream, CancellationToken cancellationToken)
@@ -172,7 +321,7 @@ public sealed class Socks5Server
             return null;
         }
 
-        return new Socks5ConnectRequest(host, port);
+        return new Socks5ConnectRequest(host, port, addressType);
     }
 
     private static async Task<string?> ReadIPv4AddressAsync(NetworkStream stream, CancellationToken cancellationToken)
@@ -220,7 +369,7 @@ public sealed class Socks5Server
         return System.Text.Encoding.ASCII.GetString(domainBytes);
     }
 
-    private static async Task ConnectAsync(TcpClient client, Socks5ConnectRequest request, CancellationToken cancellationToken)
+    private static async Task ConnectDirectAsync(TcpClient client, Socks5ConnectRequest request, CancellationToken cancellationToken)
     {
         if (IPAddress.TryParse(request.Host, out var ipAddress))
         {
@@ -229,6 +378,17 @@ public sealed class Socks5Server
         }
 
         await client.ConnectAsync(request.Host, request.Port, cancellationToken);
+    }
+
+    private static AddressType ToProtocolAddressType(byte socksAddressType)
+    {
+        return socksAddressType switch
+        {
+            AddressTypeIPv4 => AddressType.IPv4,
+            AddressTypeIPv6 => AddressType.IPv6,
+            AddressTypeDomain => AddressType.Domain,
+            _ => throw new InvalidDataException($"Unsupported SOCKS address type: {socksAddressType}")
+        };
     }
 
     private static async Task SendReplyAsync(
@@ -264,15 +424,15 @@ public sealed class Socks5Server
         await stream.WriteAsync(response, cancellationToken);
     }
 
-    private static async Task RelayAsync(Stream clientStream, Stream upstreamStream, CancellationToken cancellationToken)
+    private static async Task RelayRawAsync(Stream clientStream, Stream upstreamStream, CancellationToken cancellationToken)
     {
-        var toUpstream = PumpAsync(clientStream, upstreamStream, cancellationToken);
-        var toClient = PumpAsync(upstreamStream, clientStream, cancellationToken);
+        var toUpstream = PumpRawAsync(clientStream, upstreamStream, cancellationToken);
+        var toClient = PumpRawAsync(upstreamStream, clientStream, cancellationToken);
 
         await Task.WhenAny(toUpstream, toClient);
     }
 
-    private static async Task PumpAsync(Stream source, Stream destination, CancellationToken cancellationToken)
+    private static async Task PumpRawAsync(Stream source, Stream destination, CancellationToken cancellationToken)
     {
         var buffer = new byte[16 * 1024];
         while (!cancellationToken.IsCancellationRequested)
@@ -305,5 +465,5 @@ public sealed class Socks5Server
         return true;
     }
 
-    private readonly record struct Socks5ConnectRequest(string Host, int Port);
+    private readonly record struct Socks5ConnectRequest(string Host, int Port, byte AddressType);
 }
