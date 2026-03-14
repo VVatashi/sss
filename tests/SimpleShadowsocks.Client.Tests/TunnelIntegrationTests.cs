@@ -145,6 +145,68 @@ public sealed class TunnelIntegrationTests
     }
 
     [Fact]
+    public async Task Socks5Client_GracefullyMigratesActiveSession_AfterTunnelReconnect()
+    {
+        await using var echo = await StartEchoServerAsync();
+
+        var tunnelPort = AllocateUnusedPort();
+        var tunnel1 = await StartTunnelServerOnPortAsync(tunnelPort);
+        await using var socks = await StartSocksServerAsync(
+            tunnelPort,
+            new TunnelConnectionPolicy
+            {
+                HeartbeatIntervalSeconds = 1,
+                IdleTimeoutSeconds = 5,
+                ReconnectBaseDelayMs = 100,
+                ReconnectMaxDelayMs = 300,
+                ReconnectMaxAttempts = 30
+            });
+
+        using var tcpClient = new TcpClient();
+        await tcpClient.ConnectAsync(IPAddress.Loopback, socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        Assert.Equal(new byte[] { 0x05, 0x00 }, await ReadExactAsync(stream, 2));
+        await stream.WriteAsync(BuildConnectRequestIPv4(IPAddress.Loopback, echo.Port));
+        var connectResponse = await ReadExactAsync(stream, 10);
+        Assert.Equal((byte)0x00, connectResponse[1]);
+
+        var phase1 = Encoding.ASCII.GetBytes("migration-phase-1");
+        await stream.WriteAsync(phase1);
+        Assert.Equal(phase1, await ReadExactAsync(stream, phase1.Length));
+
+        await tunnel1.DisposeAsync();
+        var restartTask = Task.Run(async () =>
+        {
+            await Task.Delay(300);
+            return await StartTunnelServerOnPortAsync(tunnelPort);
+        });
+
+        await using var tunnel2 = await restartTask;
+
+        var resumed = false;
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            try
+            {
+                var phase2 = Encoding.ASCII.GetBytes($"migration-phase-2-{attempt}");
+                await stream.WriteAsync(phase2);
+                var echoed = await ReadExactAsync(stream, phase2.Length);
+                Assert.Equal(phase2, echoed);
+                resumed = true;
+                break;
+            }
+            catch
+            {
+                await Task.Delay(100);
+            }
+        }
+
+        Assert.True(resumed, "Active SOCKS session was not resumed after tunnel reconnect.");
+    }
+
+    [Fact]
     public async Task SlowOrTimedOutConnect_DoesNotBlockOtherSessions_OnSameTunnel()
     {
         await using var echo = await StartEchoServerAsync();
@@ -395,13 +457,14 @@ public sealed class TunnelIntegrationTests
         ];
     }
 
-    private static async Task<byte[]> ReadExactAsync(NetworkStream stream, int length)
+    private static async Task<byte[]> ReadExactAsync(NetworkStream stream, int length, int timeoutMs = 5000)
     {
+        using var timeoutCts = new CancellationTokenSource(timeoutMs);
         var buffer = new byte[length];
         var offset = 0;
         while (offset < length)
         {
-            var read = await stream.ReadAsync(buffer.AsMemory(offset, length - offset));
+            var read = await stream.ReadAsync(buffer.AsMemory(offset, length - offset), timeoutCts.Token);
             if (read == 0)
             {
                 throw new IOException("Unexpected EOF while reading from stream.");

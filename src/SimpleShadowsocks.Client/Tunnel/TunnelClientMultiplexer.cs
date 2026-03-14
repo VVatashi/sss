@@ -30,8 +30,10 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
     private Channel<OutboundFrame>? _outboundFrames;
     private Exception? _connectionError;
     private int _nextSessionId;
+    private int _connectionGeneration;
     private long _lastIncomingUtcTicks;
     private long _controlSendSequence;
+    private volatile bool _disposing;
 
     public TunnelClientMultiplexer(
         string remoteHost,
@@ -69,7 +71,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         }
 
         var sessionId = (uint)Interlocked.Increment(ref _nextSessionId);
-        var state = new SessionState(_connectionPolicy.SessionReceiveChannelCapacity);
+        var state = new SessionState(connectRequest, _connectionPolicy.SessionReceiveChannelCapacity);
         if (!_sessions.TryAdd(sessionId, state))
         {
             throw new InvalidOperationException("Failed to register tunnel session.");
@@ -77,10 +79,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
 
         try
         {
-            var payload = ProtocolPayloadSerializer.SerializeConnectRequest(connectRequest);
-            await SendSessionFrameAsync(sessionId, FrameType.Connect, payload, cancellationToken);
-
-            var replyCode = await state.ConnectReply.Task.WaitAsync(cancellationToken);
+            var replyCode = await ConnectSessionAsync(sessionId, state, cancellationToken);
             if (replyCode != 0x00)
             {
                 _sessions.TryRemove(sessionId, out _);
@@ -106,6 +105,8 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
     {
         if (_sessions.TryRemove(sessionId, out var state))
         {
+            state.MarkClosed();
+            state.FailConnect(new IOException("Session is closed."));
             var sequence = state.TakeNextSendSequence();
             try
             {
@@ -123,7 +124,8 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await HandleConnectionFaultAsync();
+        _disposing = true;
+        await HandleConnectionFaultAsync(preserveSessions: false);
 
         if (_readLoopTask is not null)
         {
@@ -165,12 +167,13 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                 try
                 {
                     await ConnectOnceAsync(cancellationToken);
+                    await RestoreSessionsAsync(cancellationToken);
                     return;
                 }
                 catch (Exception ex)
                 {
                     lastError = ex;
-                    await HandleConnectionFaultAsync();
+                    await HandleConnectionFaultAsync(preserveSessions: true);
 
                     if (attempt == _connectionPolicy.ReconnectMaxAttempts)
                     {
@@ -185,6 +188,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                 }
             }
 
+            await HandleConnectionFaultAsync(preserveSessions: false);
             throw new IOException($"Unable to connect tunnel after {_connectionPolicy.ReconnectMaxAttempts} attempts.", lastError);
         }
         finally
@@ -214,9 +218,10 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         });
         TouchIncoming();
 
-        _writeLoopTask = Task.Run(() => WriteLoopAsync(_connectionCts.Token));
-        _readLoopTask = Task.Run(() => ReadLoopAsync(_connectionCts.Token));
-        _heartbeatLoopTask = Task.Run(() => HeartbeatLoopAsync(_connectionCts.Token));
+        var generation = Interlocked.Increment(ref _connectionGeneration);
+        _writeLoopTask = Task.Run(() => WriteLoopAsync(generation, _connectionCts.Token));
+        _readLoopTask = Task.Run(() => ReadLoopAsync(generation, _connectionCts.Token));
+        _heartbeatLoopTask = Task.Run(() => HeartbeatLoopAsync(generation, _connectionCts.Token));
     }
 
     private bool IsConnected()
@@ -253,11 +258,10 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
             throw new InvalidOperationException($"Session {sessionId} is not active.");
         }
 
-        var sequence = state.TakeNextSendSequence();
-        return SendFrameAsync(new ProtocolFrame(frameType, sessionId, sequence, payload), cancellationToken);
+        return SendSessionFrameAsync(sessionId, state, frameType, payload, cancellationToken);
     }
 
-    private async Task ReadLoopAsync(CancellationToken cancellationToken)
+    private async Task ReadLoopAsync(int generation, CancellationToken cancellationToken)
     {
         try
         {
@@ -299,7 +303,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                     continue;
                 }
 
-                if (!state.TryAcceptIncomingSequence(frame.Sequence))
+                if (!state.TryAcceptIncomingFrame(frame.Type, frame.Sequence))
                 {
                     await CloseSessionAsync(frame.SessionId, 0x21, CancellationToken.None);
                     continue;
@@ -308,7 +312,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                 switch (frame.Type)
                 {
                     case FrameType.Connect:
-                        state.ConnectReply.TrySetResult(frame.Payload.Length >= 1 ? frame.Payload.Span[0] : (byte)0x01);
+                        state.CompleteConnectReply(frame.Payload.Length >= 1 ? frame.Payload.Span[0] : (byte)0x01);
                         break;
 
                     case FrameType.Data:
@@ -316,6 +320,8 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                         break;
 
                     case FrameType.Close:
+                        state.MarkClosed();
+                        state.FailConnect(new IOException("Session closed by remote."));
                         state.ReaderWriter.Writer.TryComplete();
                         _sessions.TryRemove(frame.SessionId, out _);
                         break;
@@ -345,11 +351,11 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         }
         finally
         {
-            await HandleConnectionFaultAsync();
+            await HandleConnectionFaultAsync(preserveSessions: true, expectedGeneration: generation);
         }
     }
 
-    private async Task WriteLoopAsync(CancellationToken cancellationToken)
+    private async Task WriteLoopAsync(int generation, CancellationToken cancellationToken)
     {
         var outboundFrames = _outboundFrames;
         if (_secureStream is null || outboundFrames is null)
@@ -423,11 +429,11 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                 outbound.Completion.TrySetException(terminalError ?? new IOException("Tunnel writer stopped."));
             }
 
-            await HandleConnectionFaultAsync();
+            await HandleConnectionFaultAsync(preserveSessions: true, expectedGeneration: generation);
         }
     }
 
-    private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
+    private async Task HeartbeatLoopAsync(int generation, CancellationToken cancellationToken)
     {
         var interval = TimeSpan.FromSeconds(Math.Max(1, _connectionPolicy.HeartbeatIntervalSeconds));
         var idleTimeout = TimeSpan.FromSeconds(Math.Max(5, _connectionPolicy.IdleTimeoutSeconds));
@@ -453,7 +459,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         }
         catch
         {
-            await HandleConnectionFaultAsync();
+            await HandleConnectionFaultAsync(preserveSessions: true, expectedGeneration: generation);
         }
     }
 
@@ -507,8 +513,106 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         return payload.ToArray();
     }
 
-    private async Task HandleConnectionFaultAsync()
+    private async Task<byte> ConnectSessionAsync(uint sessionId, SessionState state, CancellationToken cancellationToken)
     {
+        state.BeginConnectAttempt();
+        var payload = ProtocolPayloadSerializer.SerializeConnectRequest(state.ConnectRequest);
+        try
+        {
+            await SendFrameAsync(new ProtocolFrame(FrameType.Connect, sessionId, 0, payload), cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            state.FailConnect(ex);
+            throw;
+        }
+
+        return await state.WaitForConnectReplyAsync(cancellationToken);
+    }
+
+    private async Task RestoreSessionsAsync(CancellationToken cancellationToken)
+    {
+        if (_sessions.IsEmpty)
+        {
+            return;
+        }
+
+        foreach (var (sessionId, state) in _sessions.ToArray())
+        {
+            if (state.IsClosed || !_sessions.ContainsKey(sessionId))
+            {
+                continue;
+            }
+
+            byte replyCode;
+            try
+            {
+                replyCode = await ConnectSessionAsync(sessionId, state, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                state.ReaderWriter.Writer.TryComplete(ex);
+                state.MarkClosed();
+                state.FailConnect(ex);
+                _sessions.TryRemove(sessionId, out _);
+                continue;
+            }
+
+            if (replyCode != 0x00)
+            {
+                state.MarkClosed();
+                state.FailConnect(new IOException($"Session resume failed with remote reply code {replyCode}."));
+                state.ReaderWriter.Writer.TryComplete(
+                    new IOException($"Session resume failed with remote reply code {replyCode}."));
+                _sessions.TryRemove(sessionId, out _);
+            }
+        }
+    }
+
+    private async Task SendSessionFrameAsync(
+        uint sessionId,
+        SessionState state,
+        FrameType frameType,
+        ReadOnlyMemory<byte> payload,
+        CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            await EnsureConnectedAsync(cancellationToken);
+            await state.WaitUntilActiveAsync(cancellationToken);
+
+            if (!_sessions.ContainsKey(sessionId) || state.IsClosed)
+            {
+                throw new InvalidOperationException($"Session {sessionId} is not active.");
+            }
+
+            var sequence = state.TakeNextSendSequence();
+            try
+            {
+                await SendFrameAsync(new ProtocolFrame(frameType, sessionId, sequence, payload), cancellationToken);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch when (!_disposing)
+            {
+                // Connection likely rotated while sending. Reconnect/resume and retry.
+                continue;
+            }
+        }
+    }
+
+    private async Task HandleConnectionFaultAsync(bool preserveSessions, int? expectedGeneration = null)
+    {
+        if (expectedGeneration.HasValue && Volatile.Read(ref _connectionGeneration) != expectedGeneration.Value)
+        {
+            return;
+        }
+
         _connectionCts?.Cancel();
         _connectionCts?.Dispose();
         _connectionCts = null;
@@ -539,16 +643,27 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         try { _tcpClient?.Dispose(); } catch { }
         _tcpClient = null;
 
+        if (preserveSessions)
+        {
+            var error = _connectionError ?? new IOException("Tunnel connection fault.");
+            foreach (var (_, state) in _sessions)
+            {
+                state.NotifyConnectionFault(error);
+            }
+            return;
+        }
+
         foreach (var (sessionId, state) in _sessions.ToArray())
         {
+            state.MarkClosed();
             state.ReaderWriter.Writer.TryComplete();
             if (_connectionError is not null)
             {
-                state.ConnectReply.TrySetException(_connectionError);
+                state.FailConnect(_connectionError);
             }
             else
             {
-                state.ConnectReply.TrySetResult(0x01);
+                state.FailConnect(new IOException("Tunnel connection closed."));
             }
             _sessions.TryRemove(sessionId, out _);
         }
@@ -557,22 +672,146 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
     private sealed class SessionState
     {
         private readonly object _sequenceLock = new();
+        private readonly object _connectLock = new();
         private ulong _nextSendSequence;
         private ulong _nextExpectedIncomingSequence;
-
-        public TaskCompletionSource<byte> ConnectReply { get; } =
+        private bool _awaitingConnectReply;
+        private bool _closed;
+        private TaskCompletionSource<byte> _pendingConnectReply =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource<bool> _activeReady =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ConnectRequest ConnectRequest { get; }
 
         public Channel<byte[]> ReaderWriter { get; }
 
-        public SessionState(int receiveChannelCapacity)
+        public SessionState(ConnectRequest connectRequest, int receiveChannelCapacity)
         {
+            ConnectRequest = connectRequest;
             ReaderWriter = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(receiveChannelCapacity)
             {
                 SingleReader = true,
                 SingleWriter = true,
                 FullMode = BoundedChannelFullMode.Wait
             });
+        }
+
+        public bool IsClosed
+        {
+            get
+            {
+                lock (_connectLock)
+                {
+                    return _closed;
+                }
+            }
+        }
+
+        public void BeginConnectAttempt()
+        {
+            lock (_connectLock)
+            {
+                if (_closed)
+                {
+                    throw new InvalidOperationException("Session is closed.");
+                }
+
+                _pendingConnectReply = new TaskCompletionSource<byte>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _activeReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+
+            lock (_sequenceLock)
+            {
+                _nextSendSequence = 1;
+                _nextExpectedIncomingSequence = 0;
+                _awaitingConnectReply = true;
+            }
+        }
+
+        public Task<byte> WaitForConnectReplyAsync(CancellationToken cancellationToken)
+        {
+            TaskCompletionSource<byte> pending;
+            lock (_connectLock)
+            {
+                pending = _pendingConnectReply;
+            }
+
+            return pending.Task.WaitAsync(cancellationToken);
+        }
+
+        public Task WaitUntilActiveAsync(CancellationToken cancellationToken)
+        {
+            TaskCompletionSource<bool> ready;
+            lock (_connectLock)
+            {
+                if (_closed)
+                {
+                    throw new InvalidOperationException("Session is closed.");
+                }
+
+                ready = _activeReady;
+            }
+
+            return ready.Task.WaitAsync(cancellationToken);
+        }
+
+        public void CompleteConnectReply(byte replyCode)
+        {
+            TaskCompletionSource<byte> connectReply;
+            TaskCompletionSource<bool> ready;
+            lock (_connectLock)
+            {
+                connectReply = _pendingConnectReply;
+                ready = _activeReady;
+            }
+
+            connectReply.TrySetResult(replyCode);
+            if (replyCode == 0x00)
+            {
+                ready.TrySetResult(true);
+            }
+            else
+            {
+                ready.TrySetException(new IOException($"Remote CONNECT failed with code {replyCode}."));
+            }
+        }
+
+        public void FailConnect(Exception ex)
+        {
+            TaskCompletionSource<byte> connectReply;
+            TaskCompletionSource<bool> ready;
+            lock (_connectLock)
+            {
+                connectReply = _pendingConnectReply;
+                ready = _activeReady;
+            }
+
+            connectReply.TrySetException(ex);
+            ready.TrySetException(ex);
+        }
+
+        public void NotifyConnectionFault(Exception ex)
+        {
+            lock (_sequenceLock)
+            {
+                if (!_awaitingConnectReply)
+                {
+                    return;
+                }
+
+                _awaitingConnectReply = false;
+            }
+
+            FailConnect(ex);
+        }
+
+        public void MarkClosed()
+        {
+            lock (_connectLock)
+            {
+                _closed = true;
+            }
         }
 
         public ulong TakeNextSendSequence()
@@ -583,10 +822,22 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
             }
         }
 
-        public bool TryAcceptIncomingSequence(ulong sequence)
+        public bool TryAcceptIncomingFrame(FrameType frameType, ulong sequence)
         {
             lock (_sequenceLock)
             {
+                if (_awaitingConnectReply)
+                {
+                    if (frameType != FrameType.Connect || sequence != 0)
+                    {
+                        return false;
+                    }
+
+                    _awaitingConnectReply = false;
+                    _nextExpectedIncomingSequence = 1;
+                    return true;
+                }
+
                 if (sequence != _nextExpectedIncomingSequence)
                 {
                     return false;
