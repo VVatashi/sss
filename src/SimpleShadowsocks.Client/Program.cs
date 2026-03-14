@@ -16,6 +16,7 @@ var remoteServers = (config.RemoteServers ?? [])
 var sharedKey = config.SharedKey;
 var protocolVersion = config.ProtocolVersion;
 var enableCompression = config.EnableCompression;
+var compressionAlgorithm = config.GetCompressionAlgorithm();
 var tunnelCipherAlgorithm = config.GetTunnelCipherAlgorithm();
 var cryptoPolicy = new TunnelCryptoPolicy
 {
@@ -74,7 +75,7 @@ else
     Console.WriteLine($"Tunnel server: {remoteHost}:{remotePort}");
 }
 Console.WriteLine($"Protocol version: {ProtocolConstants.Version}");
-Console.WriteLine($"Configured tunnel protocol: v{protocolVersion}, compression={(enableCompression ? "on" : "off")}");
+Console.WriteLine($"Configured tunnel protocol: v{protocolVersion}, compression={(enableCompression ? "on" : "off")} ({compressionAlgorithm})");
 Console.WriteLine($"Configured AEAD: {tunnelCipherAlgorithm}");
 Console.WriteLine("Press Ctrl+C to stop.");
 
@@ -87,7 +88,8 @@ var server = remoteServers.Count > 0
         cryptoPolicy,
         connectionPolicy,
         protocolVersion,
-        enableCompression)
+        enableCompression,
+        compressionAlgorithm)
     : new Socks5Server(
         IPAddress.Loopback,
         listenPort,
@@ -97,7 +99,8 @@ var server = remoteServers.Count > 0
         cryptoPolicy,
         connectionPolicy,
         protocolVersion,
-        enableCompression);
+        enableCompression,
+        compressionAlgorithm);
 await server.RunAsync(cts.Token);
 
 internal sealed class ClientConfig
@@ -117,6 +120,7 @@ internal sealed class ClientConfig
     public int SessionReceiveChannelCapacity { get; init; } = 256;
     public byte ProtocolVersion { get; init; } = ProtocolConstants.Version;
     public bool EnableCompression { get; init; } = false;
+    public string CompressionAlgorithm { get; init; } = nameof(SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm.Deflate);
     public string TunnelCipherAlgorithm { get; init; } = nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.ChaCha20Poly1305);
     public List<RemoteServerConfig>? RemoteServers { get; init; }
 
@@ -133,6 +137,20 @@ internal sealed class ClientConfig
             $"{nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.Aes256Gcm)}, " +
             $"{nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.Aegis128L)}, " +
             $"{nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.Aegis256)}");
+    }
+
+    public SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm GetCompressionAlgorithm()
+    {
+        if (Enum.TryParse<SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm>(CompressionAlgorithm, ignoreCase: true, out var parsed))
+        {
+            return parsed;
+        }
+
+        throw new InvalidDataException(
+            $"Unsupported CompressionAlgorithm: '{CompressionAlgorithm}'. " +
+            $"Supported: {nameof(SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm.Deflate)}, " +
+            $"{nameof(SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm.Gzip)}, " +
+            $"{nameof(SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm.Brotli)}");
     }
 
     public static ClientConfig Load()

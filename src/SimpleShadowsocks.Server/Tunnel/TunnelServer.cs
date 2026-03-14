@@ -120,6 +120,7 @@ public sealed class TunnelServer
         var pendingConnectSessions = new ConcurrentDictionary<uint, byte>();
         byte? connectionVersion = null;
         var connectionCompressionEnabled = false;
+        var connectionCompressionAlgorithm = PayloadCompressionAlgorithm.Deflate;
 
         try
         {
@@ -136,6 +137,10 @@ public sealed class TunnelServer
                 {
                     connectionVersion = frameResult.Value.Version;
                     connectionCompressionEnabled = (frameResult.Value.Flags & ProtocolFlags.CompressionEnabled) != 0;
+                    if (connectionCompressionEnabled)
+                    {
+                        connectionCompressionAlgorithm = ProtocolFrameCodec.GetCompressionAlgorithm(frameResult.Value.Flags);
+                    }
                 }
                 else if (connectionVersion.Value != frameResult.Value.Version)
                 {
@@ -146,7 +151,8 @@ public sealed class TunnelServer
                 var writeOptions = new ProtocolWriteOptions
                 {
                     Version = connectionVersion.Value,
-                    EnableCompression = connectionVersion.Value == ProtocolConstants.Version && connectionCompressionEnabled
+                    EnableCompression = connectionVersion.Value == ProtocolConstants.Version && connectionCompressionEnabled,
+                    CompressionAlgorithm = connectionCompressionAlgorithm
                 };
 
                 switch (frame.Type)
@@ -247,7 +253,8 @@ public sealed class TunnelServer
             var closeWriteOptions = new ProtocolWriteOptions
             {
                 Version = connectionVersion ?? ProtocolConstants.LegacyVersion,
-                EnableCompression = connectionVersion == ProtocolConstants.Version && connectionCompressionEnabled
+                EnableCompression = connectionVersion == ProtocolConstants.Version && connectionCompressionEnabled,
+                CompressionAlgorithm = connectionCompressionAlgorithm
             };
             foreach (var sessionId in sessions.Keys)
             {

@@ -131,7 +131,8 @@ journalctl -u simple-shadowsocks-server -f
 
 Параметры протокола (в `appsettings.json` клиента):
 - `ProtocolVersion` - версия протокола кадров (`1` или `2`).
-- `EnableCompression` - включение сжатия payload в `v2` (`false` по умолчанию), алгоритм фиксирован: `Deflate` (`CompressionLevel.Fastest`).
+- `EnableCompression` - включение сжатия payload в `v2` (`false` по умолчанию).
+- `CompressionAlgorithm` - алгоритм сжатия payload в `v2`: `Deflate`, `Gzip`, `Brotli` (`Deflate` по умолчанию).
 - `TunnelCipherAlgorithm` - AEAD-алгоритм туннеля: `ChaCha20Poly1305`, `Aes256Gcm`, `Aegis128L`, `Aegis256`.
 
 Параметры server policy (в `appsettings.json` сервера):
@@ -178,6 +179,13 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_Aegis256" --logger "console;verbosity=detailed"
 ```
 
+Perf-замеры алгоритмов сжатия payload (Release):
+
+```powershell
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_CompressionAlgorithms_MixedPayload" --logger "console;verbosity=detailed"
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_CompressionAlgorithms_CompressiblePayload" --logger "console;verbosity=detailed"
+```
+
 Примечание по perf-тестам:
 - добавлено подробное stage-логирование (`[perf] ...`) для диагностики зависаний;
 - добавлены встроенные таймауты на этапы `warmup` и `measurement`, чтобы тест не зависал бесконечно.
@@ -207,7 +215,8 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
   - клиент поддерживает группу tunnel-серверов с выбором `round-robin`
   - привязка TCP-сессии SOCKS5 к выбранному tunnel-серверу (sticky per client TCP session)
   - версия протокола кадров увеличена до `v2` (добавлены flags и опциональное сжатие payload)
-  - алгоритм сжатия payload в `v2` зафиксирован на `Deflate` (без выбора/negotiation алгоритма)
+  - поддержаны алгоритмы сжатия payload в `v2`: `Deflate`, `Gzip`, `Brotli`
+  - алгоритм сжатия кодируется в `FLAGS` каждого кадра `v2` и выбирается клиентом через конфиг
   - сервер совместим с `v1` и `v2`; версия соединения фиксируется по первому кадру клиента
   - при несовместимости версии клиент закрывает соединение с понятной ошибкой
   - снижены лишние аллокации в горячем пути кодека/сериализации:
@@ -253,7 +262,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
   - есть проверки `v1/v2` и round-trip со сжатием в `v2`
   - есть отдельный perf-тест на хорошо сжимаемом payload
   - есть раздельные perf-тесты по каждому AEAD-алгоритму (`ChaCha20-Poly1305`, `AES-256-GCM`, `AEGIS-128L`, `AEGIS-256`)
-  - текущий набор: `33` теста, проходят
+  - текущий набор: `38` тестов, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
   - `bin/<ProjectName>/...`
@@ -288,8 +297,12 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - `VER`: версия кадра (`1` или `2`).
 - `TYPE`: `Connect(1)`, `Data(2)`, `Close(3)`, `Ping(4)`, `Pong(5)`.
 - `FLAGS` (только `v2`):
-  - `0x01` (`PayloadCompressed`) - `PAYLOAD` сжат `Deflate`.
+  - `0x01` (`PayloadCompressed`) - `PAYLOAD` сжат.
   - `0x02` (`CompressionEnabled`) - сторона поддерживает/включила сжатие на этом соединении.
+  - `0x0C` (`CompressionAlgorithmMask`) - код алгоритма сжатия:
+    - `00` = `Deflate`
+    - `01` = `Gzip`
+    - `10` = `Brotli`
 - `SESSION`: ID логической мультиплексированной сессии (`0` зарезервирован для control-frame, например heartbeat).
 - `SEQUENCE`: монотонный счётчик кадров внутри `SESSION`.
 - `LEN`: длина `PAYLOAD` в байтах.
@@ -299,7 +312,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - Максимальный размер payload: `1 MiB` (`ProtocolConstants.MaxPayloadLength`).
 - Сервер принимает `v1` и `v2`; версия соединения фиксируется по первому кадру и не может меняться в рамках одного tunnel-соединения.
 - Клиент проверяет, что ответы приходят в ожидаемой версии, иначе закрывает соединение с понятной ошибкой.
-- Для `v2` сжатие фиксировано на `Deflate (CompressionLevel.Fastest)`, выбор алгоритма не negotiated.
+- Для `v2` алгоритм сжатия выбирается клиентом (`CompressionAlgorithm`) и кодируется в `FLAGS` кадра.
 - Ordering/replay policy на прикладных кадрах: ожидается строго возрастающий `SEQUENCE` per `SESSION`; при нарушении сессия закрывается.
 
 Crypto-handshake (transport encryption):
@@ -316,18 +329,30 @@ Crypto-handshake (transport encryption):
 
 ## Результат измерений сжатия (Release)
 
-Тест: `PerformanceMeasurementsTests`, `128 MiB`, `16 KiB`, `4 streams`.
+Тесты:  
+- `PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_CompressionAlgorithms_MixedPayload`  
+- `PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_CompressionAlgorithms_CompressiblePayload`  
+Параметры: `128 MiB`, `16 KiB`, `4 streams`, AEAD=`ChaCha20-Poly1305`.
 
-Профиль `mixed` (слабо сжимаемый):
-- Без сжатия: `50.86 MiB/s`, `2,347,577 bytes/MiB`.
-- Со сжатием: `38.77 MiB/s`, `2,416,535 bytes/MiB`.
+Профиль `mixed`:
 
-Профиль `compressible` (повторяющиеся последовательности байтов):
-- Без сжатия: `58.98 MiB/s`, `2,333,631 bytes/MiB`.
-- Со сжатием: `37.28 MiB/s`, `2,382,185 bytes/MiB`.
+| Алгоритм | Throughput (MiB/s) | Alloc/MiB (bytes) | Tunnel C->S (bytes) | Tunnel S->C (bytes) | Tunnel Total (bytes) |
+|---|---:|---:|---:|---:|---:|
+| `off` | 37.61 | 2,342,877 | 143,120,373 | 143,120,289 | 286,240,662 |
+| `Deflate` | 36.93 | 2,402,209 | 4,287,185 | 4,491,681 | 8,778,866 |
+| `Gzip` | 35.28 | 2,382,586 | 4,448,217 | 4,648,353 | 9,096,570 |
+| `Brotli` | 35.18 | 2,342,133 | 2,800,237 | 2,994,593 | 5,794,830 |
 
-Вывод: в текущей реализации (`Deflate`) сжатие проигрывает по throughput в обоих профилях и не даёт выигрыша по аллокациям.  
-По умолчанию оставлено `EnableCompression=false`.
+Профиль `compressible`:
+
+| Алгоритм | Throughput (MiB/s) | Alloc/MiB (bytes) | Tunnel C->S (bytes) | Tunnel S->C (bytes) | Tunnel Total (bytes) |
+|---|---:|---:|---:|---:|---:|
+| `off` | 27.32 | 2,338,542 | 143,120,373 | 143,120,289 | 286,240,662 |
+| `Deflate` | 38.52 | 2,409,452 | 1,824,013 | 2,028,449 | 3,852,462 |
+| `Gzip` | 34.15 | 2,380,139 | 1,984,465 | 2,185,121 | 4,169,586 |
+| `Brotli` | 36.71 | 2,337,144 | 552,965 | 748,961 | 1,301,926 |
+
+Вывод: сжатие резко снижает объём туннельного трафика (особенно `Brotli`), но не всегда улучшает throughput; по умолчанию оставлено `EnableCompression=false`, `CompressionAlgorithm=Deflate`.
 
 ## Результат сравнения AEAD (Release)
 

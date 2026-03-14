@@ -42,7 +42,8 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         TunnelCryptoPolicy cryptoPolicy,
         TunnelConnectionPolicy connectionPolicy,
         byte protocolVersion = ProtocolConstants.Version,
-        bool enableCompression = false)
+        bool enableCompression = false,
+        PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate)
     {
         _remoteHost = remoteHost;
         _remotePort = remotePort;
@@ -53,7 +54,8 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         _writeOptions = new ProtocolWriteOptions
         {
             Version = protocolVersion,
-            EnableCompression = enableCompression
+            EnableCompression = enableCompression,
+            CompressionAlgorithm = compressionAlgorithm
         };
         ValidatePolicy(_connectionPolicy);
         TouchIncoming();

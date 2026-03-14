@@ -24,6 +24,7 @@ public sealed class Socks5Server
     private readonly TunnelConnectionPolicy _connectionPolicy;
     private readonly byte _protocolVersion;
     private readonly bool _enableCompression;
+    private readonly PayloadCompressionAlgorithm _compressionAlgorithm;
     private List<TunnelClientMultiplexer>? _multiplexers;
     private int _nextMultiplexerIndex = -1;
 
@@ -35,6 +36,7 @@ public sealed class Socks5Server
         _connectionPolicy = TunnelConnectionPolicy.Default;
         _protocolVersion = ProtocolConstants.Version;
         _enableCompression = false;
+        _compressionAlgorithm = PayloadCompressionAlgorithm.Deflate;
     }
 
     public Socks5Server(
@@ -46,7 +48,8 @@ public sealed class Socks5Server
         TunnelCryptoPolicy? cryptoPolicy = null,
         TunnelConnectionPolicy? connectionPolicy = null,
         byte protocolVersion = ProtocolConstants.Version,
-        bool enableCompression = false)
+        bool enableCompression = false,
+        PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate)
     {
         _listener = new TcpListener(listenAddress, port);
         _remoteServers.Add((remoteServerHost, remoteServerPort));
@@ -55,6 +58,7 @@ public sealed class Socks5Server
         _connectionPolicy = connectionPolicy ?? TunnelConnectionPolicy.Default;
         _protocolVersion = protocolVersion;
         _enableCompression = enableCompression;
+        _compressionAlgorithm = compressionAlgorithm;
     }
 
     public Socks5Server(
@@ -65,7 +69,8 @@ public sealed class Socks5Server
         TunnelCryptoPolicy? cryptoPolicy = null,
         TunnelConnectionPolicy? connectionPolicy = null,
         byte protocolVersion = ProtocolConstants.Version,
-        bool enableCompression = false)
+        bool enableCompression = false,
+        PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate)
     {
         _listener = new TcpListener(listenAddress, port);
         foreach (var (host, serverPort) in remoteServers)
@@ -83,6 +88,7 @@ public sealed class Socks5Server
         _connectionPolicy = connectionPolicy ?? TunnelConnectionPolicy.Default;
         _protocolVersion = protocolVersion;
         _enableCompression = enableCompression;
+        _compressionAlgorithm = compressionAlgorithm;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -100,7 +106,8 @@ public sealed class Socks5Server
                     _cryptoPolicy,
                     _connectionPolicy,
                     _protocolVersion,
-                    _enableCompression));
+                    _enableCompression,
+                    _compressionAlgorithm));
             }
         }
 

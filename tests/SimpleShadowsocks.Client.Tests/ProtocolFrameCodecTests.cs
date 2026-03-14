@@ -103,6 +103,34 @@ public sealed class ProtocolFrameCodecTests
         Assert.Equal(payload, decoded.Value.Frame.Payload.ToArray());
     }
 
+    [Theory]
+    [InlineData(PayloadCompressionAlgorithm.Deflate)]
+    [InlineData(PayloadCompressionAlgorithm.Gzip)]
+    [InlineData(PayloadCompressionAlgorithm.Brotli)]
+    public async Task FrameCodec_V2_WithCompressionAlgorithm_RoundTrip(PayloadCompressionAlgorithm algorithm)
+    {
+        var payload = System.Text.Encoding.ASCII.GetBytes(new string('B', 4096));
+        var frame = new ProtocolFrame(FrameType.Data, 7, 11, payload);
+
+        await using var stream = new MemoryStream();
+        await ProtocolFrameCodec.WriteAsync(stream, frame, default, new ProtocolWriteOptions
+        {
+            Version = ProtocolConstants.Version,
+            EnableCompression = true,
+            CompressionAlgorithm = algorithm,
+            CompressionMinBytes = 64,
+            CompressionMinSavingsBytes = 1
+        });
+
+        stream.Position = 0;
+        var decoded = await ProtocolFrameCodec.ReadDetailedAsync(stream);
+        Assert.True(decoded.HasValue);
+        Assert.Equal(ProtocolConstants.Version, decoded.Value.Version);
+        Assert.True((decoded.Value.Flags & ProtocolFlags.CompressionEnabled) != 0);
+        Assert.Equal(algorithm, ProtocolFrameCodec.GetCompressionAlgorithm(decoded.Value.Flags));
+        Assert.Equal(payload, decoded.Value.Frame.Payload.ToArray());
+    }
+
     [Fact]
     public void ConnectPayload_Domain_RoundTrip()
     {

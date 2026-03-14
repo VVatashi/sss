@@ -1,11 +1,16 @@
 using System.Buffers.Binary;
 using System.Buffers;
-using System.IO.Compression;
+using SimpleShadowsocks.Protocol.Compression;
 
 namespace SimpleShadowsocks.Protocol;
 
 public static class ProtocolFrameCodec
 {
+    public static PayloadCompressionAlgorithm GetCompressionAlgorithm(byte flags)
+    {
+        return PayloadCompressionCodecFactory.FromFlags(flags);
+    }
+
     public static void WriteTo(IBufferWriter<byte> writer, ProtocolFrame frame, ProtocolWriteOptions? options = null)
     {
         if (writer is null)
@@ -30,7 +35,12 @@ public static class ProtocolFrameCodec
         EncodedPayload encodedPayload;
         if (effectiveVersion == ProtocolConstants.Version)
         {
-            encodedPayload = EncodePayload(frame.Payload, options.EnableCompression, options.CompressionMinBytes, options.CompressionMinSavingsBytes);
+            encodedPayload = EncodePayload(
+                frame.Payload,
+                options.EnableCompression,
+                options.CompressionAlgorithm,
+                options.CompressionMinBytes,
+                options.CompressionMinSavingsBytes);
             flags = encodedPayload.Flags;
         }
         else
@@ -99,7 +109,12 @@ public static class ProtocolFrameCodec
             EncodedPayload encodedPayload;
             if (effectiveVersion == ProtocolConstants.Version)
             {
-                encodedPayload = EncodePayload(frame.Payload, options.EnableCompression, options.CompressionMinBytes, options.CompressionMinSavingsBytes);
+                encodedPayload = EncodePayload(
+                    frame.Payload,
+                    options.EnableCompression,
+                    options.CompressionAlgorithm,
+                    options.CompressionMinBytes,
+                    options.CompressionMinSavingsBytes);
             }
             else
             {
@@ -238,7 +253,7 @@ public static class ProtocolFrameCodec
                 try
                 {
                     await ReadExactlyAsync(stream, compressed, (int)payloadLength, cancellationToken);
-                    payload = DecompressPayload(compressed, (int)payloadLength);
+                    payload = DecompressPayload(compressed, (int)payloadLength, flags);
                 }
                 finally
                 {
@@ -319,6 +334,7 @@ public static class ProtocolFrameCodec
     private static EncodedPayload EncodePayload(
         ReadOnlyMemory<byte> sourcePayload,
         bool enableCompression,
+        PayloadCompressionAlgorithm compressionAlgorithm,
         int minBytes,
         int minSavingsBytes)
     {
@@ -329,25 +345,15 @@ public static class ProtocolFrameCodec
         }
 
         flags |= ProtocolFlags.CompressionEnabled;
+        flags |= PayloadCompressionCodecFactory.ToFlags(compressionAlgorithm);
         if (sourcePayload.Length < minBytes)
         {
             return EncodedPayload.FromSource(sourcePayload, flags);
         }
 
-        var maxCompressedLength = GetDeflateMaxCompressedLength(sourcePayload.Length);
-        var rented = ArrayPool<byte>.Shared.Rent(maxCompressedLength);
-        int bytesWritten;
-        try
-        {
-            using var output = new PooledBufferWriteStream(rented, maxCompressedLength);
-            using (var deflate = new DeflateStream(output, CompressionLevel.Fastest, leaveOpen: true))
-            {
-                deflate.Write(sourcePayload.Span);
-            }
-
-            bytesWritten = output.WrittenCount;
-        }
-        catch
+        var rented = ArrayPool<byte>.Shared.Rent(ProtocolConstants.MaxPayloadLength);
+        var codec = PayloadCompressionCodecFactory.Resolve(compressionAlgorithm);
+        if (!codec.TryCompress(sourcePayload.Span, rented, out var bytesWritten))
         {
             ArrayPool<byte>.Shared.Return(rented);
             return EncodedPayload.FromSource(sourcePayload, flags);
@@ -363,37 +369,11 @@ public static class ProtocolFrameCodec
         return EncodedPayload.FromPooled(rented, bytesWritten, flags);
     }
 
-    private static byte[] DecompressPayload(byte[] compressed, int compressedLength)
+    private static byte[] DecompressPayload(byte[] compressed, int compressedLength, byte flags)
     {
-        var rented = ArrayPool<byte>.Shared.Rent(ProtocolConstants.MaxPayloadLength);
-        try
-        {
-            using var input = new MemoryStream(compressed, 0, compressedLength, writable: false, publiclyVisible: true);
-            using var inflate = new DeflateStream(input, CompressionMode.Decompress, leaveOpen: false);
-            using var output = new PooledBufferWriteStream(rented, ProtocolConstants.MaxPayloadLength);
-            inflate.CopyTo(output);
-
-            var bytesWritten = output.WrittenCount;
-            if (bytesWritten < 0 || bytesWritten > ProtocolConstants.MaxPayloadLength)
-            {
-                throw new InvalidDataException("Compressed payload cannot be decompressed.");
-            }
-
-            var result = new byte[bytesWritten];
-            Buffer.BlockCopy(rented, 0, result, 0, bytesWritten);
-            return result;
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(rented);
-        }
-    }
-
-    private static int GetDeflateMaxCompressedLength(int sourceLength)
-    {
-        // zlib's deflateBound approximation for raw deflate stream.
-        var blocks = (sourceLength + 16_382) / 16_383;
-        return checked(sourceLength + (5 * blocks) + 6);
+        var algorithm = PayloadCompressionCodecFactory.FromFlags(flags);
+        var codec = PayloadCompressionCodecFactory.Resolve(algorithm);
+        return codec.Decompress(compressed, compressedLength, ProtocolConstants.MaxPayloadLength);
     }
 
     private readonly struct EncodedPayload : IDisposable
@@ -423,60 +403,6 @@ public static class ProtocolFrameCodec
             {
                 ArrayPool<byte>.Shared.Return(_pooled);
             }
-        }
-    }
-
-    private sealed class PooledBufferWriteStream : Stream
-    {
-        private readonly byte[] _buffer;
-        private readonly int _maxLength;
-        private int _position;
-
-        public PooledBufferWriteStream(byte[] buffer, int maxLength)
-        {
-            _buffer = buffer;
-            _maxLength = maxLength;
-        }
-
-        public int WrittenCount => _position;
-        public override bool CanRead => false;
-        public override bool CanSeek => false;
-        public override bool CanWrite => true;
-        public override long Length => _position;
-        public override long Position
-        {
-            get => _position;
-            set => throw new NotSupportedException();
-        }
-
-        public override void Flush()
-        {
-        }
-
-        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-        public override void SetLength(long value) => throw new NotSupportedException();
-
-        public override void Write(byte[] buffer, int offset, int count)
-        {
-            Write(buffer.AsSpan(offset, count));
-        }
-
-        public override void Write(ReadOnlySpan<byte> buffer)
-        {
-            if (_position + buffer.Length > _maxLength)
-            {
-                throw new InvalidDataException("Compressed payload exceeds allowed maximum length.");
-            }
-
-            buffer.CopyTo(_buffer.AsSpan(_position));
-            _position += buffer.Length;
-        }
-
-        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-        {
-            Write(buffer, offset, count);
-            return Task.CompletedTask;
         }
     }
 }

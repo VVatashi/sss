@@ -15,6 +15,8 @@ public static class ProtocolFlags
     public const byte None = 0x00;
     public const byte PayloadCompressed = 0x01;
     public const byte CompressionEnabled = 0x02;
+    public const byte CompressionAlgorithmMask = 0x0C;
+    public const int CompressionAlgorithmShift = 2;
 }
 
 public enum FrameType : byte
@@ -38,6 +40,13 @@ public readonly record struct DataChunk(uint SessionId, ReadOnlyMemory<byte> Pay
 public readonly record struct ProtocolFrame(FrameType Type, uint SessionId, ulong Sequence, ReadOnlyMemory<byte> Payload);
 public readonly record struct ProtocolReadResult(ProtocolFrame Frame, byte Version, byte Flags);
 
+public enum PayloadCompressionAlgorithm : byte
+{
+    Deflate = 0,
+    Gzip = 1,
+    Brotli = 2
+}
+
 public sealed class ProtocolWriteOptions
 {
     public static ProtocolWriteOptions V2NoCompression { get; } = new()
@@ -48,6 +57,7 @@ public sealed class ProtocolWriteOptions
 
     public byte Version { get; init; } = ProtocolConstants.Version;
     public bool EnableCompression { get; init; }
+    public PayloadCompressionAlgorithm CompressionAlgorithm { get; init; } = PayloadCompressionAlgorithm.Deflate;
     public int CompressionMinBytes { get; init; } = 256;
     public int CompressionMinSavingsBytes { get; init; } = 16;
 }

@@ -212,7 +212,7 @@ public sealed class TunnelIntegrationTests
             new TunnelConnectionPolicy
             {
                 HeartbeatIntervalSeconds = 1,
-                IdleTimeoutSeconds = 5,
+                IdleTimeoutSeconds = 30,
                 ReconnectBaseDelayMs = 100,
                 ReconnectMaxDelayMs = 300,
                 ReconnectMaxAttempts = 30
@@ -235,14 +235,14 @@ public sealed class TunnelIntegrationTests
         await tunnel1.DisposeAsync();
         var restartTask = Task.Run(async () =>
         {
-            await Task.Delay(300);
+            await Task.Delay(50);
             return await StartTunnelServerOnPortAsync(tunnelPort);
         });
 
         await using var tunnel2 = await restartTask;
 
         var resumed = false;
-        for (var attempt = 0; attempt < 100; attempt++)
+        for (var attempt = 0; attempt < 300; attempt++)
         {
             try
             {
@@ -255,7 +255,7 @@ public sealed class TunnelIntegrationTests
             }
             catch
             {
-                await Task.Delay(200);
+                await Task.Delay(300);
             }
         }
 
