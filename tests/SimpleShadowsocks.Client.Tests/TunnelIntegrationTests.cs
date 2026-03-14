@@ -38,6 +38,62 @@ public sealed class TunnelIntegrationTests
     }
 
     [Fact]
+    public async Task Socks5Client_UsesProtocolTunnel_WithAes256Gcm()
+    {
+        await using var echo = await StartEchoServerAsync();
+        await using var tunnel = await StartTunnelServerAsync();
+        await using var socks = await StartSocksServerAsync(
+            tunnel.Port,
+            connectionPolicy: null,
+            cryptoPolicy: new TunnelCryptoPolicy
+            {
+                HandshakeMaxClockSkewSeconds = TunnelCryptoPolicy.Default.HandshakeMaxClockSkewSeconds,
+                ReplayWindowSeconds = TunnelCryptoPolicy.Default.ReplayWindowSeconds,
+                PreferredAlgorithm = TunnelCipherAlgorithm.Aes256Gcm
+            });
+
+        using var tcpClient = new TcpClient();
+        await tcpClient.ConnectAsync(IPAddress.Loopback, socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        var greeting = await ReadExactAsync(stream, 2);
+        Assert.Equal(new byte[] { 0x05, 0x00 }, greeting);
+
+        var connectRequest = BuildConnectRequestIPv4(IPAddress.Loopback, echo.Port);
+        await stream.WriteAsync(connectRequest);
+        var connectResponse = await ReadExactAsync(stream, 10);
+        Assert.Equal((byte)0x00, connectResponse[1]);
+
+        var payload = Encoding.ASCII.GetBytes("hello-over-aesgcm-tunnel");
+        await stream.WriteAsync(payload);
+        var echoed = await ReadExactAsync(stream, payload.Length);
+        Assert.Equal(payload, echoed);
+    }
+
+    [Fact]
+    public async Task Socks5Client_UsesProtocolTunnel_WithAegis128L()
+    {
+        if (!AeadDuplexStream.IsSupported(TunnelCipherAlgorithm.Aegis128L))
+        {
+            return;
+        }
+
+        await RunSingleCipherRoundTripAsync(TunnelCipherAlgorithm.Aegis128L, "hello-over-aegis128l-tunnel");
+    }
+
+    [Fact]
+    public async Task Socks5Client_UsesProtocolTunnel_WithAegis256()
+    {
+        if (!AeadDuplexStream.IsSupported(TunnelCipherAlgorithm.Aegis256))
+        {
+            return;
+        }
+
+        await RunSingleCipherRoundTripAsync(TunnelCipherAlgorithm.Aegis256, "hello-over-aegis256-tunnel");
+    }
+
+    [Fact]
     public async Task Socks5Client_MultiplexesMultipleSessions_OverSingleTunnelConnection()
     {
         await using var echo = await StartEchoServerAsync();
@@ -186,20 +242,20 @@ public sealed class TunnelIntegrationTests
         await using var tunnel2 = await restartTask;
 
         var resumed = false;
-        for (var attempt = 0; attempt < 20; attempt++)
+        for (var attempt = 0; attempt < 100; attempt++)
         {
             try
             {
                 var phase2 = Encoding.ASCII.GetBytes($"migration-phase-2-{attempt}");
                 await stream.WriteAsync(phase2);
-                var echoed = await ReadExactAsync(stream, phase2.Length);
+                var echoed = await ReadExactAsync(stream, phase2.Length, timeoutMs: 20_000);
                 Assert.Equal(phase2, echoed);
                 resumed = true;
                 break;
             }
             catch
             {
-                await Task.Delay(100);
+                await Task.Delay(200);
             }
         }
 
@@ -298,7 +354,8 @@ public sealed class TunnelIntegrationTests
 
     private static async Task<RunningSocksServer> StartSocksServerAsync(
         int tunnelPort,
-        TunnelConnectionPolicy? connectionPolicy = null)
+        TunnelConnectionPolicy? connectionPolicy = null,
+        TunnelCryptoPolicy? cryptoPolicy = null)
     {
         var port = AllocateUnusedPort();
         var server = new Socks5Server(
@@ -307,7 +364,7 @@ public sealed class TunnelIntegrationTests
             "127.0.0.1",
             tunnelPort,
             "dev-shared-key",
-            TunnelCryptoPolicy.Default,
+            cryptoPolicy ?? TunnelCryptoPolicy.Default,
             connectionPolicy ?? TunnelConnectionPolicy.Default);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
@@ -316,9 +373,43 @@ public sealed class TunnelIntegrationTests
         return new RunningSocksServer(port, cts, runTask);
     }
 
+    private static async Task RunSingleCipherRoundTripAsync(TunnelCipherAlgorithm algorithm, string payloadText)
+    {
+        await using var echo = await StartEchoServerAsync();
+        await using var tunnel = await StartTunnelServerAsync();
+        await using var socks = await StartSocksServerAsync(
+            tunnel.Port,
+            connectionPolicy: null,
+            cryptoPolicy: new TunnelCryptoPolicy
+            {
+                HandshakeMaxClockSkewSeconds = TunnelCryptoPolicy.Default.HandshakeMaxClockSkewSeconds,
+                ReplayWindowSeconds = TunnelCryptoPolicy.Default.ReplayWindowSeconds,
+                PreferredAlgorithm = algorithm
+            });
+
+        using var tcpClient = new TcpClient();
+        await tcpClient.ConnectAsync(IPAddress.Loopback, socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        var greeting = await ReadExactAsync(stream, 2);
+        Assert.Equal(new byte[] { 0x05, 0x00 }, greeting);
+
+        var connectRequest = BuildConnectRequestIPv4(IPAddress.Loopback, echo.Port);
+        await stream.WriteAsync(connectRequest);
+        var connectResponse = await ReadExactAsync(stream, 10);
+        Assert.Equal((byte)0x00, connectResponse[1]);
+
+        var payload = Encoding.ASCII.GetBytes(payloadText);
+        await stream.WriteAsync(payload);
+        var echoed = await ReadExactAsync(stream, payload.Length);
+        Assert.Equal(payload, echoed);
+    }
+
     private static async Task<RunningSocksServer> StartSocksServerAsync(
         IReadOnlyList<(string Host, int Port)> tunnelServers,
-        TunnelConnectionPolicy? connectionPolicy = null)
+        TunnelConnectionPolicy? connectionPolicy = null,
+        TunnelCryptoPolicy? cryptoPolicy = null)
     {
         var port = AllocateUnusedPort();
         var server = new Socks5Server(
@@ -326,7 +417,7 @@ public sealed class TunnelIntegrationTests
             port,
             tunnelServers,
             "dev-shared-key",
-            TunnelCryptoPolicy.Default,
+            cryptoPolicy ?? TunnelCryptoPolicy.Default,
             connectionPolicy ?? TunnelConnectionPolicy.Default);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);

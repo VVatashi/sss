@@ -6,18 +6,21 @@ namespace SimpleShadowsocks.Protocol.Crypto;
 public static class TunnelCryptoHandshake
 {
     private const int NonceLength = 12;
+    private const int AlgorithmLength = 1;
     private const int MacLength = 32;
     private const int TimestampLength = sizeof(long);
     private const int CounterLength = sizeof(ulong);
     private const int ClientMagicLength = 4;
     private const int ServerMagicLength = 4;
-    private static readonly byte[] ClientMagic = "TSC1"u8.ToArray();
-    private static readonly byte[] ServerMagic = "TSS1"u8.ToArray();
-    private static readonly byte[] HandshakeMacInfo = "ss-v1-handshake-mac"u8.ToArray();
-    private static readonly byte[] TransportKeyInfo = "ss-v1-transport-key"u8.ToArray();
+    private static readonly byte[] ClientMagic = "TSC2"u8.ToArray();
+    private static readonly byte[] ServerMagic = "TSS2"u8.ToArray();
+    private static readonly byte[] HandshakeMacInfo = "ss-v2-handshake-mac"u8.ToArray();
+    private static readonly byte[] TransportKeyInfoPrefix = "ss-v2-transport-key-"u8.ToArray();
+    private static readonly byte[] TransportClientNonceInfoPrefix = "ss-v2-transport-cnonce-"u8.ToArray();
+    private static readonly byte[] TransportServerNonceInfoPrefix = "ss-v2-transport-snonce-"u8.ToArray();
     private static long _clientHandshakeCounter;
 
-    public static async Task<ChaCha20Poly1305DuplexStream> AsClientAsync(
+    public static async Task<AeadDuplexStream> AsClientAsync(
         Stream plainStream,
         byte[] key,
         TunnelCryptoPolicy? policy = null,
@@ -26,27 +29,43 @@ public static class TunnelCryptoHandshake
         policy ??= TunnelCryptoPolicy.Default;
         var handshakeMacKey = DeriveHandshakeMacKey(key);
 
+        var algorithm = policy.PreferredAlgorithm;
+        if (!AeadDuplexStream.IsSupported(algorithm))
+        {
+            throw new InvalidDataException($"Unsupported preferred AEAD algorithm: {algorithm}.");
+        }
+
         var unixTimeSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var counter = (ulong)Interlocked.Increment(ref _clientHandshakeCounter);
         var clientWriteNonce = RandomNumberGenerator.GetBytes(NonceLength);
-        var clientHello = BuildClientHello(handshakeMacKey, unixTimeSeconds, counter, clientWriteNonce);
+        var clientHello = BuildClientHello(handshakeMacKey, algorithm, unixTimeSeconds, counter, clientWriteNonce);
         await plainStream.WriteAsync(clientHello, cancellationToken);
         await plainStream.FlushAsync(cancellationToken);
 
-        var serverHello = await ReadExactlyAsync(plainStream, ServerMagicLength + TimestampLength + NonceLength + MacLength, cancellationToken);
-        var (serverWriteNonce, serverUnixTimeSeconds) = ValidateAndExtractServerHello(serverHello, handshakeMacKey, clientHello);
-        ValidateClockSkew(serverUnixTimeSeconds, policy.HandshakeMaxClockSkewSeconds);
-
-        var transportKey = DeriveTransportKey(key, clientWriteNonce, serverWriteNonce);
-        return new ChaCha20Poly1305DuplexStream(
+        var serverHello = await ReadExactlyAsync(
             plainStream,
-            transportKey,
-            clientWriteNonce,
-            serverWriteNonce,
+            ServerMagicLength + AlgorithmLength + TimestampLength + NonceLength + MacLength,
+            cancellationToken);
+        var (serverWriteNonce, serverUnixTimeSeconds, serverAlgorithm) =
+            ValidateAndExtractServerHello(serverHello, handshakeMacKey, clientHello);
+        ValidateClockSkew(serverUnixTimeSeconds, policy.HandshakeMaxClockSkewSeconds);
+        if (serverAlgorithm != algorithm)
+        {
+            throw new InvalidDataException(
+                $"Server selected unexpected AEAD algorithm: {serverAlgorithm}. Expected: {algorithm}.");
+        }
+
+        var material = DeriveTransportMaterial(key, clientWriteNonce, serverWriteNonce, algorithm);
+        return new AeadDuplexStream(
+            plainStream,
+            algorithm,
+            material.Key,
+            material.ClientWriteBaseNonce,
+            material.ServerWriteBaseNonce,
             leaveOpen: true);
     }
 
-    public static async Task<ChaCha20Poly1305DuplexStream> AsServerAsync(
+    public static async Task<AeadDuplexStream> AsServerAsync(
         Stream plainStream,
         byte[] key,
         TunnelCryptoPolicy? policy = null,
@@ -57,11 +76,16 @@ public static class TunnelCryptoHandshake
 
         var clientHello = await ReadExactlyAsync(
             plainStream,
-            ClientMagicLength + TimestampLength + CounterLength + NonceLength + MacLength,
+            ClientMagicLength + AlgorithmLength + TimestampLength + CounterLength + NonceLength + MacLength,
             cancellationToken);
 
-        var (clientWriteNonce, clientUnixTimeSeconds, handshakeCounter) = ValidateAndExtractClientHello(clientHello, handshakeMacKey);
+        var (clientWriteNonce, clientUnixTimeSeconds, handshakeCounter, algorithm) =
+            ValidateAndExtractClientHello(clientHello, handshakeMacKey);
         ValidateClockSkew(clientUnixTimeSeconds, policy.HandshakeMaxClockSkewSeconds);
+        if (!AeadDuplexStream.IsSupported(algorithm))
+        {
+            throw new InvalidDataException($"Unsupported client AEAD algorithm: {algorithm}.");
+        }
 
         if (!ReplayProtectionCache.TryRegister(clientWriteNonce, handshakeCounter, policy.ReplayWindowSeconds))
         {
@@ -70,27 +94,36 @@ public static class TunnelCryptoHandshake
 
         var serverWriteNonce = RandomNumberGenerator.GetBytes(NonceLength);
         var serverUnixTimeSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var serverHello = BuildServerHello(handshakeMacKey, clientHello, serverUnixTimeSeconds, serverWriteNonce);
+        var serverHello = BuildServerHello(handshakeMacKey, clientHello, algorithm, serverUnixTimeSeconds, serverWriteNonce);
         await plainStream.WriteAsync(serverHello, cancellationToken);
         await plainStream.FlushAsync(cancellationToken);
 
-        var transportKey = DeriveTransportKey(key, clientWriteNonce, serverWriteNonce);
-        return new ChaCha20Poly1305DuplexStream(
+        var material = DeriveTransportMaterial(key, clientWriteNonce, serverWriteNonce, algorithm);
+        return new AeadDuplexStream(
             plainStream,
-            transportKey,
-            serverWriteNonce,
-            clientWriteNonce,
+            algorithm,
+            material.Key,
+            material.ServerWriteBaseNonce,
+            material.ClientWriteBaseNonce,
             leaveOpen: true);
     }
 
-    private static byte[] BuildClientHello(byte[] macKey, long unixTimeSeconds, ulong handshakeCounter, byte[] clientNonce)
+    private static byte[] BuildClientHello(
+        byte[] macKey,
+        TunnelCipherAlgorithm algorithm,
+        long unixTimeSeconds,
+        ulong handshakeCounter,
+        byte[] clientNonce)
     {
-        var payloadLength = ClientMagicLength + TimestampLength + CounterLength + NonceLength;
+        var payloadLength = ClientMagicLength + AlgorithmLength + TimestampLength + CounterLength + NonceLength;
         var payload = new byte[payloadLength];
         Buffer.BlockCopy(ClientMagic, 0, payload, 0, ClientMagicLength);
-        BinaryPrimitives.WriteInt64BigEndian(payload.AsSpan(ClientMagicLength, TimestampLength), unixTimeSeconds);
-        BinaryPrimitives.WriteUInt64BigEndian(payload.AsSpan(ClientMagicLength + TimestampLength, CounterLength), handshakeCounter);
-        Buffer.BlockCopy(clientNonce, 0, payload, ClientMagicLength + TimestampLength + CounterLength, NonceLength);
+        payload[ClientMagicLength] = (byte)algorithm;
+        BinaryPrimitives.WriteInt64BigEndian(payload.AsSpan(ClientMagicLength + AlgorithmLength, TimestampLength), unixTimeSeconds);
+        BinaryPrimitives.WriteUInt64BigEndian(
+            payload.AsSpan(ClientMagicLength + AlgorithmLength + TimestampLength, CounterLength),
+            handshakeCounter);
+        Buffer.BlockCopy(clientNonce, 0, payload, ClientMagicLength + AlgorithmLength + TimestampLength + CounterLength, NonceLength);
 
         var mac = ComputeHmacSha256(macKey, payload);
         var hello = new byte[payload.Length + mac.Length];
@@ -99,12 +132,18 @@ public static class TunnelCryptoHandshake
         return hello;
     }
 
-    private static byte[] BuildServerHello(byte[] macKey, byte[] clientHello, long unixTimeSeconds, byte[] serverNonce)
+    private static byte[] BuildServerHello(
+        byte[] macKey,
+        byte[] clientHello,
+        TunnelCipherAlgorithm algorithm,
+        long unixTimeSeconds,
+        byte[] serverNonce)
     {
-        var payload = new byte[ServerMagicLength + TimestampLength + NonceLength];
+        var payload = new byte[ServerMagicLength + AlgorithmLength + TimestampLength + NonceLength];
         Buffer.BlockCopy(ServerMagic, 0, payload, 0, ServerMagicLength);
-        BinaryPrimitives.WriteInt64BigEndian(payload.AsSpan(ServerMagicLength, TimestampLength), unixTimeSeconds);
-        Buffer.BlockCopy(serverNonce, 0, payload, ServerMagicLength + TimestampLength, NonceLength);
+        payload[ServerMagicLength] = (byte)algorithm;
+        BinaryPrimitives.WriteInt64BigEndian(payload.AsSpan(ServerMagicLength + AlgorithmLength, TimestampLength), unixTimeSeconds);
+        Buffer.BlockCopy(serverNonce, 0, payload, ServerMagicLength + AlgorithmLength + TimestampLength, NonceLength);
 
         var macInput = new byte[clientHello.Length + payload.Length];
         Buffer.BlockCopy(clientHello, 0, macInput, 0, clientHello.Length);
@@ -117,7 +156,7 @@ public static class TunnelCryptoHandshake
         return hello;
     }
 
-    private static (byte[] ClientNonce, long UnixTimeSeconds, ulong HandshakeCounter) ValidateAndExtractClientHello(
+    private static (byte[] ClientNonce, long UnixTimeSeconds, ulong HandshakeCounter, TunnelCipherAlgorithm Algorithm) ValidateAndExtractClientHello(
         byte[] clientHello,
         byte[] macKey)
     {
@@ -136,13 +175,15 @@ public static class TunnelCryptoHandshake
             throw new InvalidDataException("Invalid client handshake magic.");
         }
 
-        var unixTime = BinaryPrimitives.ReadInt64BigEndian(payload.Slice(ClientMagicLength, TimestampLength));
-        var counter = BinaryPrimitives.ReadUInt64BigEndian(payload.Slice(ClientMagicLength + TimestampLength, CounterLength));
-        var nonce = payload.Slice(ClientMagicLength + TimestampLength + CounterLength, NonceLength).ToArray();
-        return (nonce, unixTime, counter);
+        var algorithm = (TunnelCipherAlgorithm)payload[ClientMagicLength];
+        var unixTime = BinaryPrimitives.ReadInt64BigEndian(payload.Slice(ClientMagicLength + AlgorithmLength, TimestampLength));
+        var counter = BinaryPrimitives.ReadUInt64BigEndian(
+            payload.Slice(ClientMagicLength + AlgorithmLength + TimestampLength, CounterLength));
+        var nonce = payload.Slice(ClientMagicLength + AlgorithmLength + TimestampLength + CounterLength, NonceLength).ToArray();
+        return (nonce, unixTime, counter, algorithm);
     }
 
-    private static (byte[] ServerNonce, long UnixTimeSeconds) ValidateAndExtractServerHello(
+    private static (byte[] ServerNonce, long UnixTimeSeconds, TunnelCipherAlgorithm Algorithm) ValidateAndExtractServerHello(
         byte[] serverHello,
         byte[] macKey,
         byte[] clientHello)
@@ -166,9 +207,10 @@ public static class TunnelCryptoHandshake
             throw new InvalidDataException("Invalid server handshake MAC.");
         }
 
-        var unixTime = BinaryPrimitives.ReadInt64BigEndian(payload.Slice(ServerMagicLength, TimestampLength));
-        var nonce = payload.Slice(ServerMagicLength + TimestampLength, NonceLength).ToArray();
-        return (nonce, unixTime);
+        var algorithm = (TunnelCipherAlgorithm)payload[ServerMagicLength];
+        var unixTime = BinaryPrimitives.ReadInt64BigEndian(payload.Slice(ServerMagicLength + AlgorithmLength, TimestampLength));
+        var nonce = payload.Slice(ServerMagicLength + AlgorithmLength + TimestampLength, NonceLength).ToArray();
+        return (nonce, unixTime, algorithm);
     }
 
     private static byte[] ComputeHmacSha256(byte[] key, ReadOnlySpan<byte> data)
@@ -183,13 +225,33 @@ public static class TunnelCryptoHandshake
         return HkdfExpand(prk, HandshakeMacInfo, 32);
     }
 
-    private static byte[] DeriveTransportKey(byte[] psk, byte[] clientNonce, byte[] serverNonce)
+    private static (byte[] Key, byte[] ClientWriteBaseNonce, byte[] ServerWriteBaseNonce) DeriveTransportMaterial(
+        byte[] psk,
+        byte[] clientNonce,
+        byte[] serverNonce,
+        TunnelCipherAlgorithm algorithm)
     {
         var salt = new byte[clientNonce.Length + serverNonce.Length];
         Buffer.BlockCopy(clientNonce, 0, salt, 0, clientNonce.Length);
         Buffer.BlockCopy(serverNonce, 0, salt, clientNonce.Length, serverNonce.Length);
         var prk = HkdfExtract(salt, psk);
-        return HkdfExpand(prk, TransportKeyInfo, 32);
+        var keyInfo = BuildAlgorithmInfo(TransportKeyInfoPrefix, algorithm);
+        var key = HkdfExpand(prk, keyInfo, 32);
+
+        var nonceLength = AeadDuplexStream.GetNonceSize(algorithm);
+        var clientNonceInfo = BuildAlgorithmInfo(TransportClientNonceInfoPrefix, algorithm);
+        var serverNonceInfo = BuildAlgorithmInfo(TransportServerNonceInfoPrefix, algorithm);
+        var clientWriteBaseNonce = HkdfExpand(prk, clientNonceInfo, nonceLength);
+        var serverWriteBaseNonce = HkdfExpand(prk, serverNonceInfo, nonceLength);
+        return (key, clientWriteBaseNonce, serverWriteBaseNonce);
+    }
+
+    private static byte[] BuildAlgorithmInfo(byte[] prefix, TunnelCipherAlgorithm algorithm)
+    {
+        var info = new byte[prefix.Length + 1];
+        Buffer.BlockCopy(prefix, 0, info, 0, prefix.Length);
+        info[^1] = (byte)algorithm;
+        return info;
     }
 
     private static byte[] HkdfExtract(byte[] salt, byte[] ikm)

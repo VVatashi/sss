@@ -12,6 +12,8 @@ namespace SimpleShadowsocks.Client.Tests;
 
 public sealed class PerformanceMeasurementsTests
 {
+    private static readonly TimeSpan WarmupTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan MeasurementTimeout = TimeSpan.FromSeconds(90);
     private readonly ITestOutputHelper _output;
 
     public PerformanceMeasurementsTests(ITestOutputHelper output)
@@ -94,6 +96,71 @@ public sealed class PerformanceMeasurementsTests
         Assert.True(withCompression.ThroughputMibPerSec > 5, $"Unexpectedly low throughput: {withCompression.ThroughputMibPerSec:F2} MiB/s");
     }
 
+    [Fact]
+    public async Task Measure_Throughput_And_Allocations_ChaCha20Poly1305()
+    {
+        await MeasureSingleAlgorithmAsync(TunnelCipherAlgorithm.ChaCha20Poly1305, "ChaCha20-Poly1305");
+    }
+
+    [Fact]
+    public async Task Measure_Throughput_And_Allocations_Aes256Gcm()
+    {
+        await MeasureSingleAlgorithmAsync(TunnelCipherAlgorithm.Aes256Gcm, "AES-256-GCM");
+    }
+
+    [Fact]
+    public async Task Measure_Throughput_And_Allocations_Aegis128L()
+    {
+        if (!AeadDuplexStream.IsSupported(TunnelCipherAlgorithm.Aegis128L))
+        {
+            _output.WriteLine("AEGIS-128L is not supported on this runtime.");
+            return;
+        }
+
+        await MeasureSingleAlgorithmAsync(TunnelCipherAlgorithm.Aegis128L, "AEGIS-128L");
+    }
+
+    [Fact]
+    public async Task Measure_Throughput_And_Allocations_Aegis256()
+    {
+        if (!AeadDuplexStream.IsSupported(TunnelCipherAlgorithm.Aegis256))
+        {
+            _output.WriteLine("AEGIS-256 is not supported on this runtime.");
+            return;
+        }
+
+        await MeasureSingleAlgorithmAsync(TunnelCipherAlgorithm.Aegis256, "AEGIS-256");
+    }
+
+    private async Task MeasureSingleAlgorithmAsync(TunnelCipherAlgorithm algorithm, string algorithmName)
+    {
+        const int totalMb = 128;
+        const int chunkKb = 16;
+        const int streams = 4;
+        var totalBytes = (long)totalMb * 1024 * 1024;
+        var chunkBytes = chunkKb * 1024;
+
+        _output.WriteLine($"[perf] start algorithm={algorithmName}, total={totalMb}MiB, chunk={chunkKb}KiB, streams={streams}");
+        await using var echo = await StartEchoServerAsync();
+        _output.WriteLine($"[perf] echo server ready on 127.0.0.1:{echo.Port}");
+        await using var tunnel = await StartTunnelServerAsync();
+        _output.WriteLine($"[perf] tunnel server ready on 127.0.0.1:{tunnel.Port}");
+
+        var result = await MeasureModeAsync(
+            echo.Port,
+            tunnel.Port,
+            chunkBytes,
+            totalBytes,
+            streams,
+            enableCompression: false,
+            payloadProfile: PayloadProfile.Mixed,
+            algorithm: algorithm);
+
+        _output.WriteLine($"=== AEAD {algorithmName} ===");
+        _output.WriteLine(result.ToString());
+        Assert.True(result.ThroughputMibPerSec > 5, $"Unexpectedly low throughput ({algorithmName}): {result.ThroughputMibPerSec:F2} MiB/s");
+    }
+
     private async Task<PerfResult> MeasureModeAsync(
         int echoPort,
         int tunnelPort,
@@ -101,20 +168,45 @@ public sealed class PerformanceMeasurementsTests
         long totalBytes,
         int streams,
         bool enableCompression,
-        PayloadProfile payloadProfile)
+        PayloadProfile payloadProfile,
+        TunnelCipherAlgorithm algorithm = TunnelCipherAlgorithm.ChaCha20Poly1305)
     {
-        await using var socks = await StartSocksServerAsync(tunnelPort, enableCompression);
-        await RunTrafficAsync(socks.Port, echoPort, 8L * 1024 * 1024, chunkBytes, 2, payloadProfile);
+        _output.WriteLine($"[perf] start socks server (algorithm={algorithm}, compression={enableCompression})");
+        await using var socks = await StartSocksServerAsync(tunnelPort, enableCompression, algorithm);
+        _output.WriteLine($"[perf] socks server ready on 127.0.0.1:{socks.Port}");
 
+        _output.WriteLine($"[perf] warmup start (timeout={WarmupTimeout.TotalSeconds}s)");
+        await RunTrafficAsync(
+            socks.Port,
+            echoPort,
+            8L * 1024 * 1024,
+            chunkBytes,
+            2,
+            payloadProfile,
+            WarmupTimeout,
+            "warmup");
+        _output.WriteLine("[perf] warmup done");
+
+        _output.WriteLine("[perf] full GC before measurement");
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
 
         var allocBefore = GC.GetTotalAllocatedBytes(true);
         var sw = Stopwatch.StartNew();
-        await RunTrafficAsync(socks.Port, echoPort, totalBytes, chunkBytes, streams, payloadProfile);
+        _output.WriteLine($"[perf] measurement start (timeout={MeasurementTimeout.TotalSeconds}s)");
+        await RunTrafficAsync(
+            socks.Port,
+            echoPort,
+            totalBytes,
+            chunkBytes,
+            streams,
+            payloadProfile,
+            MeasurementTimeout,
+            "measurement");
         sw.Stop();
         var allocAfter = GC.GetTotalAllocatedBytes(true);
+        _output.WriteLine("[perf] measurement done");
 
         var allocated = allocAfter - allocBefore;
         var seconds = sw.Elapsed.TotalSeconds;
@@ -124,65 +216,88 @@ public sealed class PerformanceMeasurementsTests
         return new PerfResult(enableCompression, seconds, throughput, allocated, bytesPerMiB);
     }
 
-    private static async Task RunTrafficAsync(
+    private async Task RunTrafficAsync(
         int socksPort,
         int echoPort,
         long totalBytes,
         int chunkBytes,
         int streams,
-        PayloadProfile payloadProfile)
+        PayloadProfile payloadProfile,
+        TimeSpan timeout,
+        string stage)
     {
+        _output.WriteLine($"[perf] {stage}: preparing streams, totalBytes={totalBytes}, streams={streams}");
         var bytesPerStream = totalBytes / streams;
         var extra = totalBytes % streams;
         var tasks = new List<Task>(streams);
+        using var cts = new CancellationTokenSource(timeout);
 
         for (var i = 0; i < streams; i++)
         {
             var streamBytes = bytesPerStream + (i == streams - 1 ? extra : 0);
-            tasks.Add(RunSingleStreamAsync(socksPort, echoPort, streamBytes, chunkBytes, payloadProfile));
+            var streamId = i + 1;
+            _output.WriteLine($"[perf] {stage}: stream#{streamId} start, bytes={streamBytes}");
+            tasks.Add(RunSingleStreamAsync(socksPort, echoPort, streamBytes, chunkBytes, payloadProfile, streamId, cts.Token));
         }
 
-        await Task.WhenAll(tasks);
+        try
+        {
+            await Task.WhenAll(tasks);
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            throw new TimeoutException($"[perf] {stage} timeout after {timeout.TotalSeconds}s.");
+        }
+
+        _output.WriteLine($"[perf] {stage}: all streams completed");
     }
 
-    private static async Task RunSingleStreamAsync(
+    private async Task RunSingleStreamAsync(
         int socksPort,
         int echoPort,
         long totalBytes,
         int chunkBytes,
-        PayloadProfile payloadProfile)
+        PayloadProfile payloadProfile,
+        int streamId,
+        CancellationToken cancellationToken)
     {
+        _output.WriteLine($"[perf] stream#{streamId}: connecting to SOCKS 127.0.0.1:{socksPort}");
         using var tcpClient = new TcpClient();
-        await tcpClient.ConnectAsync(IPAddress.Loopback, socksPort);
+        await tcpClient.ConnectAsync(IPAddress.Loopback, socksPort, cancellationToken);
         using var stream = tcpClient.GetStream();
+        _output.WriteLine($"[perf] stream#{streamId}: SOCKS TCP connected");
 
-        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
-        var greeting = await ReadExactAsync(stream, 2);
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 }, cancellationToken);
+        var greeting = await ReadExactAsync(stream, 2, cancellationToken);
         if (greeting[0] != 0x05 || greeting[1] != 0x00)
         {
             throw new InvalidOperationException("SOCKS5 greeting failed.");
         }
+        _output.WriteLine($"[perf] stream#{streamId}: SOCKS greeting ok");
 
-        await stream.WriteAsync(BuildConnectRequestIPv4(IPAddress.Loopback, echoPort));
-        var connect = await ReadExactAsync(stream, 10);
+        await stream.WriteAsync(BuildConnectRequestIPv4(IPAddress.Loopback, echoPort), cancellationToken);
+        var connect = await ReadExactAsync(stream, 10, cancellationToken);
         if (connect[1] != 0x00)
         {
             throw new InvalidOperationException($"SOCKS5 connect failed: {connect[1]}");
         }
+        _output.WriteLine($"[perf] stream#{streamId}: SOCKS connect to echo ok");
 
         var sendBuffer = BuildPayload(chunkBytes, payloadProfile);
 
         var readBuffer = new byte[chunkBytes];
         long sent = 0;
+        var lastLoggedMiB = 0;
         while (sent < totalBytes)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var toSend = (int)Math.Min(chunkBytes, totalBytes - sent);
-            await stream.WriteAsync(sendBuffer.AsMemory(0, toSend));
+            await stream.WriteAsync(sendBuffer.AsMemory(0, toSend), cancellationToken);
 
             var offset = 0;
             while (offset < toSend)
             {
-                var read = await stream.ReadAsync(readBuffer.AsMemory(offset, toSend - offset));
+                var read = await stream.ReadAsync(readBuffer.AsMemory(offset, toSend - offset), cancellationToken);
                 if (read == 0)
                 {
                     throw new IOException("Unexpected EOF while reading echo.");
@@ -192,7 +307,20 @@ public sealed class PerformanceMeasurementsTests
             }
 
             sent += toSend;
+            if (sent == toSend)
+            {
+                _output.WriteLine($"[perf] stream#{streamId}: first payload exchange ok ({toSend} bytes)");
+            }
+
+            var sentMiB = (int)(sent / (1024 * 1024));
+            if (sentMiB >= lastLoggedMiB + 16)
+            {
+                lastLoggedMiB = sentMiB;
+                _output.WriteLine($"[perf] stream#{streamId}: sent={sentMiB}MiB/{totalBytes / (1024 * 1024)}MiB");
+            }
         }
+
+        _output.WriteLine($"[perf] stream#{streamId}: completed");
     }
 
     private static async Task<RunningTunnelServer> StartTunnelServerAsync()
@@ -210,7 +338,10 @@ public sealed class PerformanceMeasurementsTests
         return new RunningTunnelServer(port, cts, runTask);
     }
 
-    private static async Task<RunningSocksServer> StartSocksServerAsync(int tunnelPort, bool enableCompression)
+    private static async Task<RunningSocksServer> StartSocksServerAsync(
+        int tunnelPort,
+        bool enableCompression,
+        TunnelCipherAlgorithm algorithm)
     {
         var port = AllocateUnusedPort();
         var server = new Socks5Server(
@@ -219,7 +350,12 @@ public sealed class PerformanceMeasurementsTests
             "127.0.0.1",
             tunnelPort,
             "dev-shared-key",
-            TunnelCryptoPolicy.Default,
+            new TunnelCryptoPolicy
+            {
+                HandshakeMaxClockSkewSeconds = TunnelCryptoPolicy.Default.HandshakeMaxClockSkewSeconds,
+                ReplayWindowSeconds = TunnelCryptoPolicy.Default.ReplayWindowSeconds,
+                PreferredAlgorithm = algorithm
+            },
             new TunnelConnectionPolicy
             {
                 HeartbeatIntervalSeconds = 10,
@@ -324,13 +460,13 @@ public sealed class PerformanceMeasurementsTests
         ];
     }
 
-    private static async Task<byte[]> ReadExactAsync(NetworkStream stream, int length)
+    private static async Task<byte[]> ReadExactAsync(NetworkStream stream, int length, CancellationToken cancellationToken)
     {
         var buffer = new byte[length];
         var offset = 0;
         while (offset < length)
         {
-            var read = await stream.ReadAsync(buffer.AsMemory(offset, length - offset));
+            var read = await stream.ReadAsync(buffer.AsMemory(offset, length - offset), cancellationToken);
             if (read == 0)
             {
                 throw new IOException("Unexpected EOF while reading stream.");

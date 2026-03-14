@@ -9,4 +9,7 @@ public sealed class TunnelCryptoPolicy
 
     // Replay cache lifetime for seen client handshake identifiers.
     public int ReplayWindowSeconds { get; init; } = 300;
+
+    // Preferred transport AEAD algorithm for client side. Server supports all known algorithms.
+    public TunnelCipherAlgorithm PreferredAlgorithm { get; init; } = TunnelCipherAlgorithm.ChaCha20Poly1305;
 }

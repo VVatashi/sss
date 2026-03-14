@@ -16,10 +16,12 @@ var remoteServers = (config.RemoteServers ?? [])
 var sharedKey = config.SharedKey;
 var protocolVersion = config.ProtocolVersion;
 var enableCompression = config.EnableCompression;
+var tunnelCipherAlgorithm = config.GetTunnelCipherAlgorithm();
 var cryptoPolicy = new TunnelCryptoPolicy
 {
     HandshakeMaxClockSkewSeconds = config.HandshakeMaxClockSkewSeconds,
-    ReplayWindowSeconds = config.ReplayWindowSeconds
+    ReplayWindowSeconds = config.ReplayWindowSeconds,
+    PreferredAlgorithm = tunnelCipherAlgorithm
 };
 var connectionPolicy = new TunnelConnectionPolicy
 {
@@ -73,6 +75,7 @@ else
 }
 Console.WriteLine($"Protocol version: {ProtocolConstants.Version}");
 Console.WriteLine($"Configured tunnel protocol: v{protocolVersion}, compression={(enableCompression ? "on" : "off")}");
+Console.WriteLine($"Configured AEAD: {tunnelCipherAlgorithm}");
 Console.WriteLine("Press Ctrl+C to stop.");
 
 var server = remoteServers.Count > 0
@@ -114,7 +117,23 @@ internal sealed class ClientConfig
     public int SessionReceiveChannelCapacity { get; init; } = 256;
     public byte ProtocolVersion { get; init; } = ProtocolConstants.Version;
     public bool EnableCompression { get; init; } = false;
+    public string TunnelCipherAlgorithm { get; init; } = nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.ChaCha20Poly1305);
     public List<RemoteServerConfig>? RemoteServers { get; init; }
+
+    public SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm GetTunnelCipherAlgorithm()
+    {
+        if (Enum.TryParse<SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm>(TunnelCipherAlgorithm, ignoreCase: true, out var parsed))
+        {
+            return parsed;
+        }
+
+        throw new InvalidDataException(
+            $"Unsupported TunnelCipherAlgorithm: '{TunnelCipherAlgorithm}'. " +
+            $"Supported: {nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.ChaCha20Poly1305)}, " +
+            $"{nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.Aes256Gcm)}, " +
+            $"{nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.Aegis128L)}, " +
+            $"{nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.Aegis256)}");
+    }
 
     public static ClientConfig Load()
     {

@@ -132,6 +132,7 @@ journalctl -u simple-shadowsocks-server -f
 Параметры протокола (в `appsettings.json` клиента):
 - `ProtocolVersion` - версия протокола кадров (`1` или `2`).
 - `EnableCompression` - включение сжатия payload в `v2` (`false` по умолчанию), алгоритм фиксирован: `Deflate` (`CompressionLevel.Fastest`).
+- `TunnelCipherAlgorithm` - AEAD-алгоритм туннеля: `ChaCha20Poly1305`, `Aes256Gcm`, `Aegis128L`, `Aegis256`.
 
 Параметры server policy (в `appsettings.json` сервера):
 - `MaxConcurrentTunnels` - лимит одновременных tunnel-соединений.
@@ -168,6 +169,19 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~PerformanceMeasurementsTests" --logger "console;verbosity=detailed"
 ```
 
+Perf-замеры AEAD по одному алгоритму (Release):
+
+```powershell
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_ChaCha20Poly1305" --logger "console;verbosity=detailed"
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_Aes256Gcm" --logger "console;verbosity=detailed"
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_Aegis128L" --logger "console;verbosity=detailed"
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_Aegis256" --logger "console;verbosity=detailed"
+```
+
+Примечание по perf-тестам:
+- добавлено подробное stage-логирование (`[perf] ...`) для диагностики зависаний;
+- добавлены встроенные таймауты на этапы `warmup` и `measurement`, чтобы тест не зависал бесконечно.
+
 ## Что уже реализовано
 
 - Решение и проекты на `.NET 9`:
@@ -201,9 +215,14 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
     - сериализация `CONNECT` для IP/Domain без промежуточных буферов (`TryWriteBytes`/span-based ASCII encode)
 
 - Поточное шифрование туннеля:
-  - алгоритм `ChaCha20-Poly1305 (AEAD)`: приоритет `System.Security.Cryptography.ChaCha20Poly1305`, fallback на BouncyCastle при недоступности платформенной реализации
+  - AEAD-алгоритмы: `ChaCha20-Poly1305`, `AES-256-GCM`, `AEGIS-128L`, `AEGIS-256`
+  - клиент выбирает алгоритм через `TunnelCipherAlgorithm` в конфиге
+  - сервер поддерживает все перечисленные AEAD-алгоритмы и принимает выбор клиента из crypto-handshake
+  - реализации AEAD вынесены в отдельные классы с общим интерфейсом (`IAeadCipherImpl`) и фабрикой выбора алгоритма (`AeadCipherFactory`) без изменения wire-формата
+  - для `ChaCha20-Poly1305`/`AES-256-GCM` используются `System.Security.Cryptography` при доступности, fallback - BouncyCastle
+  - для `AEGIS-128L`/`AEGIS-256` используется `NSec.Cryptography` (libsodium backend) с runtime-проверкой поддержки
   - pre-shared key из конфигурации
-  - защищенный handshake (HMAC + timestamp + handshake counter) c проверкой времени на обеих сторонах
+  - защищенный crypto-handshake v2 (HMAC + timestamp + handshake counter + negotiated algorithm) c проверкой времени на обеих сторонах
   - HKDF-разделение ключевого материала: отдельный ключ для MAC handshake и отдельный transport key для AEAD
   - последующий обмен всеми кадрами в зашифрованном и аутентифицированном виде
   - nonce policy: уникальный nonce на каждый AEAD-record через base nonce + counter
@@ -221,16 +240,20 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 
 - Тесты:
   - unit + integration тесты SOCKS5, протокола и туннеля
+  - есть узкий crypto regression-тест handshake+record roundtrip для `AEGIS-128L`
   - есть проверка multiplexing: две сессии через один туннель
   - есть проверка reconnect после перезапуска tunnel-сервера
   - есть проверка graceful migration активной сессии через reconnect туннеля
   - есть проверка ограничения сессий на сервере и валидации reconnect policy
   - есть проверка round-robin распределения по группе tunnel-серверов
   - есть проверка, что медленный/таймаутный `CONNECT` не блокирует другие сессии
+  - есть проверка туннеля с `AES-256-GCM`
+  - есть проверки туннеля с `AEGIS-128L` и `AEGIS-256`
   - есть perf-тест для измерения throughput/allocations
   - есть проверки `v1/v2` и round-trip со сжатием в `v2`
   - есть отдельный perf-тест на хорошо сжимаемом payload
-  - текущий набор: `25` тестов, проходят
+  - есть раздельные perf-тесты по каждому AEAD-алгоритму (`ChaCha20-Poly1305`, `AES-256-GCM`, `AEGIS-128L`, `AEGIS-256`)
+  - текущий набор: `33` теста, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
   - `bin/<ProjectName>/...`
@@ -279,6 +302,12 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - Для `v2` сжатие фиксировано на `Deflate (CompressionLevel.Fastest)`, выбор алгоритма не negotiated.
 - Ordering/replay policy на прикладных кадрах: ожидается строго возрастающий `SEQUENCE` per `SESSION`; при нарушении сессия закрывается.
 
+Crypto-handshake (transport encryption):
+- Используется handshake версии `v2` (магии `TSC2`/`TSS2`).
+- Клиент передаёт выбранный AEAD-алгоритм в `ClientHello`.
+- Сервер отвечает `ServerHello` с подтверждённым алгоритмом (в текущей реализации равным выбору клиента).
+- При несовпадении/неподдерживаемом алгоритме handshake завершается ошибкой.
+
 ## Ограничения текущей версии
 
 - Нет ротации ключей.
@@ -299,6 +328,17 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 
 Вывод: в текущей реализации (`Deflate`) сжатие проигрывает по throughput в обоих профилях и не даёт выигрыша по аллокациям.  
 По умолчанию оставлено `EnableCompression=false`.
+
+## Результат сравнения AEAD (Release)
+
+Тесты запускались по одному (каждый в отдельном `dotnet test` запуске, с внутренним `warmup`), `128 MiB`, `16 KiB`, `4 streams`, `compression=off`.
+
+- `ChaCha20-Poly1305`: `51.09 MiB/s`, `2,348,914 bytes/MiB`.
+- `AES-256-GCM`: `29.35 MiB/s`, `2,346,777 bytes/MiB`.
+- `AEGIS-128L`: `27.93 MiB/s`, `2,316,319 bytes/MiB`.
+- `AEGIS-256`: `28.86 MiB/s`, `2,324,720 bytes/MiB`.
+
+Вывод: на текущем хосте лучшая пропускная способность у `ChaCha20-Poly1305`; `AES-256-GCM` и AEGIS-алгоритмы заметно медленнее.
 
 ## Следующие шаги
 

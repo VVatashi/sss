@@ -1,27 +1,22 @@
-using System.Buffers.Binary;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
-using Org.BouncyCastle.Crypto;
-using Org.BouncyCastle.Crypto.Parameters;
-using BcChaCha20Poly1305 = Org.BouncyCastle.Crypto.Modes.ChaCha20Poly1305;
 
 namespace SimpleShadowsocks.Protocol.Crypto;
 
-public sealed class ChaCha20Poly1305DuplexStream : Stream
+public sealed class AeadDuplexStream : Stream
 {
-    private const int NonceLength = 12;
-    private const int TagBits = 128;
-    private const int TagLength = TagBits / 8;
     private const int LengthPrefixSize = 4;
     private const int MaxCipherRecordLength = 2 * 1024 * 1024;
 
     private readonly Stream _inner;
-    private readonly byte[] _key;
+    private readonly IAeadCipherImpl _writeCipher;
+    private readonly IAeadCipherImpl _readCipher;
+    private readonly int _nonceLength;
+    private readonly int _tagLength;
     private readonly byte[] _writeBaseNonce;
     private readonly byte[] _readBaseNonce;
     private readonly bool _leaveOpen;
-    private static int _systemChaCha20Poly1305Available = ProbeSystemChaCha20Poly1305() ? 1 : 0;
 
     private ulong _writeCounter;
     private ulong _readCounter;
@@ -31,8 +26,9 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
     private int _plainReadLength;
     private bool _plainReadBufferFromPool;
 
-    public ChaCha20Poly1305DuplexStream(
+    public AeadDuplexStream(
         Stream inner,
+        TunnelCipherAlgorithm algorithm,
         ReadOnlySpan<byte> key,
         ReadOnlySpan<byte> writeBaseNonce,
         ReadOnlySpan<byte> readBaseNonce,
@@ -40,16 +36,20 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
     {
         if (key.Length != 32)
         {
-            throw new ArgumentException("ChaCha20-Poly1305 key must be 32 bytes.", nameof(key));
+            throw new ArgumentException("AEAD key must be 32 bytes.", nameof(key));
         }
 
-        if (writeBaseNonce.Length != NonceLength || readBaseNonce.Length != NonceLength)
+        _writeCipher = AeadCipherFactory.Create(algorithm, key);
+        _readCipher = AeadCipherFactory.Create(algorithm, key);
+        _nonceLength = _writeCipher.NonceSize;
+        _tagLength = _writeCipher.TagSize;
+
+        if (writeBaseNonce.Length != _nonceLength || readBaseNonce.Length != _nonceLength)
         {
-            throw new ArgumentException("ChaCha20-Poly1305 nonce must be 12 bytes.");
+            throw new ArgumentException($"AEAD nonce must be {_nonceLength} bytes.");
         }
 
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
-        _key = key.ToArray();
         _writeBaseNonce = writeBaseNonce.ToArray();
         _readBaseNonce = readBaseNonce.ToArray();
         _leaveOpen = leaveOpen;
@@ -110,7 +110,7 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
             throw new InvalidOperationException("AEAD write counter exhausted; re-key is required.");
         }
 
-        var nonce = BuildNonce(_writeBaseNonce, _writeCounter++);
+        var nonce = BuildNonce(_writeBaseNonce, _writeCounter++, _nonceLength);
         await EncryptAndWriteAsync(buffer, nonce, cancellationToken);
     }
 
@@ -120,6 +120,8 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
     protected override void Dispose(bool disposing)
     {
         ReturnPlainReadBuffer();
+        _writeCipher.Dispose();
+        _readCipher.Dispose();
 
         if (disposing && !_leaveOpen)
         {
@@ -132,6 +134,8 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
     public override async ValueTask DisposeAsync()
     {
         ReturnPlainReadBuffer();
+        _writeCipher.Dispose();
+        _readCipher.Dispose();
 
         if (!_leaveOpen)
         {
@@ -140,6 +144,9 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
 
         await base.DisposeAsync();
     }
+
+    public static bool IsSupported(TunnelCipherAlgorithm algorithm) => AeadCipherFactory.IsSupported(algorithm);
+    public static int GetNonceSize(TunnelCipherAlgorithm algorithm) => AeadCipherFactory.GetNonceSize(algorithm);
 
     private bool EnsurePlainReadData()
     {
@@ -163,7 +170,7 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
             }
 
             var cipherLength = BinaryPrimitives.ReadInt32BigEndian(lengthBuffer.AsSpan(0, LengthPrefixSize));
-            if (cipherLength <= TagLength || cipherLength > MaxCipherRecordLength)
+            if (cipherLength <= _tagLength || cipherLength > MaxCipherRecordLength)
             {
                 throw new InvalidDataException($"Invalid encrypted record length: {cipherLength}.");
             }
@@ -178,9 +185,9 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
                     throw new InvalidDataException("AEAD read counter exhausted.");
                 }
 
-                var nonce = BuildNonce(_readBaseNonce, _readCounter++);
+                var nonce = BuildNonce(_readBaseNonce, _readCounter++, _nonceLength);
                 ReturnPlainReadBuffer();
-                (_plainReadBuffer, _plainReadLength) = DecryptPooled(cipherText.AsSpan(0, cipherLength), nonce, _key);
+                (_plainReadBuffer, _plainReadLength) = DecryptPooled(cipherText.AsSpan(0, cipherLength), nonce);
                 _plainReadBufferFromPool = true;
                 _plainReadOffset = 0;
                 return true;
@@ -196,25 +203,24 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
         }
     }
 
-    private static byte[] BuildNonce(byte[] baseNonce, ulong counter)
+    private static byte[] BuildNonce(byte[] baseNonce, ulong counter, int nonceLength)
     {
-        var nonce = new byte[NonceLength];
+        var nonce = new byte[nonceLength];
         baseNonce.AsSpan().CopyTo(nonce);
-        nonce[NonceLength - 8] ^= (byte)(counter >> 56);
-        nonce[NonceLength - 7] ^= (byte)(counter >> 48);
-        nonce[NonceLength - 6] ^= (byte)(counter >> 40);
-        nonce[NonceLength - 5] ^= (byte)(counter >> 32);
-        nonce[NonceLength - 4] ^= (byte)(counter >> 24);
-        nonce[NonceLength - 3] ^= (byte)(counter >> 16);
-        nonce[NonceLength - 2] ^= (byte)(counter >> 8);
-        nonce[NonceLength - 1] ^= (byte)counter;
-
+        nonce[nonceLength - 8] ^= (byte)(counter >> 56);
+        nonce[nonceLength - 7] ^= (byte)(counter >> 48);
+        nonce[nonceLength - 6] ^= (byte)(counter >> 40);
+        nonce[nonceLength - 5] ^= (byte)(counter >> 32);
+        nonce[nonceLength - 4] ^= (byte)(counter >> 24);
+        nonce[nonceLength - 3] ^= (byte)(counter >> 16);
+        nonce[nonceLength - 2] ^= (byte)(counter >> 8);
+        nonce[nonceLength - 1] ^= (byte)counter;
         return nonce;
     }
 
     private async ValueTask EncryptAndWriteAsync(ReadOnlyMemory<byte> plain, byte[] nonce, CancellationToken cancellationToken)
     {
-        var cipherBuffer = ArrayPool<byte>.Shared.Rent(plain.Length + TagLength);
+        var cipherBuffer = ArrayPool<byte>.Shared.Rent(plain.Length + _tagLength);
         byte[]? rentedInput = null;
         try
         {
@@ -230,7 +236,7 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
                 plainSpan = rentedInput.AsSpan(0, plain.Length);
             }
 
-            var len = EncryptCombined(plainSpan, nonce, _key, cipherBuffer);
+            var len = _writeCipher.Encrypt(plainSpan, nonce, cipherBuffer);
 
             var prefix = ArrayPool<byte>.Shared.Rent(LengthPrefixSize);
             try
@@ -256,29 +262,19 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
         }
     }
 
-    private static (byte[] Buffer, int Length) DecryptPooled(ReadOnlySpan<byte> cipherText, byte[] nonce, byte[] key)
+    private (byte[] Buffer, int Length) DecryptPooled(ReadOnlySpan<byte> cipherText, ReadOnlySpan<byte> nonce)
     {
-        var output = ArrayPool<byte>.Shared.Rent(cipherText.Length - TagLength);
+        var output = ArrayPool<byte>.Shared.Rent(cipherText.Length - _tagLength);
         try
         {
-            var len = DecryptCombined(cipherText, nonce, key, output);
+            var len = _readCipher.Decrypt(cipherText, nonce, output);
             return (output, len);
         }
-        catch (CryptographicException ex)
+        catch
         {
             ArrayPool<byte>.Shared.Return(output);
-            throw new InvalidDataException("Encrypted record authentication failed.", ex);
+            throw;
         }
-        catch (InvalidCipherTextException ex)
-        {
-            ArrayPool<byte>.Shared.Return(output);
-            throw new InvalidDataException("Encrypted record authentication failed.", ex);
-        }
-    }
-
-    private static async Task<int> ReadExactlyOrEofAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
-    {
-        return await ReadExactlyOrEofAsync(stream, buffer, buffer.Length, cancellationToken);
     }
 
     private static async Task<int> ReadExactlyOrEofAsync(Stream stream, byte[] buffer, int length, CancellationToken cancellationToken)
@@ -296,11 +292,6 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
         }
 
         return offset;
-    }
-
-    private static async Task ReadExactlyAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
-    {
-        await ReadExactlyAsync(stream, buffer, buffer.Length, cancellationToken);
     }
 
     private static async Task ReadExactlyAsync(Stream stream, byte[] buffer, int length, CancellationToken cancellationToken)
@@ -329,107 +320,5 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
         _plainReadOffset = 0;
         _plainReadLength = 0;
         _plainReadBufferFromPool = false;
-    }
-
-    private static int EncryptCombined(ReadOnlySpan<byte> plain, ReadOnlySpan<byte> nonce, byte[] key, byte[] destination)
-    {
-        if (Volatile.Read(ref _systemChaCha20Poly1305Available) == 1)
-        {
-            try
-            {
-                using var cipher = new System.Security.Cryptography.ChaCha20Poly1305(key);
-                var cipherSpan = destination.AsSpan(0, plain.Length);
-                var tagSpan = destination.AsSpan(plain.Length, TagLength);
-                cipher.Encrypt(nonce, plain, cipherSpan, tagSpan);
-                return plain.Length + TagLength;
-            }
-            catch (PlatformNotSupportedException)
-            {
-                Interlocked.Exchange(ref _systemChaCha20Poly1305Available, 0);
-            }
-        }
-
-        var bcCipher = new BcChaCha20Poly1305();
-        var nonceArray = new byte[NonceLength];
-        byte[]? rentedPlain = null;
-        try
-        {
-            nonce.CopyTo(nonceArray);
-            bcCipher.Init(true, new AeadParameters(new KeyParameter(key), TagBits, nonceArray));
-
-            var plainArray = ArrayPool<byte>.Shared.Rent(plain.Length);
-            rentedPlain = plainArray;
-            plain.CopyTo(plainArray);
-
-            var len = bcCipher.ProcessBytes(plainArray, 0, plain.Length, destination, 0);
-            len += bcCipher.DoFinal(destination, len);
-            return len;
-        }
-        finally
-        {
-            if (rentedPlain is not null)
-            {
-                ArrayPool<byte>.Shared.Return(rentedPlain);
-            }
-        }
-    }
-
-    private static int DecryptCombined(ReadOnlySpan<byte> cipherTextAndTag, ReadOnlySpan<byte> nonce, byte[] key, byte[] destination)
-    {
-        if (Volatile.Read(ref _systemChaCha20Poly1305Available) == 1)
-        {
-            try
-            {
-                using var cipher = new System.Security.Cryptography.ChaCha20Poly1305(key);
-                var cipherLen = cipherTextAndTag.Length - TagLength;
-                var cipherSpan = cipherTextAndTag.Slice(0, cipherLen);
-                var tagSpan = cipherTextAndTag.Slice(cipherLen, TagLength);
-                cipher.Decrypt(nonce, cipherSpan, tagSpan, destination.AsSpan(0, cipherLen));
-                return cipherLen;
-            }
-            catch (PlatformNotSupportedException)
-            {
-                Interlocked.Exchange(ref _systemChaCha20Poly1305Available, 0);
-            }
-        }
-
-        var bcCipher = new BcChaCha20Poly1305();
-        var nonceArray = new byte[NonceLength];
-        nonce.CopyTo(nonceArray);
-        bcCipher.Init(false, new AeadParameters(new KeyParameter(key), TagBits, nonceArray));
-
-        var rentedInput = ArrayPool<byte>.Shared.Rent(cipherTextAndTag.Length);
-        try
-        {
-            cipherTextAndTag.CopyTo(rentedInput);
-            var len = bcCipher.ProcessBytes(rentedInput, 0, cipherTextAndTag.Length, destination, 0);
-            len += bcCipher.DoFinal(destination, len);
-            return len;
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(rentedInput);
-        }
-    }
-
-    private static bool ProbeSystemChaCha20Poly1305()
-    {
-        try
-        {
-            var key = new byte[32];
-            var nonce = new byte[NonceLength];
-            var plain = new byte[1];
-            var cipher = new byte[1];
-            var tag = new byte[TagLength];
-
-            using var aead = new System.Security.Cryptography.ChaCha20Poly1305(key);
-            aead.Encrypt(nonce, plain, cipher, tag);
-            aead.Decrypt(nonce, cipher, tag, plain);
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
     }
 }
