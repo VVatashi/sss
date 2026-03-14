@@ -15,7 +15,8 @@ var cryptoPolicy = new TunnelCryptoPolicy
 var serverPolicy = new TunnelServerPolicy
 {
     MaxConcurrentTunnels = config.MaxConcurrentTunnels,
-    MaxSessionsPerTunnel = config.MaxSessionsPerTunnel
+    MaxSessionsPerTunnel = config.MaxSessionsPerTunnel,
+    ConnectTimeoutMs = config.ConnectTimeoutMs
 };
 
 if (args.Length > 0 && int.TryParse(args[0], out var parsedPort))
@@ -51,6 +52,7 @@ internal sealed class ServerConfig
     public int ReplayWindowSeconds { get; init; } = 300;
     public int MaxConcurrentTunnels { get; init; } = 1024;
     public int MaxSessionsPerTunnel { get; init; } = 1024;
+    public int ConnectTimeoutMs { get; init; } = 10000;
 
     public static ServerConfig Load()
     {

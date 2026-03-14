@@ -145,6 +145,28 @@ public sealed class TunnelIntegrationTests
     }
 
     [Fact]
+    public async Task SlowOrTimedOutConnect_DoesNotBlockOtherSessions_OnSameTunnel()
+    {
+        await using var echo = await StartEchoServerAsync();
+        await using var tunnel = await StartTunnelServerAsync(new TunnelServerPolicy
+        {
+            MaxConcurrentTunnels = 32,
+            MaxSessionsPerTunnel = 256,
+            ConnectTimeoutMs = 1200
+        });
+        await using var socks = await StartSocksServerAsync(tunnel.Port);
+
+        var slowConnectTask = RunSingleSocksConnectExpectFailureAsync(
+            socks.Port,
+            IPAddress.Parse("203.0.113.1"),
+            81);
+
+        await Task.Delay(150);
+        await RunSingleSocksEchoRequestAsync(socks.Port, echo.Port, "fast-path");
+        await slowConnectTask;
+    }
+
+    [Fact]
     public async Task Socks5Client_SecondSessionIsRejected_WhenServerSessionLimitReached()
     {
         await using var echo = await StartEchoServerAsync();
@@ -270,6 +292,22 @@ public sealed class TunnelIntegrationTests
         await stream.WriteAsync(payload);
         var echoed = await ReadExactAsync(stream, payload.Length);
         Assert.Equal(payload, echoed);
+    }
+
+    private static async Task RunSingleSocksConnectExpectFailureAsync(int socksPort, IPAddress address, int port)
+    {
+        using var tcpClient = new TcpClient();
+        await tcpClient.ConnectAsync(IPAddress.Loopback, socksPort);
+        using var stream = tcpClient.GetStream();
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        var greeting = await ReadExactAsync(stream, 2);
+        Assert.Equal(new byte[] { 0x05, 0x00 }, greeting);
+
+        var connectRequest = BuildConnectRequestIPv4(address, port);
+        await stream.WriteAsync(connectRequest);
+        var connectResponse = await ReadExactAsync(stream, 10);
+        Assert.NotEqual((byte)0x00, connectResponse[1]);
     }
 
     private static async Task<RunningEchoServer> StartEchoServerAsync()

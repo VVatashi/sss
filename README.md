@@ -132,6 +132,7 @@ journalctl -u simple-shadowsocks-server -f
 Параметры server policy (в `appsettings.json` сервера):
 - `MaxConcurrentTunnels` - лимит одновременных tunnel-соединений.
 - `MaxSessionsPerTunnel` - лимит сессий в одном tunnel-соединении.
+- `ConnectTimeoutMs` - таймаут подключения сервера к целевому upstream-хосту для кадра `CONNECT`.
 
 ### 3) Запуск
 
@@ -199,11 +200,12 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 
 - Сервер туннеля:
 - принимает `CONNECT` кадр
-- подключается к целевому хосту
+- подключается к целевому хосту с ограничением по `ConnectTimeoutMs`
 - возвращает код результата
 - передает `DATA` в обе стороны
 - держит несколько независимых upstream-сессий в одном соединении с клиентом
 - ограничивает число tunnel-соединений и число сессий на туннель (hard limits)
+- обработка `CONNECT` выполняется неблокирующе для read-loop туннеля (медленный/недоступный upstream не блокирует другие сессии)
 
 - Тесты:
 - unit + integration тесты SOCKS5, протокола и туннеля
@@ -211,8 +213,9 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - есть проверка reconnect после перезапуска tunnel-сервера
 - есть проверка ограничения сессий на сервере и валидации reconnect policy
 - есть проверка round-robin распределения по группе tunnel-серверов
+- есть проверка, что медленный/таймаутный `CONNECT` не блокирует другие сессии
 - есть perf-тест для измерения throughput/allocations
-- текущий набор: `20` тестов, проходят
+- текущий набор: `21` тестов, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
 - `bin/<ProjectName>/...`

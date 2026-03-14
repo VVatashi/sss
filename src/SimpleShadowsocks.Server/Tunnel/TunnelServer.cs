@@ -12,6 +12,7 @@ public sealed class TunnelServerPolicy
 
     public int MaxConcurrentTunnels { get; init; } = 1024;
     public int MaxSessionsPerTunnel { get; init; } = 1024;
+    public int ConnectTimeoutMs { get; init; } = 10_000;
 }
 
 public sealed class TunnelServer
@@ -116,6 +117,7 @@ public sealed class TunnelServer
 
         using var writeLock = new SemaphoreSlim(1, 1);
         var sessions = new ConcurrentDictionary<uint, SessionContext>();
+        var pendingConnectSessions = new ConcurrentDictionary<uint, byte>();
 
         try
         {
@@ -130,7 +132,16 @@ public sealed class TunnelServer
                 switch (frame.Value.Type)
                 {
                     case FrameType.Connect:
-                        await HandleConnectFrameAsync(secureStream, writeLock, sessions, frame.Value, serverPolicy, cancellationToken);
+                        _ = Task.Run(
+                            () => HandleConnectFrameSafelyAsync(
+                                secureStream,
+                                writeLock,
+                                sessions,
+                                pendingConnectSessions,
+                                frame.Value,
+                                serverPolicy,
+                                cancellationToken),
+                            cancellationToken);
                         break;
 
                     case FrameType.Data:
@@ -212,10 +223,19 @@ public sealed class TunnelServer
         Stream secureStream,
         SemaphoreSlim writeLock,
         ConcurrentDictionary<uint, SessionContext> sessions,
+        ConcurrentDictionary<uint, byte> pendingConnectSessions,
         ProtocolFrame frame,
         TunnelServerPolicy serverPolicy,
         CancellationToken cancellationToken)
     {
+        if (!pendingConnectSessions.TryAdd(frame.SessionId, 0))
+        {
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
+            return;
+        }
+
+        try
+        {
         if (sessions.Count >= serverPolicy.MaxSessionsPerTunnel)
         {
             await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
@@ -248,7 +268,7 @@ public sealed class TunnelServer
         var upstreamClient = new TcpClient();
         try
         {
-            await ConnectUpstreamAsync(upstreamClient, request, cancellationToken);
+            await ConnectUpstreamAsync(upstreamClient, request, serverPolicy.ConnectTimeoutMs, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -306,18 +326,77 @@ public sealed class TunnelServer
 
         Console.WriteLine($"[tunnel] proxy {request.Address}:{request.Port} session={frame.SessionId}");
         await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x00, writeLock, cancellationToken);
+        }
+        finally
+        {
+            pendingConnectSessions.TryRemove(frame.SessionId, out _);
+        }
     }
 
-    private static async Task ConnectUpstreamAsync(TcpClient upstream, ConnectRequest request, CancellationToken cancellationToken)
+    private static async Task HandleConnectFrameSafelyAsync(
+        Stream secureStream,
+        SemaphoreSlim writeLock,
+        ConcurrentDictionary<uint, SessionContext> sessions,
+        ConcurrentDictionary<uint, byte> pendingConnectSessions,
+        ProtocolFrame frame,
+        TunnelServerPolicy serverPolicy,
+        CancellationToken cancellationToken)
     {
-        if (request.AddressType is AddressType.IPv4 or AddressType.IPv6)
+        try
         {
-            var ipAddress = IPAddress.Parse(request.Address);
-            await upstream.ConnectAsync(ipAddress, request.Port, cancellationToken);
-            return;
+            await HandleConnectFrameAsync(
+                secureStream,
+                writeLock,
+                sessions,
+                pendingConnectSessions,
+                frame,
+                serverPolicy,
+                cancellationToken);
         }
+        catch (OperationCanceledException)
+        {
+        }
+        catch
+        {
+            try
+            {
+                await SendConnectReplyAsync(
+                    secureStream,
+                    frame.SessionId,
+                    replyCode: 0x05,
+                    writeLock,
+                    CancellationToken.None);
+            }
+            catch
+            {
+            }
+        }
+    }
 
-        await upstream.ConnectAsync(request.Address, request.Port, cancellationToken);
+    private static async Task ConnectUpstreamAsync(
+        TcpClient upstream,
+        ConnectRequest request,
+        int connectTimeoutMs,
+        CancellationToken cancellationToken)
+    {
+        using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        connectCts.CancelAfter(connectTimeoutMs);
+
+        try
+        {
+            if (request.AddressType is AddressType.IPv4 or AddressType.IPv6)
+            {
+                var ipAddress = IPAddress.Parse(request.Address);
+                await upstream.ConnectAsync(ipAddress, request.Port, connectCts.Token);
+                return;
+            }
+
+            await upstream.ConnectAsync(request.Address, request.Port, connectCts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Connect timeout after {connectTimeoutMs} ms.");
+        }
     }
 
     private static Task SendConnectReplyAsync(
@@ -452,6 +531,11 @@ public sealed class TunnelServer
         if (policy.MaxSessionsPerTunnel <= 0)
         {
             throw new ArgumentOutOfRangeException(nameof(policy.MaxSessionsPerTunnel), "MaxSessionsPerTunnel must be > 0.");
+        }
+
+        if (policy.ConnectTimeoutMs <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy.ConnectTimeoutMs), "ConnectTimeoutMs must be > 0.");
         }
     }
 
