@@ -198,7 +198,8 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
 
     private static byte[] BuildNonce(byte[] baseNonce, ulong counter)
     {
-        var nonce = baseNonce.ToArray();
+        var nonce = new byte[NonceLength];
+        baseNonce.AsSpan().CopyTo(nonce);
         nonce[NonceLength - 8] ^= (byte)(counter >> 56);
         nonce[NonceLength - 7] ^= (byte)(counter >> 48);
         nonce[NonceLength - 6] ^= (byte)(counter >> 40);
@@ -349,11 +350,28 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
         }
 
         var bcCipher = new BcChaCha20Poly1305();
-        bcCipher.Init(true, new AeadParameters(new KeyParameter(key), TagBits, nonce.ToArray()));
-        var plainArray = plain.ToArray();
-        var len = bcCipher.ProcessBytes(plainArray, 0, plainArray.Length, destination, 0);
-        len += bcCipher.DoFinal(destination, len);
-        return len;
+        var nonceArray = new byte[NonceLength];
+        byte[]? rentedPlain = null;
+        try
+        {
+            nonce.CopyTo(nonceArray);
+            bcCipher.Init(true, new AeadParameters(new KeyParameter(key), TagBits, nonceArray));
+
+            var plainArray = ArrayPool<byte>.Shared.Rent(plain.Length);
+            rentedPlain = plainArray;
+            plain.CopyTo(plainArray);
+
+            var len = bcCipher.ProcessBytes(plainArray, 0, plain.Length, destination, 0);
+            len += bcCipher.DoFinal(destination, len);
+            return len;
+        }
+        finally
+        {
+            if (rentedPlain is not null)
+            {
+                ArrayPool<byte>.Shared.Return(rentedPlain);
+            }
+        }
     }
 
     private static int DecryptCombined(ReadOnlySpan<byte> cipherTextAndTag, ReadOnlySpan<byte> nonce, byte[] key, byte[] destination)
@@ -376,7 +394,9 @@ public sealed class ChaCha20Poly1305DuplexStream : Stream
         }
 
         var bcCipher = new BcChaCha20Poly1305();
-        bcCipher.Init(false, new AeadParameters(new KeyParameter(key), TagBits, nonce.ToArray()));
+        var nonceArray = new byte[NonceLength];
+        nonce.CopyTo(nonceArray);
+        bcCipher.Init(false, new AeadParameters(new KeyParameter(key), TagBits, nonceArray));
 
         var rentedInput = ArrayPool<byte>.Shared.Rent(cipherTextAndTag.Length);
         try

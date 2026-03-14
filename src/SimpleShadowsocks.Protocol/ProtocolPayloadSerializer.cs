@@ -9,19 +9,13 @@ public static class ProtocolPayloadSerializer
 {
     public static byte[] SerializeConnectRequest(ConnectRequest request)
     {
-        var addressBytes = request.AddressType switch
+        return request.AddressType switch
         {
-            AddressType.IPv4 => SerializeIpAddress(request.Address, AddressFamily.InterNetwork),
-            AddressType.IPv6 => SerializeIpAddress(request.Address, AddressFamily.InterNetworkV6),
-            AddressType.Domain => SerializeDomain(request.Address),
+            AddressType.IPv4 => SerializeIpConnectRequest(request, AddressFamily.InterNetwork, 4),
+            AddressType.IPv6 => SerializeIpConnectRequest(request, AddressFamily.InterNetworkV6, 16),
+            AddressType.Domain => SerializeDomainConnectRequest(request.Address, request.Port),
             _ => throw new InvalidDataException($"Unsupported address type: {request.AddressType}.")
         };
-
-        var payload = new byte[1 + addressBytes.Length + 2];
-        payload[0] = (byte)request.AddressType;
-        Buffer.BlockCopy(addressBytes, 0, payload, 1, addressBytes.Length);
-        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1 + addressBytes.Length, 2), request.Port);
-        return payload;
     }
 
     public static ConnectRequest DeserializeConnectRequest(ReadOnlySpan<byte> payload)
@@ -80,38 +74,54 @@ public static class ProtocolPayloadSerializer
         return BinaryPrimitives.ReadUInt64BigEndian(payload);
     }
 
-    private static byte[] SerializeIpAddress(string value, AddressFamily expectedFamily)
+    private static byte[] SerializeIpConnectRequest(ConnectRequest request, AddressFamily expectedFamily, int ipLength)
     {
-        if (!IPAddress.TryParse(value, out var ipAddress))
+        if (!IPAddress.TryParse(request.Address, out var ipAddress))
         {
-            throw new InvalidDataException($"Invalid IP address: {value}.");
+            throw new InvalidDataException($"Invalid IP address: {request.Address}.");
         }
 
         if (ipAddress.AddressFamily != expectedFamily)
         {
-            throw new InvalidDataException($"IP address family mismatch for {value}.");
+            throw new InvalidDataException($"IP address family mismatch for {request.Address}.");
         }
 
-        return ipAddress.GetAddressBytes();
+        var payload = new byte[1 + ipLength + 2];
+        payload[0] = (byte)request.AddressType;
+        if (!ipAddress.TryWriteBytes(payload.AsSpan(1, ipLength), out var bytesWritten) || bytesWritten != ipLength)
+        {
+            throw new InvalidDataException($"Failed to serialize IP address: {request.Address}.");
+        }
+
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1 + ipLength, 2), request.Port);
+        return payload;
     }
 
-    private static byte[] SerializeDomain(string domain)
+    private static byte[] SerializeDomainConnectRequest(string domain, ushort port)
     {
         if (string.IsNullOrWhiteSpace(domain))
         {
             throw new InvalidDataException("Domain must not be empty.");
         }
 
-        var bytes = Encoding.ASCII.GetBytes(domain);
-        if (bytes.Length > 255)
+        var byteCount = Encoding.ASCII.GetByteCount(domain);
+        if (byteCount > 255)
         {
             throw new InvalidDataException("Domain is too long. Max length is 255 bytes.");
         }
 
-        var result = new byte[1 + bytes.Length];
-        result[0] = (byte)bytes.Length;
-        Buffer.BlockCopy(bytes, 0, result, 1, bytes.Length);
-        return result;
+        var payload = new byte[1 + 1 + byteCount + 2];
+        payload[0] = (byte)AddressType.Domain;
+
+        var written = Encoding.ASCII.GetBytes(domain.AsSpan(), payload.AsSpan(2, byteCount));
+        if (written != byteCount)
+        {
+            throw new InvalidDataException("Failed to serialize domain.");
+        }
+
+        payload[1] = (byte)byteCount;
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(2 + byteCount, 2), port);
+        return payload;
     }
 
     private static (string Address, int Consumed) DeserializeIpAddress(ReadOnlySpan<byte> body, int expectedLength)
@@ -121,8 +131,7 @@ public static class ProtocolPayloadSerializer
             throw new InvalidDataException("CONNECT payload is too short for IP address.");
         }
 
-        var bytes = body.Slice(0, expectedLength).ToArray();
-        return (new IPAddress(bytes).ToString(), expectedLength);
+        return (new IPAddress(body.Slice(0, expectedLength)).ToString(), expectedLength);
     }
 
     private static (string Address, int Consumed) DeserializeDomain(ReadOnlySpan<byte> body)

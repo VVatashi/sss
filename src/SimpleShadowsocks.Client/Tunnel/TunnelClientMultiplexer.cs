@@ -15,6 +15,8 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
     private readonly byte[] _sharedKey;
     private readonly TunnelCryptoPolicy _cryptoPolicy;
     private readonly TunnelConnectionPolicy _connectionPolicy;
+    private readonly byte _protocolVersion;
+    private readonly ProtocolWriteOptions _writeOptions;
 
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private readonly ConcurrentDictionary<uint, SessionState> _sessions = new();
@@ -26,6 +28,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
     private Task? _writeLoopTask;
     private Task? _heartbeatLoopTask;
     private Channel<OutboundFrame>? _outboundFrames;
+    private Exception? _connectionError;
     private int _nextSessionId;
     private long _lastIncomingUtcTicks;
     private long _controlSendSequence;
@@ -35,13 +38,21 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         int remotePort,
         byte[] sharedKey,
         TunnelCryptoPolicy cryptoPolicy,
-        TunnelConnectionPolicy connectionPolicy)
+        TunnelConnectionPolicy connectionPolicy,
+        byte protocolVersion = ProtocolConstants.Version,
+        bool enableCompression = false)
     {
         _remoteHost = remoteHost;
         _remotePort = remotePort;
         _sharedKey = sharedKey;
         _cryptoPolicy = cryptoPolicy;
         _connectionPolicy = connectionPolicy;
+        _protocolVersion = protocolVersion;
+        _writeOptions = new ProtocolWriteOptions
+        {
+            Version = protocolVersion,
+            EnableCompression = enableCompression
+        };
         ValidatePolicy(_connectionPolicy);
         TouchIncoming();
     }
@@ -195,6 +206,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
             cancellationToken);
 
         _connectionCts = new CancellationTokenSource();
+        _connectionError = null;
         _outboundFrames = Channel.CreateUnbounded<OutboundFrame>(new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -256,59 +268,80 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                     return;
                 }
 
-                var frame = await ProtocolFrameCodec.ReadAsync(_secureStream, cancellationToken);
-                if (frame is null)
+                var frameResult = await ProtocolFrameCodec.ReadDetailedAsync(_secureStream, cancellationToken);
+                if (frameResult is null)
                 {
                     break;
+                }
+                var frame = frameResult.Value.Frame;
+
+                if (frameResult.Value.Version != _protocolVersion)
+                {
+                    throw new InvalidDataException(
+                        $"Protocol version mismatch: client expects v{_protocolVersion}, server replied with v{frameResult.Value.Version}.");
                 }
 
                 TouchIncoming();
 
-                if (frame.Value.SessionId == 0)
+                if (frame.SessionId == 0)
                 {
-                    if (frame.Value.Type == FrameType.Ping)
+                    if (frame.Type == FrameType.Ping)
                     {
                         var sequence = (ulong)Interlocked.Increment(ref _controlSendSequence);
-                        await SendFrameAsync(new ProtocolFrame(FrameType.Pong, 0, sequence, frame.Value.Payload), cancellationToken);
+                        await SendFrameAsync(new ProtocolFrame(FrameType.Pong, 0, sequence, frame.Payload), cancellationToken);
                     }
 
                     continue;
                 }
 
-                if (!_sessions.TryGetValue(frame.Value.SessionId, out var state))
+                if (!_sessions.TryGetValue(frame.SessionId, out var state))
                 {
                     continue;
                 }
 
-                if (!state.TryAcceptIncomingSequence(frame.Value.Sequence))
+                if (!state.TryAcceptIncomingSequence(frame.Sequence))
                 {
-                    await CloseSessionAsync(frame.Value.SessionId, 0x21, CancellationToken.None);
+                    await CloseSessionAsync(frame.SessionId, 0x21, CancellationToken.None);
                     continue;
                 }
 
-                switch (frame.Value.Type)
+                switch (frame.Type)
                 {
                     case FrameType.Connect:
-                        state.ConnectReply.TrySetResult(frame.Value.Payload.Length >= 1 ? frame.Value.Payload.Span[0] : (byte)0x01);
+                        state.ConnectReply.TrySetResult(frame.Payload.Length >= 1 ? frame.Payload.Span[0] : (byte)0x01);
                         break;
 
                     case FrameType.Data:
-                        await state.ReaderWriter.Writer.WriteAsync(DetachPayload(frame.Value.Payload), cancellationToken);
+                        await state.ReaderWriter.Writer.WriteAsync(DetachPayload(frame.Payload), cancellationToken);
                         break;
 
                     case FrameType.Close:
                         state.ReaderWriter.Writer.TryComplete();
-                        _sessions.TryRemove(frame.Value.SessionId, out _);
+                        _sessions.TryRemove(frame.SessionId, out _);
                         break;
 
                     case FrameType.Ping:
-                        await SendSessionFrameAsync(frame.Value.SessionId, FrameType.Pong, frame.Value.Payload, cancellationToken);
+                        await SendSessionFrameAsync(frame.SessionId, FrameType.Pong, frame.Payload, cancellationToken);
                         break;
                 }
             }
         }
         catch (OperationCanceledException)
         {
+        }
+        catch (EndOfStreamException ex) when (_protocolVersion != ProtocolConstants.LegacyVersion)
+        {
+            _connectionError = new IOException(
+                $"Tunnel closed unexpectedly while using protocol v{_protocolVersion}. Possible protocol version mismatch with server.",
+                ex);
+            throw _connectionError;
+        }
+        catch (Exception ex)
+        {
+            _connectionError = ex;
+            throw new IOException(
+                $"Tunnel read loop failed: {ex.Message}",
+                ex);
         }
         finally
         {
@@ -340,7 +373,7 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
                 {
                     try
                     {
-                        ProtocolFrameCodec.WriteTo(writer, outbound.Frame);
+                        ProtocolFrameCodec.WriteTo(writer, outbound.Frame, _writeOptions);
                         batch.Add(outbound);
                         accumulatedBytes += ProtocolConstants.HeaderSize + outbound.Frame.Payload.Length;
 
@@ -509,7 +542,14 @@ public sealed class TunnelClientMultiplexer : IAsyncDisposable
         foreach (var (sessionId, state) in _sessions.ToArray())
         {
             state.ReaderWriter.Writer.TryComplete();
-            state.ConnectReply.TrySetResult(0x01);
+            if (_connectionError is not null)
+            {
+                state.ConnectReply.TrySetException(_connectionError);
+            }
+            else
+            {
+                state.ConnectReply.TrySetResult(0x01);
+            }
             _sessions.TryRemove(sessionId, out _);
         }
     }

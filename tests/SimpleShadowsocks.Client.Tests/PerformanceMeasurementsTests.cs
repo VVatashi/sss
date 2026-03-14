@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using SimpleShadowsocks.Client.Socks5;
 using SimpleShadowsocks.Client.Tunnel;
+using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
 using SimpleShadowsocks.Server.Tunnel;
 using Xunit.Abstractions;
@@ -29,9 +30,81 @@ public sealed class PerformanceMeasurementsTests
 
         await using var echo = await StartEchoServerAsync();
         await using var tunnel = await StartTunnelServerAsync();
-        await using var socks = await StartSocksServerAsync(tunnel.Port);
+        var withoutCompression = await MeasureModeAsync(
+            echo.Port,
+            tunnel.Port,
+            chunkBytes,
+            totalBytes,
+            streams,
+            enableCompression: false,
+            payloadProfile: PayloadProfile.Mixed);
+        var withCompression = await MeasureModeAsync(
+            echo.Port,
+            tunnel.Port,
+            chunkBytes,
+            totalBytes,
+            streams,
+            enableCompression: true,
+            payloadProfile: PayloadProfile.Mixed);
 
-        await RunTrafficAsync(socks.Port, echo.Port, 8L * 1024 * 1024, chunkBytes, 2);
+        _output.WriteLine("=== Without compression ===");
+        _output.WriteLine(withoutCompression.ToString());
+        _output.WriteLine("=== With compression ===");
+        _output.WriteLine(withCompression.ToString());
+
+        Assert.True(withoutCompression.ThroughputMibPerSec > 5, $"Unexpectedly low throughput: {withoutCompression.ThroughputMibPerSec:F2} MiB/s");
+        Assert.True(withCompression.ThroughputMibPerSec > 5, $"Unexpectedly low throughput: {withCompression.ThroughputMibPerSec:F2} MiB/s");
+    }
+
+    [Fact]
+    public async Task Measure_Throughput_And_Allocations_CompressiblePayload()
+    {
+        const int totalMb = 128;
+        const int chunkKb = 16;
+        const int streams = 4;
+        var totalBytes = (long)totalMb * 1024 * 1024;
+        var chunkBytes = chunkKb * 1024;
+
+        await using var echo = await StartEchoServerAsync();
+        await using var tunnel = await StartTunnelServerAsync();
+
+        var withoutCompression = await MeasureModeAsync(
+            echo.Port,
+            tunnel.Port,
+            chunkBytes,
+            totalBytes,
+            streams,
+            enableCompression: false,
+            payloadProfile: PayloadProfile.Compressible);
+        var withCompression = await MeasureModeAsync(
+            echo.Port,
+            tunnel.Port,
+            chunkBytes,
+            totalBytes,
+            streams,
+            enableCompression: true,
+            payloadProfile: PayloadProfile.Compressible);
+
+        _output.WriteLine("=== Compressible payload / without compression ===");
+        _output.WriteLine(withoutCompression.ToString());
+        _output.WriteLine("=== Compressible payload / with compression ===");
+        _output.WriteLine(withCompression.ToString());
+
+        Assert.True(withoutCompression.ThroughputMibPerSec > 5, $"Unexpectedly low throughput: {withoutCompression.ThroughputMibPerSec:F2} MiB/s");
+        Assert.True(withCompression.ThroughputMibPerSec > 5, $"Unexpectedly low throughput: {withCompression.ThroughputMibPerSec:F2} MiB/s");
+    }
+
+    private async Task<PerfResult> MeasureModeAsync(
+        int echoPort,
+        int tunnelPort,
+        int chunkBytes,
+        long totalBytes,
+        int streams,
+        bool enableCompression,
+        PayloadProfile payloadProfile)
+    {
+        await using var socks = await StartSocksServerAsync(tunnelPort, enableCompression);
+        await RunTrafficAsync(socks.Port, echoPort, 8L * 1024 * 1024, chunkBytes, 2, payloadProfile);
 
         GC.Collect();
         GC.WaitForPendingFinalizers();
@@ -39,9 +112,7 @@ public sealed class PerformanceMeasurementsTests
 
         var allocBefore = GC.GetTotalAllocatedBytes(true);
         var sw = Stopwatch.StartNew();
-
-        await RunTrafficAsync(socks.Port, echo.Port, totalBytes, chunkBytes, streams);
-
+        await RunTrafficAsync(socks.Port, echoPort, totalBytes, chunkBytes, streams, payloadProfile);
         sw.Stop();
         var allocAfter = GC.GetTotalAllocatedBytes(true);
 
@@ -50,16 +121,16 @@ public sealed class PerformanceMeasurementsTests
         var mib = totalBytes / 1024d / 1024d;
         var throughput = mib / seconds;
         var bytesPerMiB = allocated / mib;
-
-        _output.WriteLine($"Elapsed: {seconds:F3} s");
-        _output.WriteLine($"Throughput: {throughput:F2} MiB/s");
-        _output.WriteLine($"Allocated: {allocated:N0} bytes ({allocated / 1024d / 1024d:F2} MiB)");
-        _output.WriteLine($"Allocated per MiB transferred: {bytesPerMiB:N0} bytes/MiB");
-
-        Assert.True(throughput > 5, $"Unexpectedly low throughput: {throughput:F2} MiB/s");
+        return new PerfResult(enableCompression, seconds, throughput, allocated, bytesPerMiB);
     }
 
-    private static async Task RunTrafficAsync(int socksPort, int echoPort, long totalBytes, int chunkBytes, int streams)
+    private static async Task RunTrafficAsync(
+        int socksPort,
+        int echoPort,
+        long totalBytes,
+        int chunkBytes,
+        int streams,
+        PayloadProfile payloadProfile)
     {
         var bytesPerStream = totalBytes / streams;
         var extra = totalBytes % streams;
@@ -68,13 +139,18 @@ public sealed class PerformanceMeasurementsTests
         for (var i = 0; i < streams; i++)
         {
             var streamBytes = bytesPerStream + (i == streams - 1 ? extra : 0);
-            tasks.Add(RunSingleStreamAsync(socksPort, echoPort, streamBytes, chunkBytes));
+            tasks.Add(RunSingleStreamAsync(socksPort, echoPort, streamBytes, chunkBytes, payloadProfile));
         }
 
         await Task.WhenAll(tasks);
     }
 
-    private static async Task RunSingleStreamAsync(int socksPort, int echoPort, long totalBytes, int chunkBytes)
+    private static async Task RunSingleStreamAsync(
+        int socksPort,
+        int echoPort,
+        long totalBytes,
+        int chunkBytes,
+        PayloadProfile payloadProfile)
     {
         using var tcpClient = new TcpClient();
         await tcpClient.ConnectAsync(IPAddress.Loopback, socksPort);
@@ -94,11 +170,7 @@ public sealed class PerformanceMeasurementsTests
             throw new InvalidOperationException($"SOCKS5 connect failed: {connect[1]}");
         }
 
-        var sendBuffer = new byte[chunkBytes];
-        for (var i = 0; i < sendBuffer.Length; i++)
-        {
-            sendBuffer[i] = (byte)(i % 251);
-        }
+        var sendBuffer = BuildPayload(chunkBytes, payloadProfile);
 
         var readBuffer = new byte[chunkBytes];
         long sent = 0;
@@ -138,7 +210,7 @@ public sealed class PerformanceMeasurementsTests
         return new RunningTunnelServer(port, cts, runTask);
     }
 
-    private static async Task<RunningSocksServer> StartSocksServerAsync(int tunnelPort)
+    private static async Task<RunningSocksServer> StartSocksServerAsync(int tunnelPort, bool enableCompression)
     {
         var port = AllocateUnusedPort();
         var server = new Socks5Server(
@@ -157,7 +229,9 @@ public sealed class PerformanceMeasurementsTests
                 ReconnectMaxAttempts = 10,
                 MaxConcurrentSessions = 4096,
                 SessionReceiveChannelCapacity = 1024
-            });
+            },
+            ProtocolConstants.Version,
+            enableCompression);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
@@ -287,6 +361,47 @@ public sealed class PerformanceMeasurementsTests
             try { await _runTask; } catch (OperationCanceledException) { }
             _cts.Dispose();
         }
+    }
+
+    private readonly record struct PerfResult(
+        bool CompressionEnabled,
+        double Seconds,
+        double ThroughputMibPerSec,
+        long AllocatedBytes,
+        double AllocatedBytesPerMiB)
+    {
+        public override string ToString()
+        {
+            return $"Compression={(CompressionEnabled ? "on" : "off")}, Elapsed={Seconds:F3}s, Throughput={ThroughputMibPerSec:F2} MiB/s, Alloc={AllocatedBytes:N0} bytes, Alloc/MiB={AllocatedBytesPerMiB:N0}";
+        }
+    }
+
+    private static byte[] BuildPayload(int chunkBytes, PayloadProfile payloadProfile)
+    {
+        var buffer = new byte[chunkBytes];
+        if (payloadProfile == PayloadProfile.Compressible)
+        {
+            var pattern = System.Text.Encoding.ASCII.GetBytes("ABCDABCDABCDABCD");
+            for (var i = 0; i < buffer.Length; i++)
+            {
+                buffer[i] = pattern[i % pattern.Length];
+            }
+
+            return buffer;
+        }
+
+        for (var i = 0; i < buffer.Length; i++)
+        {
+            buffer[i] = (byte)(i % 251);
+        }
+
+        return buffer;
+    }
+
+    private enum PayloadProfile
+    {
+        Mixed = 0,
+        Compressible = 1
     }
 
     private sealed class RunningTunnelServer : IAsyncDisposable

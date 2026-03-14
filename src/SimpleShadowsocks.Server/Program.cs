@@ -38,7 +38,7 @@ Console.CancelKeyPress += (_, eventArgs) =>
 
 Console.WriteLine("SimpleShadowsocks.Server");
 Console.WriteLine($"Tunnel listen: 0.0.0.0:{listenPort}");
-Console.WriteLine($"Protocol version: {ProtocolConstants.Version}");
+Console.WriteLine($"Protocol versions: v{ProtocolConstants.LegacyVersion}, v{ProtocolConstants.Version}");
 Console.WriteLine("Press Ctrl+C to stop.");
 
 var server = new TunnelServer(IPAddress.Any, listenPort, sharedKey, cryptoPolicy, serverPolicy);

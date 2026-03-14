@@ -14,6 +14,8 @@ var remoteServers = (config.RemoteServers ?? [])
     .Select(s => (s.Host.Trim(), s.Port))
     .ToList();
 var sharedKey = config.SharedKey;
+var protocolVersion = config.ProtocolVersion;
+var enableCompression = config.EnableCompression;
 var cryptoPolicy = new TunnelCryptoPolicy
 {
     HandshakeMaxClockSkewSeconds = config.HandshakeMaxClockSkewSeconds,
@@ -70,6 +72,7 @@ else
     Console.WriteLine($"Tunnel server: {remoteHost}:{remotePort}");
 }
 Console.WriteLine($"Protocol version: {ProtocolConstants.Version}");
+Console.WriteLine($"Configured tunnel protocol: v{protocolVersion}, compression={(enableCompression ? "on" : "off")}");
 Console.WriteLine("Press Ctrl+C to stop.");
 
 var server = remoteServers.Count > 0
@@ -79,7 +82,9 @@ var server = remoteServers.Count > 0
         remoteServers,
         sharedKey,
         cryptoPolicy,
-        connectionPolicy)
+        connectionPolicy,
+        protocolVersion,
+        enableCompression)
     : new Socks5Server(
         IPAddress.Loopback,
         listenPort,
@@ -87,7 +92,9 @@ var server = remoteServers.Count > 0
         remotePort,
         sharedKey,
         cryptoPolicy,
-        connectionPolicy);
+        connectionPolicy,
+        protocolVersion,
+        enableCompression);
 await server.RunAsync(cts.Token);
 
 internal sealed class ClientConfig
@@ -105,6 +112,8 @@ internal sealed class ClientConfig
     public int ReconnectMaxAttempts { get; init; } = 12;
     public int MaxConcurrentSessions { get; init; } = 1024;
     public int SessionReceiveChannelCapacity { get; init; } = 256;
+    public byte ProtocolVersion { get; init; } = ProtocolConstants.Version;
+    public bool EnableCompression { get; init; } = false;
     public List<RemoteServerConfig>? RemoteServers { get; init; }
 
     public static ClientConfig Load()

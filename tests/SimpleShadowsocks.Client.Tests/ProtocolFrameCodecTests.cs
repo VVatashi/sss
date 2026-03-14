@@ -15,46 +15,92 @@ public sealed class ProtocolFrameCodecTests
             Payload: new byte[] { 1, 2, 3, 4, 5 });
 
         await using var stream = new MemoryStream();
-        await ProtocolFrameCodec.WriteAsync(stream, frame);
+        await ProtocolFrameCodec.WriteAsync(stream, frame, default, new ProtocolWriteOptions
+        {
+            Version = ProtocolConstants.Version,
+            EnableCompression = false
+        });
 
         stream.Position = 0;
-        var decoded = await ProtocolFrameCodec.ReadAsync(stream);
+        var decoded = await ProtocolFrameCodec.ReadDetailedAsync(stream);
 
         Assert.True(decoded.HasValue);
-        Assert.Equal(frame.Type, decoded.Value.Type);
-        Assert.Equal(frame.SessionId, decoded.Value.SessionId);
-        Assert.Equal(frame.Sequence, decoded.Value.Sequence);
-        Assert.Equal(frame.Payload.ToArray(), decoded.Value.Payload.ToArray());
+        Assert.Equal(ProtocolConstants.Version, decoded.Value.Version);
+        Assert.Equal(frame.Type, decoded.Value.Frame.Type);
+        Assert.Equal(frame.SessionId, decoded.Value.Frame.SessionId);
+        Assert.Equal(frame.Sequence, decoded.Value.Frame.Sequence);
+        Assert.Equal(frame.Payload.ToArray(), decoded.Value.Frame.Payload.ToArray());
     }
 
     [Fact]
     public async Task FrameCodec_AtEndOfStream_ReturnsNull()
     {
         await using var stream = new MemoryStream();
-        var decoded = await ProtocolFrameCodec.ReadAsync(stream);
+        var decoded = await ProtocolFrameCodec.ReadDetailedAsync(stream);
         Assert.Null(decoded);
     }
 
     [Fact]
     public async Task FrameCodec_InvalidVersion_ThrowsInvalidDataException()
     {
-        var raw = new byte[ProtocolConstants.HeaderSize];
+        var raw = new byte[ProtocolConstants.HeaderSizeV2];
         raw[0] = 99;
         raw[1] = (byte)FrameType.Ping;
 
         await using var stream = new MemoryStream(raw);
-        await Assert.ThrowsAsync<InvalidDataException>(async () => _ = await ProtocolFrameCodec.ReadAsync(stream));
+        await Assert.ThrowsAsync<InvalidDataException>(async () => _ = await ProtocolFrameCodec.ReadDetailedAsync(stream));
     }
 
     [Fact]
     public async Task FrameCodec_InvalidFrameType_ThrowsInvalidDataException()
     {
-        var raw = new byte[ProtocolConstants.HeaderSize];
+        var raw = new byte[ProtocolConstants.HeaderSizeV2];
         raw[0] = ProtocolConstants.Version;
         raw[1] = 0xFF;
 
         await using var stream = new MemoryStream(raw);
-        await Assert.ThrowsAsync<InvalidDataException>(async () => _ = await ProtocolFrameCodec.ReadAsync(stream));
+        await Assert.ThrowsAsync<InvalidDataException>(async () => _ = await ProtocolFrameCodec.ReadDetailedAsync(stream));
+    }
+
+    [Fact]
+    public async Task FrameCodec_LegacyV1_RoundTrip_IsSupported()
+    {
+        var frame = new ProtocolFrame(FrameType.Ping, 1, 2, new byte[] { 9, 8, 7 });
+        await using var stream = new MemoryStream();
+        await ProtocolFrameCodec.WriteAsync(stream, frame, default, new ProtocolWriteOptions
+        {
+            Version = ProtocolConstants.LegacyVersion,
+            EnableCompression = false
+        });
+
+        stream.Position = 0;
+        var decoded = await ProtocolFrameCodec.ReadDetailedAsync(stream);
+        Assert.True(decoded.HasValue);
+        Assert.Equal(ProtocolConstants.LegacyVersion, decoded.Value.Version);
+        Assert.Equal(frame.Payload.ToArray(), decoded.Value.Frame.Payload.ToArray());
+    }
+
+    [Fact]
+    public async Task FrameCodec_V2_WithCompression_RoundTrip()
+    {
+        var payload = System.Text.Encoding.ASCII.GetBytes(new string('A', 4096));
+        var frame = new ProtocolFrame(FrameType.Data, 5, 10, payload);
+
+        await using var stream = new MemoryStream();
+        await ProtocolFrameCodec.WriteAsync(stream, frame, default, new ProtocolWriteOptions
+        {
+            Version = ProtocolConstants.Version,
+            EnableCompression = true,
+            CompressionMinBytes = 64,
+            CompressionMinSavingsBytes = 1
+        });
+
+        stream.Position = 0;
+        var decoded = await ProtocolFrameCodec.ReadDetailedAsync(stream);
+        Assert.True(decoded.HasValue);
+        Assert.Equal(ProtocolConstants.Version, decoded.Value.Version);
+        Assert.True((decoded.Value.Flags & ProtocolFlags.CompressionEnabled) != 0);
+        Assert.Equal(payload, decoded.Value.Frame.Payload.ToArray());
     }
 
     [Fact]

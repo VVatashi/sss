@@ -22,6 +22,8 @@ public sealed class Socks5Server
     private readonly byte[] _sharedKey;
     private readonly TunnelCryptoPolicy _cryptoPolicy;
     private readonly TunnelConnectionPolicy _connectionPolicy;
+    private readonly byte _protocolVersion;
+    private readonly bool _enableCompression;
     private List<TunnelClientMultiplexer>? _multiplexers;
     private int _nextMultiplexerIndex = -1;
 
@@ -31,6 +33,8 @@ public sealed class Socks5Server
         _sharedKey = PreSharedKey.Derive32Bytes("dev-shared-key");
         _cryptoPolicy = TunnelCryptoPolicy.Default;
         _connectionPolicy = TunnelConnectionPolicy.Default;
+        _protocolVersion = ProtocolConstants.Version;
+        _enableCompression = false;
     }
 
     public Socks5Server(
@@ -40,13 +44,17 @@ public sealed class Socks5Server
         int remoteServerPort,
         string sharedKey,
         TunnelCryptoPolicy? cryptoPolicy = null,
-        TunnelConnectionPolicy? connectionPolicy = null)
+        TunnelConnectionPolicy? connectionPolicy = null,
+        byte protocolVersion = ProtocolConstants.Version,
+        bool enableCompression = false)
     {
         _listener = new TcpListener(listenAddress, port);
         _remoteServers.Add((remoteServerHost, remoteServerPort));
         _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
         _cryptoPolicy = cryptoPolicy ?? TunnelCryptoPolicy.Default;
         _connectionPolicy = connectionPolicy ?? TunnelConnectionPolicy.Default;
+        _protocolVersion = protocolVersion;
+        _enableCompression = enableCompression;
     }
 
     public Socks5Server(
@@ -55,7 +63,9 @@ public sealed class Socks5Server
         IReadOnlyList<(string Host, int Port)> remoteServers,
         string sharedKey,
         TunnelCryptoPolicy? cryptoPolicy = null,
-        TunnelConnectionPolicy? connectionPolicy = null)
+        TunnelConnectionPolicy? connectionPolicy = null,
+        byte protocolVersion = ProtocolConstants.Version,
+        bool enableCompression = false)
     {
         _listener = new TcpListener(listenAddress, port);
         foreach (var (host, serverPort) in remoteServers)
@@ -71,6 +81,8 @@ public sealed class Socks5Server
         _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
         _cryptoPolicy = cryptoPolicy ?? TunnelCryptoPolicy.Default;
         _connectionPolicy = connectionPolicy ?? TunnelConnectionPolicy.Default;
+        _protocolVersion = protocolVersion;
+        _enableCompression = enableCompression;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -81,7 +93,14 @@ public sealed class Socks5Server
             _multiplexers = new List<TunnelClientMultiplexer>(_remoteServers.Count);
             foreach (var (host, serverPort) in _remoteServers)
             {
-                _multiplexers.Add(new TunnelClientMultiplexer(host, serverPort, _sharedKey, _cryptoPolicy, _connectionPolicy));
+                _multiplexers.Add(new TunnelClientMultiplexer(
+                    host,
+                    serverPort,
+                    _sharedKey,
+                    _cryptoPolicy,
+                    _connectionPolicy,
+                    _protocolVersion,
+                    _enableCompression));
             }
         }
 

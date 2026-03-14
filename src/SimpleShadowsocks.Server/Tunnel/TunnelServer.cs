@@ -118,18 +118,38 @@ public sealed class TunnelServer
         using var writeLock = new SemaphoreSlim(1, 1);
         var sessions = new ConcurrentDictionary<uint, SessionContext>();
         var pendingConnectSessions = new ConcurrentDictionary<uint, byte>();
+        byte? connectionVersion = null;
+        var connectionCompressionEnabled = false;
 
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var frame = await ProtocolFrameCodec.ReadAsync(secureStream, cancellationToken);
-                if (frame is null)
+                var frameResult = await ProtocolFrameCodec.ReadDetailedAsync(secureStream, cancellationToken);
+                if (frameResult is null)
                 {
                     break;
                 }
+                var frame = frameResult.Value.Frame;
 
-                switch (frame.Value.Type)
+                if (connectionVersion is null)
+                {
+                    connectionVersion = frameResult.Value.Version;
+                    connectionCompressionEnabled = (frameResult.Value.Flags & ProtocolFlags.CompressionEnabled) != 0;
+                }
+                else if (connectionVersion.Value != frameResult.Value.Version)
+                {
+                    throw new InvalidDataException(
+                        $"Protocol version changed in one tunnel: {connectionVersion.Value} -> {frameResult.Value.Version}.");
+                }
+
+                var writeOptions = new ProtocolWriteOptions
+                {
+                    Version = connectionVersion.Value,
+                    EnableCompression = connectionVersion.Value == ProtocolConstants.Version && connectionCompressionEnabled
+                };
+
+                switch (frame.Type)
                 {
                     case FrameType.Connect:
                         _ = Task.Run(
@@ -138,73 +158,85 @@ public sealed class TunnelServer
                                 writeLock,
                                 sessions,
                                 pendingConnectSessions,
-                                frame.Value,
+                                frame,
+                                writeOptions,
                                 serverPolicy,
                                 cancellationToken),
                             cancellationToken);
                         break;
 
                     case FrameType.Data:
-                        if (sessions.TryGetValue(frame.Value.SessionId, out var session))
+                        if (sessions.TryGetValue(frame.SessionId, out var session))
                         {
-                            if (!session.TryAcceptIncomingSequence(frame.Value.Sequence))
+                            if (!session.TryAcceptIncomingSequence(frame.Sequence))
                             {
                                 await CloseSessionAsync(
                                     sessions,
-                                    frame.Value.SessionId,
+                                    frame.SessionId,
                                     sendCloseToClient: true,
                                     secureStream,
                                     writeLock,
+                                    writeOptions,
                                     CancellationToken.None);
                                 break;
                             }
 
-                            if (!frame.Value.Payload.IsEmpty)
+                            if (!frame.Payload.IsEmpty)
                             {
-                                await session.UpstreamStream.WriteAsync(frame.Value.Payload, cancellationToken);
+                                await session.UpstreamStream.WriteAsync(frame.Payload, cancellationToken);
                                 await session.UpstreamStream.FlushAsync(cancellationToken);
                             }
                         }
                         break;
 
                     case FrameType.Close:
-                        if (sessions.TryGetValue(frame.Value.SessionId, out var closingSession)
-                            && !closingSession.TryAcceptIncomingSequence(frame.Value.Sequence))
+                        if (sessions.TryGetValue(frame.SessionId, out var closingSession)
+                            && !closingSession.TryAcceptIncomingSequence(frame.Sequence))
                         {
                             await CloseSessionAsync(
                                 sessions,
-                                frame.Value.SessionId,
+                                frame.SessionId,
                                 sendCloseToClient: true,
                                 secureStream,
                                 writeLock,
+                                writeOptions,
                                 CancellationToken.None);
                             break;
                         }
 
-                        await CloseSessionAsync(sessions, frame.Value.SessionId, sendCloseToClient: false, secureStream, writeLock, cancellationToken);
+                        await CloseSessionAsync(
+                            sessions,
+                            frame.SessionId,
+                            sendCloseToClient: false,
+                            secureStream,
+                            writeLock,
+                            writeOptions,
+                            cancellationToken);
                         break;
 
                     case FrameType.Ping:
-                        if (sessions.TryGetValue(frame.Value.SessionId, out var pingSession)
-                            && !pingSession.TryAcceptIncomingSequence(frame.Value.Sequence))
+                        if (sessions.TryGetValue(frame.SessionId, out var pingSession)
+                            && !pingSession.TryAcceptIncomingSequence(frame.Sequence))
                         {
                             await CloseSessionAsync(
                                 sessions,
-                                frame.Value.SessionId,
+                                frame.SessionId,
                                 sendCloseToClient: true,
                                 secureStream,
                                 writeLock,
+                                writeOptions,
                                 CancellationToken.None);
                             break;
                         }
 
-                        var pongSequence = sessions.TryGetValue(frame.Value.SessionId, out pingSession)
+                        var pongSequence = sessions.TryGetValue(frame.SessionId, out pingSession)
                             ? pingSession.TakeNextSendSequence()
                             : 0UL;
                         await SendFrameLockedAsync(
                             secureStream,
-                            new ProtocolFrame(FrameType.Pong, frame.Value.SessionId, pongSequence, frame.Value.Payload),
+                            new ProtocolFrame(FrameType.Pong, frame.SessionId, pongSequence, frame.Payload),
                             writeLock,
+                            writeOptions,
                             cancellationToken);
                         break;
                 }
@@ -212,9 +244,21 @@ public sealed class TunnelServer
         }
         finally
         {
+            var closeWriteOptions = new ProtocolWriteOptions
+            {
+                Version = connectionVersion ?? ProtocolConstants.LegacyVersion,
+                EnableCompression = connectionVersion == ProtocolConstants.Version && connectionCompressionEnabled
+            };
             foreach (var sessionId in sessions.Keys)
             {
-                await CloseSessionAsync(sessions, sessionId, sendCloseToClient: false, secureStream, writeLock, CancellationToken.None);
+                await CloseSessionAsync(
+                    sessions,
+                    sessionId,
+                    sendCloseToClient: false,
+                    secureStream,
+                    writeLock,
+                    closeWriteOptions,
+                    CancellationToken.None);
             }
         }
     }
@@ -225,12 +269,13 @@ public sealed class TunnelServer
         ConcurrentDictionary<uint, SessionContext> sessions,
         ConcurrentDictionary<uint, byte> pendingConnectSessions,
         ProtocolFrame frame,
+        ProtocolWriteOptions writeOptions,
         TunnelServerPolicy serverPolicy,
         CancellationToken cancellationToken)
     {
         if (!pendingConnectSessions.TryAdd(frame.SessionId, 0))
         {
-            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, writeOptions, cancellationToken);
             return;
         }
 
@@ -238,13 +283,13 @@ public sealed class TunnelServer
         {
         if (sessions.Count >= serverPolicy.MaxSessionsPerTunnel)
         {
-            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, writeOptions, cancellationToken);
             return;
         }
 
         if (sessions.ContainsKey(frame.SessionId))
         {
-            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, writeOptions, cancellationToken);
             return;
         }
 
@@ -253,7 +298,7 @@ public sealed class TunnelServer
         {
             if (frame.Sequence != 0)
             {
-                await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
+                await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, writeOptions, cancellationToken);
                 return;
             }
 
@@ -261,7 +306,7 @@ public sealed class TunnelServer
         }
         catch
         {
-            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x08, writeLock, cancellationToken);
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x08, writeLock, writeOptions, cancellationToken);
             return;
         }
 
@@ -274,7 +319,7 @@ public sealed class TunnelServer
         {
             upstreamClient.Dispose();
             Console.WriteLine($"[tunnel] connect failed {request.Address}:{request.Port} ({ex.Message})");
-            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x05, writeLock, cancellationToken);
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x05, writeLock, writeOptions, cancellationToken);
             return;
         }
 
@@ -284,7 +329,7 @@ public sealed class TunnelServer
         if (!sessions.TryAdd(frame.SessionId, context))
         {
             context.Dispose();
-            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, cancellationToken);
+            await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, writeOptions, cancellationToken);
             return;
         }
 
@@ -306,6 +351,7 @@ public sealed class TunnelServer
                         secureStream,
                         new ProtocolFrame(FrameType.Data, context.SessionId, sequence, buffer.AsMemory(0, read)),
                         writeLock,
+                        writeOptions,
                         context.Cancellation.Token);
                 }
             }
@@ -320,12 +366,13 @@ public sealed class TunnelServer
                     sendCloseToClient: true,
                     secureStream,
                     writeLock,
+                    writeOptions,
                     CancellationToken.None);
             }
         }, context.Cancellation.Token);
 
         Console.WriteLine($"[tunnel] proxy {request.Address}:{request.Port} session={frame.SessionId}");
-        await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x00, writeLock, cancellationToken);
+        await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x00, writeLock, writeOptions, cancellationToken);
         }
         finally
         {
@@ -339,6 +386,7 @@ public sealed class TunnelServer
         ConcurrentDictionary<uint, SessionContext> sessions,
         ConcurrentDictionary<uint, byte> pendingConnectSessions,
         ProtocolFrame frame,
+        ProtocolWriteOptions writeOptions,
         TunnelServerPolicy serverPolicy,
         CancellationToken cancellationToken)
     {
@@ -350,6 +398,7 @@ public sealed class TunnelServer
                 sessions,
                 pendingConnectSessions,
                 frame,
+                writeOptions,
                 serverPolicy,
                 cancellationToken);
         }
@@ -365,6 +414,7 @@ public sealed class TunnelServer
                     frame.SessionId,
                     replyCode: 0x05,
                     writeLock,
+                    writeOptions,
                     CancellationToken.None);
             }
             catch
@@ -404,12 +454,14 @@ public sealed class TunnelServer
         uint sessionId,
         byte replyCode,
         SemaphoreSlim writeLock,
+        ProtocolWriteOptions writeOptions,
         CancellationToken cancellationToken)
     {
         return SendFrameLockedAsync(
             stream,
             new ProtocolFrame(FrameType.Connect, sessionId, 0, new[] { replyCode }),
             writeLock,
+            writeOptions,
             cancellationToken);
     }
 
@@ -419,6 +471,7 @@ public sealed class TunnelServer
         bool sendCloseToClient,
         Stream secureStream,
         SemaphoreSlim writeLock,
+        ProtocolWriteOptions writeOptions,
         CancellationToken cancellationToken)
     {
         if (!sessions.TryRemove(sessionId, out var context))
@@ -437,6 +490,7 @@ public sealed class TunnelServer
                     secureStream,
                     new ProtocolFrame(FrameType.Close, sessionId, context.TakeNextSendSequence(), ProtocolPayloadSerializer.SerializeClose(0x00)),
                     writeLock,
+                    writeOptions,
                     cancellationToken);
             }
             catch
@@ -449,12 +503,13 @@ public sealed class TunnelServer
         Stream stream,
         ProtocolFrame frame,
         SemaphoreSlim writeLock,
+        ProtocolWriteOptions writeOptions,
         CancellationToken cancellationToken)
     {
         await writeLock.WaitAsync(cancellationToken);
         try
         {
-            await ProtocolFrameCodec.WriteAsync(stream, frame, cancellationToken);
+            await ProtocolFrameCodec.WriteAsync(stream, frame, cancellationToken, writeOptions);
         }
         finally
         {

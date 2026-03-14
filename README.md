@@ -13,8 +13,8 @@
 
 ```powershell
 dotnet build src\SimpleShadowsocks.Protocol\SimpleShadowsocks.Protocol.csproj
-dotnet build src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj
 dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
+dotnet build src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj
 ```
 
 ### 1.1) Сборка Release-бинарников (Windows/macOS/Linux)
@@ -129,6 +129,10 @@ journalctl -u simple-shadowsocks-server -f
 Если `RemoteServers` не пустой, клиент использует именно его.  
 Если переданы CLI-аргументы `remoteHost/remotePort`, они переопределяют список и включают режим одиночного сервера.
 
+Параметры протокола (в `appsettings.json` клиента):
+- `ProtocolVersion` - версия протокола кадров (`1` или `2`).
+- `EnableCompression` - включение сжатия payload в `v2` (`false` по умолчанию), алгоритм фиксирован: `Deflate` (`CompressionLevel.Fastest`).
+
 Параметры server policy (в `appsettings.json` сервера):
 - `MaxConcurrentTunnels` - лимит одновременных tunnel-соединений.
 - `MaxSessionsPerTunnel` - лимит сессий в одном tunnel-соединении.
@@ -187,6 +191,13 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - reconnect policy: повторные подключения с экспоненциальной задержкой в пределах настроек policy
 - клиент поддерживает группу tunnel-серверов с выбором `round-robin`
 - привязка TCP-сессии SOCKS5 к выбранному tunnel-серверу (sticky per client TCP session)
+- версия протокола кадров увеличена до `v2` (добавлены flags и опциональное сжатие payload)
+- алгоритм сжатия payload в `v2` зафиксирован на `Deflate` (без выбора/negotiation алгоритма)
+- сервер совместим с `v1` и `v2`; версия соединения фиксируется по первому кадру клиента
+- при несовместимости версии клиент закрывает соединение с понятной ошибкой
+- снижены лишние аллокации в горячем пути кодека/сериализации:
+- чтение сжатых payload через `ArrayPool<byte>` без промежуточного heap-массива для compressed frame
+- сериализация `CONNECT` для IP/Domain без промежуточных буферов (`TryWriteBytes`/span-based ASCII encode)
 
 - Поточное шифрование туннеля:
 - алгоритм `ChaCha20-Poly1305 (AEAD)`: приоритет `System.Security.Cryptography.ChaCha20Poly1305`, fallback на BouncyCastle при недоступности платформенной реализации
@@ -215,7 +226,9 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - есть проверка round-robin распределения по группе tunnel-серверов
 - есть проверка, что медленный/таймаутный `CONNECT` не блокирует другие сессии
 - есть perf-тест для измерения throughput/allocations
-- текущий набор: `21` тестов, проходят
+- есть проверки `v1/v2` и round-trip со сжатием в `v2`
+- есть отдельный perf-тест на хорошо сжимаемом payload
+- текущий набор: `24` тестов, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
 - `bin/<ProjectName>/...`
@@ -228,27 +241,62 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - `src/SimpleShadowsocks.Protocol` - модели протокола, кодек и crypto-утилиты.
 - `tests/SimpleShadowsocks.Client.Tests` - unit/integration тесты.
 
-## Формат кадра протокола
+## Формат и правила протокола
 
+Поддерживаются две версии framing:
+
+`v1` (legacy, без flags):
 ```text
 +--------+----------+------------+-------------+-----------+--------------+
 | VER(1) | TYPE(1)  | SESSION(4) | SEQUENCE(8) | LEN(4)    | PAYLOAD(N)   |
 +--------+----------+------------+-------------+-----------+--------------+
 ```
 
-Поля:
-- `VER` - версия протокола.
-- `TYPE` - `Connect`, `Data`, `Close`, `Ping`, `Pong`.
-- `SESSION` - идентификатор логической сессии.
-- `SEQUENCE` - монотонный счетчик кадров в рамках `SESSION`.
-- `LEN` - длина payload.
-- `PAYLOAD` - полезные данные.
+`v2` (текущая, с flags):
+```text
++--------+----------+----------+------------+-------------+-----------+--------------+
+| VER(1) | TYPE(1)  | FLAGS(1) | SESSION(4) | SEQUENCE(8) | LEN(4)    | PAYLOAD(N)   |
++--------+----------+----------+------------+-------------+-----------+--------------+
+```
+
+Где:
+- `VER`: версия кадра (`1` или `2`).
+- `TYPE`: `Connect(1)`, `Data(2)`, `Close(3)`, `Ping(4)`, `Pong(5)`.
+- `FLAGS` (только `v2`):
+- `0x01` (`PayloadCompressed`) - `PAYLOAD` сжат `Deflate`.
+- `0x02` (`CompressionEnabled`) - сторона поддерживает/включила сжатие на этом соединении.
+- `SESSION`: ID логической мультиплексированной сессии (`0` зарезервирован для control-frame, например heartbeat).
+- `SEQUENCE`: монотонный счётчик кадров внутри `SESSION`.
+- `LEN`: длина `PAYLOAD` в байтах.
+- `PAYLOAD`: полезные данные кадра.
+
+Правила обработки:
+- Максимальный размер payload: `1 MiB` (`ProtocolConstants.MaxPayloadLength`).
+- Сервер принимает `v1` и `v2`; версия соединения фиксируется по первому кадру и не может меняться в рамках одного tunnel-соединения.
+- Клиент проверяет, что ответы приходят в ожидаемой версии, иначе закрывает соединение с понятной ошибкой.
+- Для `v2` сжатие фиксировано на `Deflate (CompressionLevel.Fastest)`, выбор алгоритма не negotiated.
+- Ordering/replay policy на прикладных кадрах: ожидается строго возрастающий `SEQUENCE` per `SESSION`; при нарушении сессия закрывается.
 
 ## Ограничения текущей версии
 
 - Нет ротации ключей.
 - При нарушении sequence policy сессия закрывается без механизма selective recovery/retransmit.
 - Reconnect не восстанавливает уже открытые SOCKS5-сессии: активные сессии закрываются и клиентские приложения должны открыть новое соединение.
+
+## Результат измерений сжатия (Release)
+
+Тест: `PerformanceMeasurementsTests`, `128 MiB`, `16 KiB`, `4 streams`.
+
+Профиль `mixed` (слабо сжимаемый):
+- Без сжатия: `43.72 MiB/s`, `2,337,619 bytes/MiB`.
+- Со сжатием: `37.12 MiB/s`, `2,409,587 bytes/MiB`.
+
+Профиль `compressible` (повторяющиеся последовательности байтов):
+- Без сжатия: `44.77 MiB/s`, `2,325,944 bytes/MiB`.
+- Со сжатием: `34.88 MiB/s`, `2,379,907 bytes/MiB`.
+
+Вывод: в текущей реализации (`Deflate`) сжатие проигрывает по throughput в обоих профилях и не даёт выигрыша по аллокациям.  
+По умолчанию оставлено `EnableCompression=false`.
 
 ## Следующие шаги
 
