@@ -6,6 +6,7 @@
 
 Требования:
 - `.NET SDK 9.0+`
+- для Android UI-клиента: установленный workload `maui-android` (например, `dotnet workload install maui-android`)
 
 Команды запускать из корня репозитория.
 
@@ -17,6 +18,7 @@ dotnet build src\SimpleShadowsocks.Client.Core\SimpleShadowsocks.Client.Core.csp
 dotnet build src\SimpleShadowsocks.Server.Core\SimpleShadowsocks.Server.Core.csproj
 dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
 dotnet build src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj
+dotnet build src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csproj -f net9.0-android
 dotnet build tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj
 ```
 
@@ -160,6 +162,31 @@ dotnet run --project src\SimpleShadowsocks.Client -- 1080 127.0.0.1 8388
 Аргументы:
 - Client: `<listenPort> <remoteHost> <remotePort> [sharedKey]`
 - Server: `<listenPort> [sharedKey]`
+
+### 3.1) Android UI-клиент (MAUI)
+
+В решении добавлен проект:
+- `src/SimpleShadowsocks.Client.Maui` - Android UI для запуска/остановки локального SOCKS5-клиента, который использует `SimpleShadowsocks.Client.Core`.
+
+Запуск на подключенном Android-устройстве или эмуляторе:
+
+```powershell
+dotnet build src\SimpleShadowsocks.Protocol\SimpleShadowsocks.Protocol.csproj
+dotnet build src\SimpleShadowsocks.Client.Core\SimpleShadowsocks.Client.Core.csproj
+dotnet build src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csproj -f net9.0-android
+dotnet build src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csproj -f net9.0-android -t:Run
+```
+
+Примечания по сборке Android:
+- для `Debug` в проекте включен fallback через `jarsigner`, так как на части окружений `apksigner` падает с `MSB6006: "java.exe" завершилась с кодом 1`;
+- предупреждение `XA0141` по `libsodium.so` приходит транзитивно из `libsodium` (`NSec.Cryptography`) и не блокирует текущую сборку.
+
+Поля в UI:
+- `Local SOCKS5 Port` - локальный порт прокси на устройстве.
+- `Tunnel Host` / `Tunnel Port` - адрес tunnel-сервера.
+- `Shared Key` - общий ключ (должен совпадать с сервером).
+- `Enable Compression` и `Compression Algorithm` - параметры компрессии `v2`.
+- `Cipher Algorithm` - выбор AEAD-алгоритма туннеля.
 
 ### 4) Тесты
 
