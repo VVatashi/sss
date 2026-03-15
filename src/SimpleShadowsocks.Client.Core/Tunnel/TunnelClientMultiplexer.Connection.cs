@@ -63,6 +63,7 @@ public sealed partial class TunnelClientMultiplexer
     private async Task ConnectOnceAsync(CancellationToken cancellationToken)
     {
         _tcpClient = new TcpClient();
+        _configureTcpSocket?.Invoke(_tcpClient.Client);
         await _tcpClient.ConnectAsync(_remoteHost, _remotePort, cancellationToken);
 
         var networkStream = _tcpClient.GetStream();

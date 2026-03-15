@@ -12,7 +12,7 @@
     <ApplicationId>com.simpleshadowsocks.client.maui</ApplicationId>
     <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
     <ApplicationVersion>1</ApplicationVersion>
-    <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">24</SupportedOSPlatformVersion>
+    <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">26</SupportedOSPlatformVersion>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Debug'">
@@ -24,6 +24,7 @@
     <ProjectReference Include="..\SimpleShadowsocks.Client.Core\SimpleShadowsocks.Client.Core.csproj" />
     <ProjectReference Include="..\SimpleShadowsocks.Protocol\SimpleShadowsocks.Protocol.csproj" />
     <PackageReference Include="Microsoft.Maui.Controls" Version="9.0.120" />
+    <AndroidNativeLibrary Include="Platforms\Android\NativeLibs\**\libhev-socks5-tunnel.so" />
   </ItemGroup>
 
 </Project>

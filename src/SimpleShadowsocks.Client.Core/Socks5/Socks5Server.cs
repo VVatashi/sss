@@ -24,6 +24,7 @@ public sealed partial class Socks5Server
     private readonly byte _protocolVersion;
     private readonly bool _enableCompression;
     private readonly PayloadCompressionAlgorithm _compressionAlgorithm;
+    private readonly Action<Socket>? _configureTunnelSocket;
     private List<TunnelClientMultiplexer>? _multiplexers;
     private int _nextMultiplexerIndex = -1;
 
@@ -48,7 +49,8 @@ public sealed partial class Socks5Server
         TunnelConnectionPolicy? connectionPolicy = null,
         byte protocolVersion = ProtocolConstants.Version,
         bool enableCompression = false,
-        PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate)
+        PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate,
+        Action<Socket>? configureTunnelSocket = null)
     {
         _listener = new TcpListener(listenAddress, port);
         _remoteServers.Add((remoteServerHost, remoteServerPort));
@@ -58,6 +60,7 @@ public sealed partial class Socks5Server
         _protocolVersion = protocolVersion;
         _enableCompression = enableCompression;
         _compressionAlgorithm = compressionAlgorithm;
+        _configureTunnelSocket = configureTunnelSocket;
     }
 
     public Socks5Server(
@@ -69,7 +72,8 @@ public sealed partial class Socks5Server
         TunnelConnectionPolicy? connectionPolicy = null,
         byte protocolVersion = ProtocolConstants.Version,
         bool enableCompression = false,
-        PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate)
+        PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate,
+        Action<Socket>? configureTunnelSocket = null)
     {
         _listener = new TcpListener(listenAddress, port);
         foreach (var (host, serverPort) in remoteServers)
@@ -88,6 +92,7 @@ public sealed partial class Socks5Server
         _protocolVersion = protocolVersion;
         _enableCompression = enableCompression;
         _compressionAlgorithm = compressionAlgorithm;
+        _configureTunnelSocket = configureTunnelSocket;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -106,7 +111,8 @@ public sealed partial class Socks5Server
                     _connectionPolicy,
                     _protocolVersion,
                     _enableCompression,
-                    _compressionAlgorithm));
+                    _compressionAlgorithm,
+                    _configureTunnelSocket));
             }
         }
 

@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using SimpleShadowsocks.Client.Socks5;
 using SimpleShadowsocks.Client.Tunnel;
 using SimpleShadowsocks.Protocol.Crypto;
@@ -15,7 +16,15 @@ public sealed class ProxyRunner
     public bool IsRunning { get; private set; }
     public event Action<string>? StatusChanged;
 
-    public Task StartAsync(ProxyOptions options, CancellationToken cancellationToken)
+    public void EmitStatus(string message)
+    {
+        RaiseStatus(message);
+    }
+
+    public Task StartAsync(
+        ProxyOptions options,
+        CancellationToken cancellationToken,
+        Action<Socket>? configureTunnelSocket = null)
     {
         lock (_sync)
         {
@@ -40,7 +49,8 @@ public sealed class ProxyRunner
                 connectionPolicy,
                 options.ProtocolVersion,
                 options.EnableCompression,
-                options.CompressionAlgorithm);
+                options.CompressionAlgorithm,
+                configureTunnelSocket);
 
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             var linkedToken = _cts.Token;
@@ -114,6 +124,7 @@ public sealed class ProxyRunner
 
     private void RaiseStatus(string message)
     {
+        AppLog.Write(message);
         StatusChanged?.Invoke(message);
     }
 }

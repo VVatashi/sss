@@ -1,12 +1,14 @@
 using SimpleShadowsocks.Client.Maui.Services;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
+using System.Text;
 
 namespace SimpleShadowsocks.Client.Maui;
 
 public sealed class MainPage : ContentPage
 {
     private readonly ProxyRunner _proxyRunner;
+    private readonly UiConfigStore _configStore;
     private readonly Entry _listenPortEntry;
     private readonly Entry _remoteHostEntry;
     private readonly Entry _remotePortEntry;
@@ -15,32 +17,64 @@ public sealed class MainPage : ContentPage
     private readonly Picker _compressionPicker;
     private readonly Picker _cipherPicker;
     private readonly Label _statusLabel;
+    private readonly Editor _logEditor;
+    private readonly Button _copyLogsButton;
     private readonly Button _startButton;
     private readonly Button _stopButton;
+    private readonly StringBuilder _logBuffer = new();
 
-    public MainPage(ProxyRunner proxyRunner)
+    public MainPage(ProxyRunner proxyRunner, UiConfigStore configStore)
     {
         _proxyRunner = proxyRunner;
+        _configStore = configStore;
         _proxyRunner.StatusChanged += OnStatusChanged;
 
         Title = "SimpleShadowsocks";
         var defaults = ProxyOptions.CreateDefaults();
+        var saved = _configStore.Load();
+        var selectedCompression = saved.ResolveCompressionAlgorithm(defaults.CompressionAlgorithm);
+        var selectedCipher = saved.ResolveCipherAlgorithm(defaults.TunnelCipherAlgorithm);
 
-        _listenPortEntry = new Entry { Keyboard = Keyboard.Numeric, Text = defaults.ListenPort.ToString() };
-        _remoteHostEntry = new Entry { Keyboard = Keyboard.Text, Text = defaults.RemoteHost };
-        _remotePortEntry = new Entry { Keyboard = Keyboard.Numeric, Text = defaults.RemotePort.ToString() };
-        _sharedKeyEntry = new Entry { Keyboard = Keyboard.Text, Text = defaults.SharedKey, IsPassword = true };
-        _compressionSwitch = new Switch { IsToggled = defaults.EnableCompression };
-        _compressionPicker = BuildCompressionPicker(defaults.CompressionAlgorithm);
-        _cipherPicker = BuildCipherPicker(defaults.TunnelCipherAlgorithm);
+        _listenPortEntry = new Entry { Keyboard = Keyboard.Numeric, Text = saved.ListenPortText };
+        _remoteHostEntry = new Entry { Keyboard = Keyboard.Text, Text = saved.RemoteHost };
+        _remotePortEntry = new Entry { Keyboard = Keyboard.Numeric, Text = saved.RemotePortText };
+        _sharedKeyEntry = new Entry { Keyboard = Keyboard.Text, Text = saved.SharedKey, IsPassword = true };
+        _compressionSwitch = new Switch { IsToggled = saved.EnableCompression };
+        _compressionPicker = BuildCompressionPicker(selectedCompression);
+        _cipherPicker = BuildCipherPicker(selectedCipher);
         _statusLabel = new Label { Text = "Stopped", TextColor = Colors.DarkRed };
+        _logEditor = new Editor
+        {
+            IsReadOnly = true,
+            AutoSize = EditorAutoSizeOption.Disabled,
+            HeightRequest = 240,
+            FontFamily = "monospace"
+        };
+        _copyLogsButton = new Button
+        {
+            Text = "Copy Logs",
+            HorizontalOptions = LayoutOptions.End
+        };
         _startButton = new Button { Text = "Start" };
         _stopButton = new Button { Text = "Stop", IsEnabled = false };
 
         _startButton.Clicked += StartButtonOnClicked;
         _stopButton.Clicked += StopButtonOnClicked;
+        _copyLogsButton.Clicked += async (_, _) => await CopyLogsAsync();
+        AppLog.LineAdded += OnLogLineAdded;
         _compressionSwitch.Toggled += (_, e) => _compressionPicker.IsEnabled = e.Value;
+        _listenPortEntry.TextChanged += (_, _) => SaveUiDraft();
+        _remoteHostEntry.TextChanged += (_, _) => SaveUiDraft();
+        _remotePortEntry.TextChanged += (_, _) => SaveUiDraft();
+        _sharedKeyEntry.TextChanged += (_, _) => SaveUiDraft();
+        _compressionSwitch.Toggled += (_, _) => SaveUiDraft();
+        _compressionPicker.SelectedIndexChanged += (_, _) => SaveUiDraft();
+        _cipherPicker.SelectedIndexChanged += (_, _) => SaveUiDraft();
         _compressionPicker.IsEnabled = _compressionSwitch.IsToggled;
+        _logEditor.GestureRecognizers.Add(new TapGestureRecognizer
+        {
+            Command = new Command(async () => await CopyLogsAsync())
+        });
 
         Content = new ScrollView
         {
@@ -63,16 +97,23 @@ public sealed class MainPage : ContentPage
                         Children = { _startButton, _stopButton }
                     },
                     new Label { Text = "Status" },
-                    _statusLabel
+                    _statusLabel,
+                    new HorizontalStackLayout
+                    {
+                        Children =
+                        {
+                            new Label
+                            {
+                                Text = "Logs",
+                                VerticalOptions = LayoutOptions.Center
+                            },
+                            _copyLogsButton
+                        }
+                    },
+                    _logEditor
                 }
             }
         };
-    }
-
-    protected override async void OnDisappearing()
-    {
-        base.OnDisappearing();
-        await _proxyRunner.StopAsync();
     }
 
     private async void StartButtonOnClicked(object? sender, EventArgs e)
@@ -85,19 +126,37 @@ public sealed class MainPage : ContentPage
 
         try
         {
+            SaveUiDraft();
+#if ANDROID
+            await SocksVpnServiceClient.StartAsync(options, CancellationToken.None);
+            ShowStatus("Starting VPN service...", isError: false);
+            SetRunningUi(isRunning: true);
+#else
             await _proxyRunner.StartAsync(options, CancellationToken.None);
             SetRunningUi(isRunning: true);
+#endif
         }
         catch (Exception ex)
         {
             ShowStatus($"Failed to start proxy: {ex.Message}", isError: true);
+            AppLog.Write($"UI start failed: {ex}");
         }
     }
 
     private async void StopButtonOnClicked(object? sender, EventArgs e)
     {
-        await _proxyRunner.StopAsync();
+        Task stopTask;
+#if ANDROID
+        SocksVpnServiceClient.Stop();
+        stopTask = Task.CompletedTask;
+#else
+        stopTask = _proxyRunner.StopAsync();
+#endif
+
+        await stopTask;
+#if !ANDROID
         SetRunningUi(isRunning: false);
+#endif
     }
 
     private void OnStatusChanged(string message)
@@ -109,6 +168,44 @@ public sealed class MainPage : ContentPage
             ShowStatus(message, isError);
             SetRunningUi(_proxyRunner.IsRunning);
         });
+    }
+
+    private void OnLogLineAdded(string line)
+    {
+        Dispatcher.Dispatch(() => AppendLog(line));
+    }
+
+    private void AppendLog(string line)
+    {
+        _logBuffer.AppendLine(line);
+        _logEditor.Text = _logBuffer.ToString();
+        _logEditor.CursorPosition = _logEditor.Text.Length;
+    }
+
+    private async Task CopyLogsAsync()
+    {
+        var text = _logEditor.Text ?? string.Empty;
+        await Clipboard.Default.SetTextAsync(text);
+        ShowStatus("Logs copied to clipboard.", isError: false);
+    }
+
+    private void SaveUiDraft()
+    {
+        var compression = _compressionPicker.SelectedItem is PayloadCompressionAlgorithm c
+            ? c
+            : PayloadCompressionAlgorithm.Deflate;
+        var cipher = _cipherPicker.SelectedItem is TunnelCipherAlgorithm t
+            ? t
+            : TunnelCipherAlgorithm.ChaCha20Poly1305;
+
+        _configStore.Save(UiConfigStore.UiConfigDraft.FromControls(
+            _listenPortEntry.Text ?? string.Empty,
+            _remoteHostEntry.Text ?? string.Empty,
+            _remotePortEntry.Text ?? string.Empty,
+            _sharedKeyEntry.Text ?? string.Empty,
+            _compressionSwitch.IsToggled,
+            compression,
+            cipher));
     }
 
     private bool TryBuildOptions(out ProxyOptions options, out string validationError)

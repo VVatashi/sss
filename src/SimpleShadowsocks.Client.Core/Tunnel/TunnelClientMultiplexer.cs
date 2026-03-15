@@ -8,6 +8,7 @@ namespace SimpleShadowsocks.Client.Tunnel;
 
 public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
 {
+    private readonly Action<Socket>? _configureTcpSocket;
     private readonly string _remoteHost;
     private readonly int _remotePort;
     private readonly byte[] _sharedKey;
@@ -41,8 +42,10 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         TunnelConnectionPolicy connectionPolicy,
         byte protocolVersion = ProtocolConstants.Version,
         bool enableCompression = false,
-        PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate)
+        PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate,
+        Action<Socket>? configureTcpSocket = null)
     {
+        _configureTcpSocket = configureTcpSocket;
         _remoteHost = remoteHost;
         _remotePort = remotePort;
         _sharedKey = sharedKey;

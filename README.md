@@ -7,6 +7,7 @@
 Требования:
 - `.NET SDK 9.0+`
 - для Android UI-клиента: установленный workload `maui-android` (например, `dotnet workload install maui-android`)
+- для Android UI/VPN-клиента: `minSdkVersion = 26` (Android 8.0+)
 
 Команды запускать из корня репозитория.
 
@@ -179,7 +180,32 @@ dotnet build src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csp
 
 Примечания по сборке Android:
 - для `Debug` в проекте включен fallback через `jarsigner`, так как на части окружений `apksigner` падает с `MSB6006: "java.exe" завершилась с кодом 1`;
-- предупреждение `XA0141` по `libsodium.so` приходит транзитивно из `libsodium` (`NSec.Cryptography`) и не блокирует текущую сборку.
+- предупреждение `XA0141` по `libsodium.so` (и при наличии собственного `libhev-socks5-tunnel.so`) не блокирует текущую сборку, но требует 16KB-page-size-совместимых native-библиотек для Android 16+.
+
+### 3.2) Android VPN MVP (`VpnService` + TCP + DNS через туннель)
+
+В `SimpleShadowsocks.Client.Maui` добавлен MVP-режим Android VPN:
+- `SocksVpnService` (Foreground `VpnService`) поднимает TUN-интерфейс и держит процесс в фоне;
+- локальный SOCKS5 (`SimpleShadowsocks.Client.Core`) запускается внутри сервиса;
+- DNS обслуживается встроенным `mapdns` внутри `hev-socks5-tunnel`;
+- TCP-трафик из TUN передается в `hev-socks5-tunnel`, загруженный в тот же процесс приложения.
+
+Важно:
+- для работы VPN MVP нужна native library `heiher/hev-socks5-tunnel`;
+- интеграция запускает `hev_socks5_tunnel_main_from_str(...)` in-process через `DllImport`;
+- библиотека должна быть упакована в ABI-папку проекта:
+  - `src/SimpleShadowsocks.Client.Maui/Platforms/Android/NativeLibs/arm64-v8a/libhev-socks5-tunnel.so`
+  - `src/SimpleShadowsocks.Client.Maui/Platforms/Android/NativeLibs/x86_64/libhev-socks5-tunnel.so` (для эмулятора);
+- запуск из `AppDataDirectory` не используется;
+- если библиотека отсутствует, сервис завершится с ошибкой `hev-socks5-tunnel native library is missing`.
+- при первом `Start` Android показывает системный диалог VPN-разрешения; после подтверждения запуск продолжается автоматически (повторное нажатие не требуется).
+
+Текущий MVP покрывает:
+- TCP через туннель;
+- принудительный DNS через `mapdns` в `hev-socks5-tunnel`.
+- TUN fd передается напрямую в `hev-socks5-tunnel` внутри того же процесса через native API `hev_socks5_tunnel_main_from_str(...)`; межпроцессная передача fd не используется.
+- исходящее tunnel-подключение самого клиента исключается из VPN через `VpnService.Protect(...)`, чтобы uplink к вашему серверу не зацикливался обратно в TUN.
+- Android `Private DNS` / DNS-over-TLS (`:853`) этим MVP не поддерживается; для проверки обычного DNS через VPN на устройстве должен быть отключен `Private DNS`.
 
 Поля в UI:
 - `Local SOCKS5 Port` - локальный порт прокси на устройстве.
@@ -187,6 +213,10 @@ dotnet build src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csp
 - `Shared Key` - общий ключ (должен совпадать с сервером).
 - `Enable Compression` и `Compression Algorithm` - параметры компрессии `v2`.
 - `Cipher Algorithm` - выбор AEAD-алгоритма туннеля.
+- запуск выполняется через Android `ForegroundService`, поэтому прокси продолжает работать в фоне после скрытия UI, пока не нажата `Stop`.
+- в UI есть read-only лог с автопрокруткой, куда выводятся `Console.Write*`, этапы запуска VPN и ошибки.
+- лог можно скопировать в буфер обмена кнопкой `Copy Logs` или тапом по полю лога.
+- введенные пользователем параметры автоматически сохраняются в локальные `Preferences` и восстанавливаются при следующем запуске приложения.
 
 ### 4) Тесты
 
