@@ -4,6 +4,7 @@ using SimpleShadowsocks.Protocol.Crypto;
 
 namespace SimpleShadowsocks.Client.Tests;
 
+[Trait(TestCategories.Name, TestCategories.Unit)]
 public sealed class AeadHandshakeTests
 {
     [Fact]

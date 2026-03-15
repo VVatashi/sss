@@ -16,6 +16,10 @@ public sealed class AeadDuplexStream : Stream
     private readonly int _tagLength;
     private readonly byte[] _writeBaseNonce;
     private readonly byte[] _readBaseNonce;
+    private readonly byte[] _writeNonceBuffer;
+    private readonly byte[] _readNonceBuffer;
+    private readonly byte[] _writeLengthPrefixBuffer = new byte[LengthPrefixSize];
+    private readonly byte[] _readLengthPrefixBuffer = new byte[LengthPrefixSize];
     private readonly bool _leaveOpen;
 
     private ulong _writeCounter;
@@ -52,6 +56,8 @@ public sealed class AeadDuplexStream : Stream
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
         _writeBaseNonce = writeBaseNonce.ToArray();
         _readBaseNonce = readBaseNonce.ToArray();
+        _writeNonceBuffer = new byte[_nonceLength];
+        _readNonceBuffer = new byte[_nonceLength];
         _leaveOpen = leaveOpen;
     }
 
@@ -110,8 +116,8 @@ public sealed class AeadDuplexStream : Stream
             throw new InvalidOperationException("AEAD write counter exhausted; re-key is required.");
         }
 
-        var nonce = BuildNonce(_writeBaseNonce, _writeCounter++, _nonceLength);
-        await EncryptAndWriteAsync(buffer, nonce, cancellationToken);
+        BuildNonce(_writeBaseNonce, _writeCounter++, _writeNonceBuffer);
+        await EncryptAndWriteAsync(buffer, _writeNonceBuffer, cancellationToken);
     }
 
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
@@ -155,67 +161,57 @@ public sealed class AeadDuplexStream : Stream
 
     private async Task<bool> LoadNextPlainRecordAsync(CancellationToken cancellationToken)
     {
-        var lengthBuffer = ArrayPool<byte>.Shared.Rent(LengthPrefixSize);
+        var lengthBytesRead = await ReadExactlyOrEofAsync(_inner, _readLengthPrefixBuffer, LengthPrefixSize, cancellationToken);
+        if (lengthBytesRead == 0)
+        {
+            return false;
+        }
+
+        if (lengthBytesRead != LengthPrefixSize)
+        {
+            throw new EndOfStreamException("Unexpected EOF while reading encrypted record length.");
+        }
+
+        var cipherLength = BinaryPrimitives.ReadInt32BigEndian(_readLengthPrefixBuffer);
+        if (cipherLength <= _tagLength || cipherLength > MaxCipherRecordLength)
+        {
+            throw new InvalidDataException($"Invalid encrypted record length: {cipherLength}.");
+        }
+
+        var cipherText = ArrayPool<byte>.Shared.Rent(cipherLength);
         try
         {
-            var lengthBytesRead = await ReadExactlyOrEofAsync(_inner, lengthBuffer, LengthPrefixSize, cancellationToken);
-            if (lengthBytesRead == 0)
+            await ReadExactlyAsync(_inner, cipherText, cipherLength, cancellationToken);
+
+            if (_readCounter == ulong.MaxValue)
             {
-                return false;
+                throw new InvalidDataException("AEAD read counter exhausted.");
             }
 
-            if (lengthBytesRead != LengthPrefixSize)
-            {
-                throw new EndOfStreamException("Unexpected EOF while reading encrypted record length.");
-            }
-
-            var cipherLength = BinaryPrimitives.ReadInt32BigEndian(lengthBuffer.AsSpan(0, LengthPrefixSize));
-            if (cipherLength <= _tagLength || cipherLength > MaxCipherRecordLength)
-            {
-                throw new InvalidDataException($"Invalid encrypted record length: {cipherLength}.");
-            }
-
-            var cipherText = ArrayPool<byte>.Shared.Rent(cipherLength);
-            try
-            {
-                await ReadExactlyAsync(_inner, cipherText, cipherLength, cancellationToken);
-
-                if (_readCounter == ulong.MaxValue)
-                {
-                    throw new InvalidDataException("AEAD read counter exhausted.");
-                }
-
-                var nonce = BuildNonce(_readBaseNonce, _readCounter++, _nonceLength);
-                ReturnPlainReadBuffer();
-                (_plainReadBuffer, _plainReadLength) = DecryptPooled(cipherText.AsSpan(0, cipherLength), nonce);
-                _plainReadBufferFromPool = true;
-                _plainReadOffset = 0;
-                return true;
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(cipherText);
-            }
+            BuildNonce(_readBaseNonce, _readCounter++, _readNonceBuffer);
+            ReturnPlainReadBuffer();
+            (_plainReadBuffer, _plainReadLength) = DecryptPooled(cipherText.AsSpan(0, cipherLength), _readNonceBuffer);
+            _plainReadBufferFromPool = true;
+            _plainReadOffset = 0;
+            return true;
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(lengthBuffer);
+            ArrayPool<byte>.Shared.Return(cipherText);
         }
     }
 
-    private static byte[] BuildNonce(byte[] baseNonce, ulong counter, int nonceLength)
+    private static void BuildNonce(ReadOnlySpan<byte> baseNonce, ulong counter, Span<byte> destination)
     {
-        var nonce = new byte[nonceLength];
-        baseNonce.AsSpan().CopyTo(nonce);
-        nonce[nonceLength - 8] ^= (byte)(counter >> 56);
-        nonce[nonceLength - 7] ^= (byte)(counter >> 48);
-        nonce[nonceLength - 6] ^= (byte)(counter >> 40);
-        nonce[nonceLength - 5] ^= (byte)(counter >> 32);
-        nonce[nonceLength - 4] ^= (byte)(counter >> 24);
-        nonce[nonceLength - 3] ^= (byte)(counter >> 16);
-        nonce[nonceLength - 2] ^= (byte)(counter >> 8);
-        nonce[nonceLength - 1] ^= (byte)counter;
-        return nonce;
+        baseNonce.CopyTo(destination);
+        destination[^8] ^= (byte)(counter >> 56);
+        destination[^7] ^= (byte)(counter >> 48);
+        destination[^6] ^= (byte)(counter >> 40);
+        destination[^5] ^= (byte)(counter >> 32);
+        destination[^4] ^= (byte)(counter >> 24);
+        destination[^3] ^= (byte)(counter >> 16);
+        destination[^2] ^= (byte)(counter >> 8);
+        destination[^1] ^= (byte)counter;
     }
 
     private async ValueTask EncryptAndWriteAsync(ReadOnlyMemory<byte> plain, byte[] nonce, CancellationToken cancellationToken)
@@ -237,17 +233,8 @@ public sealed class AeadDuplexStream : Stream
             }
 
             var len = _writeCipher.Encrypt(plainSpan, nonce, cipherBuffer);
-
-            var prefix = ArrayPool<byte>.Shared.Rent(LengthPrefixSize);
-            try
-            {
-                BinaryPrimitives.WriteInt32BigEndian(prefix.AsSpan(0, LengthPrefixSize), len);
-                await _inner.WriteAsync(prefix.AsMemory(0, LengthPrefixSize), cancellationToken);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(prefix);
-            }
+            BinaryPrimitives.WriteInt32BigEndian(_writeLengthPrefixBuffer, len);
+            await _inner.WriteAsync(_writeLengthPrefixBuffer.AsMemory(0, LengthPrefixSize), cancellationToken);
 
             await _inner.WriteAsync(cipherBuffer.AsMemory(0, len), cancellationToken);
         }

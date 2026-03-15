@@ -13,8 +13,11 @@
 
 ```powershell
 dotnet build src\SimpleShadowsocks.Protocol\SimpleShadowsocks.Protocol.csproj
+dotnet build src\SimpleShadowsocks.Client.Core\SimpleShadowsocks.Client.Core.csproj
+dotnet build src\SimpleShadowsocks.Server.Core\SimpleShadowsocks.Server.Core.csproj
 dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
 dotnet build src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj
+dotnet build tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj
 ```
 
 ### 1.1) Сборка Release-бинарников (Windows/macOS/Linux)
@@ -164,36 +167,62 @@ dotnet run --project src\SimpleShadowsocks.Client -- 1080 127.0.0.1 8388
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj
 ```
 
-Отдельно perf-замер (Release):
+Категории тестов:
+- `Unit` - быстрые проверки кодека и crypto-handshake.
+- `Integration` - SOCKS5 и tunnel end-to-end сценарии.
+- `Performance` - длительные perf-замеры throughput/allocations.
+
+Физическая структура тестового проекта:
+- `tests/SimpleShadowsocks.Client.Tests/Infrastructure` - общие test helpers, категории и сетевые harness-утилиты.
+- `tests/SimpleShadowsocks.Client.Tests/Unit/Protocol` - unit-тесты `SimpleShadowsocks.Protocol`.
+- `tests/SimpleShadowsocks.Client.Tests/Features/ClientCore/Socks5` - feature/integration тесты SOCKS5-клиента из `SimpleShadowsocks.Client.Core`.
+- `tests/SimpleShadowsocks.Client.Tests/Features/ClientCore/Tunnel` - feature/integration тесты tunnel/multiplexing/reconnect для `SimpleShadowsocks.Client.Core`.
+- `tests/SimpleShadowsocks.Client.Tests/Performance` - матричные perf-тесты `cipher x compression` и общая perf-harness логика.
+
+Последовательный запуск по стадиям:
 
 ```powershell
-dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~PerformanceMeasurementsTests" --logger "console;verbosity=detailed"
+pwsh .\tests\run-tests.ps1
 ```
 
-Perf-замеры AEAD по одному алгоритму (Release):
+Ручной запуск по категориям:
 
 ```powershell
-dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_ChaCha20Poly1305" --logger "console;verbosity=detailed"
-dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_Aes256Gcm" --logger "console;verbosity=detailed"
-dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_Aegis128L" --logger "console;verbosity=detailed"
-dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_Aegis256" --logger "console;verbosity=detailed"
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj --filter "Category=Unit"
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj --filter "Category=Integration"
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj --filter "Category=Performance"
 ```
 
-Perf-замеры алгоритмов сжатия payload (Release):
+Perf-матрицы `cipher x compression` (Release):
 
 ```powershell
-dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_CompressionAlgorithms_MixedPayload" --logger "console;verbosity=detailed"
-dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~Measure_Throughput_And_Allocations_CompressionAlgorithms_CompressiblePayload" --logger "console;verbosity=detailed"
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "Category=Performance" --logger "console;verbosity=detailed"
+```
+
+Точечный perf/profile запуск можно ограничивать через env vars:
+
+```powershell
+$env:SS_PERF_CIPHERS = "Aes256Gcm"
+$env:SS_PERF_COMPRESSIONS = "off,Deflate"
+$env:SS_PERF_CHUNK_KB = "64"
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_Matrix_MixedNoisePayload" --logger "console;verbosity=detailed"
 ```
 
 Примечание по perf-тестам:
 - добавлено подробное stage-логирование (`[perf] ...`) для диагностики зависаний;
 - добавлены встроенные таймауты на этапы `warmup` и `measurement`, чтобы тест не зависал бесконечно.
+- `MixedNoise` использует детерминированный набор chunk'ов с псевдослучайным шумом, подготовленный до warmup и measurement, чтобы сжатие не выглядело нереалистично эффективным.
+- `Compressible` использует заранее подготовленные хорошо сжимаемые chunk'и для сравнения с шумовым профилем на той же матрице `cipher x compression`.
+- timed section для perf-замера начинается только после preconnect всех SOCKS/tunnel-сессий, поэтому handshake/setup больше не занижают throughput.
+- порядок `compression`-режимов ротируется между cipher-ами, чтобы `off` не измерялся всегда первым на холодном состоянии.
+- доступны env overrides для узкого прогона: `SS_PERF_CIPHERS`, `SS_PERF_COMPRESSIONS`, `SS_PERF_TOTAL_MB`, `SS_PERF_CHUNK_KB`, `SS_PERF_STREAMS`, `SS_PERF_PAYLOAD_VARIANTS`.
 
 ## Что уже реализовано
 
 - Решение и проекты на `.NET 9`:
+  - `SimpleShadowsocks.Client.Core`
   - `SimpleShadowsocks.Client`
+  - `SimpleShadowsocks.Server.Core`
   - `SimpleShadowsocks.Server`
   - `SimpleShadowsocks.Protocol`
 
@@ -237,6 +266,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
   - nonce policy: уникальный nonce на каждый AEAD-record через base nonce + counter
   - защита от повторного использования nonce при исчерпании счетчика (требуется re-key)
   - replay protection на сервере для handshake (bounded cache + replay window)
+  - снижены лишние аллокации в AEAD data path: nonce и 4-byte length prefix больше не создаются заново на каждый record
 
 - Сервер туннеля:
   - принимает `CONNECT` кадр
@@ -246,6 +276,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
   - держит несколько независимых upstream-сессий в одном соединении с клиентом
   - ограничивает число tunnel-соединений и число сессий на туннель (hard limits)
   - обработка `CONNECT` выполняется неблокирующе для read-loop туннеля (медленный/недоступный upstream не блокирует другие сессии)
+  - убран `FlushAsync` на каждый `DATA` frame в `upstream`, чтобы не форсировать лишние syscalls на горячем пути
 
 - Тесты:
   - unit + integration тесты SOCKS5, протокола и туннеля
@@ -258,11 +289,10 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
   - есть проверка, что медленный/таймаутный `CONNECT` не блокирует другие сессии
   - есть проверка туннеля с `AES-256-GCM`
   - есть проверки туннеля с `AEGIS-128L` и `AEGIS-256`
-  - есть perf-тест для измерения throughput/allocations
+  - есть две perf-матрицы `cipher x compression`: для `MixedNoise` и для `Compressible`
   - есть проверки `v1/v2` и round-trip со сжатием в `v2`
-  - есть отдельный perf-тест на хорошо сжимаемом payload
-  - есть раздельные perf-тесты по каждому AEAD-алгоритму (`ChaCha20-Poly1305`, `AES-256-GCM`, `AEGIS-128L`, `AEGIS-256`)
-  - текущий набор: `38` тестов, проходят
+  - профиль `MixedNoise` предвычисляется как псевдослучайный шум до начала измерения
+  - текущий набор: `32` теста, проходят
 
 - Артефакты сборки вынесены в корневые каталоги:
   - `bin/<ProjectName>/...`
@@ -270,10 +300,30 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 
 ## Текущая структура проекта
 
-- `src/SimpleShadowsocks.Client` - локальный SOCKS5-proxy, клиент туннеля.
-- `src/SimpleShadowsocks.Server` - сервер туннеля.
+- `src/SimpleShadowsocks.Client.Core` - runtime-код локального SOCKS5-proxy и клиента туннеля.
+  - `Socks5/Socks5Server.cs` - lifecycle, accept-loop, выбор tunnel-сервера.
+  - `Socks5/Socks5Server.Protocol.cs` - SOCKS5 handshake, парсинг `CONNECT`, reply.
+  - `Socks5/Socks5Server.Relay.cs` - direct relay и relay через multiplexed tunnel.
+  - `Tunnel/TunnelClientMultiplexer.cs` - public API и базовое состояние multiplexer.
+  - `Tunnel/TunnelClientMultiplexer.Connection.cs` - connect/reconnect lifecycle и cleanup соединения.
+  - `Tunnel/TunnelClientMultiplexer.Loops.cs` - read/write/heartbeat loops.
+  - `Tunnel/TunnelClientMultiplexer.Sessions.cs` - open/restore/send логика tunnel-сессий.
+  - `Tunnel/TunnelClientMultiplexer.Models.cs` - внутренние модели состояния сессии и outbound frame.
+- `src/SimpleShadowsocks.Client` - thin launcher клиента, конфиг и `Program.cs`.
+- `src/SimpleShadowsocks.Server.Core` - runtime-код сервера туннеля.
+  - `Tunnel/TunnelServer.cs` - server policy, accept-loop и lifecycle tunnel-соединений.
+  - `Tunnel/TunnelServer.Connection.cs` - handshake tunnel-соединения и dispatch входящих кадров.
+  - `Tunnel/TunnelServer.Connect.cs` - обработка `CONNECT` и подключение к upstream.
+  - `Tunnel/TunnelServer.Sessions.cs` - lifecycle tunnel-сессий, отправка кадров и `SessionContext`.
+- `src/SimpleShadowsocks.Server` - thin launcher сервера, конфиг и `Program.cs`.
 - `src/SimpleShadowsocks.Protocol` - модели протокола, кодек и crypto-утилиты.
-- `tests/SimpleShadowsocks.Client.Tests` - unit/integration тесты.
+- `tests/SimpleShadowsocks.Client.Tests` - тестовый проект с вертикальным делением по типу теста и горизонтальным по подсистемам.
+  - `Infrastructure` - общие test helpers и categories.
+  - `Unit/Protocol` - unit-покрытие кодека и crypto-handshake для `SimpleShadowsocks.Protocol`.
+  - `Features/ClientCore/Socks5` - feature/integration сценарии SOCKS5.
+  - `Features/ClientCore/Tunnel` - feature/integration сценарии tunnel/reconnect/multiplexing.
+  - `Performance` - perf-матрицы и общие perf helpers.
+  - тестовый проект подключает `SimpleShadowsocks.Client.Core`, `SimpleShadowsocks.Server.Core` и `SimpleShadowsocks.Protocol` через `ProjectReference`.
 
 ## Формат и правила протокола
 
@@ -327,43 +377,54 @@ Crypto-handshake (transport encryption):
 - При нарушении sequence policy сессия закрывается без механизма selective recovery/retransmit.
 - Session migration/resume выполняется best-effort: при длительном недоступном upstream или ошибке повторного `CONNECT` конкретная сессия завершается.
 
-## Результат измерений сжатия (Release)
+## Результат матрицы производительности (Release)
 
-Тесты:  
-- `PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_CompressionAlgorithms_MixedPayload`  
-- `PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_CompressionAlgorithms_CompressiblePayload`  
-Параметры: `128 MiB`, `16 KiB`, `4 streams`, AEAD=`ChaCha20-Poly1305`.
+Тесты:
+- `PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_Matrix_MixedNoisePayload`
+- `PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_Matrix_CompressiblePayload`
 
-Профиль `mixed`:
+Параметры: `128 MiB`, `64 KiB`, `4 streams`.
 
-| Алгоритм | Throughput (MiB/s) | Alloc/MiB (bytes) | Tunnel C->S (bytes) | Tunnel S->C (bytes) | Tunnel Total (bytes) |
-|---|---:|---:|---:|---:|---:|
-| `off` | 37.61 | 2,342,877 | 143,120,373 | 143,120,289 | 286,240,662 |
-| `Deflate` | 36.93 | 2,402,209 | 4,287,185 | 4,491,681 | 8,778,866 |
-| `Gzip` | 35.28 | 2,382,586 | 4,448,217 | 4,648,353 | 9,096,570 |
-| `Brotli` | 35.18 | 2,342,133 | 2,800,237 | 2,994,593 | 5,794,830 |
+| Payload | Cipher | Compression | Throughput (MiB/s) | Alloc/MiB (bytes) | Tunnel C->S (bytes) | Tunnel S->C (bytes) | Tunnel Total (bytes) |
+|---|---|---|---:|---:|---:|---:|---:|
+| `MixedNoise` | `ChaCha20Poly1305` | `off` | 125.76 | 2 283 688 | 134 701 115 | 134 701 115 | 269 402 230 |
+| `MixedNoise` | `ChaCha20Poly1305` | `Deflate` | 80.56 | 2 431 463 | 134 701 056 | 134 701 056 | 269 402 112 |
+| `MixedNoise` | `ChaCha20Poly1305` | `Gzip` | 80.68 | 2 397 237 | 134 701 056 | 134 701 056 | 269 402 112 |
+| `MixedNoise` | `ChaCha20Poly1305` | `Brotli` | 107.72 | 2 374 116 | 134 701 056 | 134 701 056 | 269 402 112 |
+| `MixedNoise` | `Aes256Gcm` | `off` | 233.40 | 2 246 878 | 134 701 115 | 134 701 115 | 269 402 230 |
+| `MixedNoise` | `Aes256Gcm` | `Deflate` | 108.50 | 2 379 194 | 134 701 056 | 134 701 056 | 269 402 112 |
+| `MixedNoise` | `Aes256Gcm` | `Gzip` | 115.03 | 2 380 323 | 134 701 056 | 134 701 056 | 269 402 112 |
+| `MixedNoise` | `Aes256Gcm` | `Brotli` | 124.48 | 2 361 796 | 134 701 056 | 134 701 056 | 269 402 112 |
+| `MixedNoise` | `Aegis128L` | `off` | 307.71 | 2 209 200 | 134 963 200 | 134 963 200 | 269 926 400 |
+| `MixedNoise` | `Aegis128L` | `Deflate` | 111.68 | 2 344 754 | 134 963 200 | 134 963 200 | 269 926 400 |
+| `MixedNoise` | `Aegis128L` | `Gzip` | 116.16 | 2 344 999 | 134 963 200 | 134 963 200 | 269 926 400 |
+| `MixedNoise` | `Aegis128L` | `Brotli` | 131.80 | 2 321 708 | 134 963 200 | 134 963 200 | 269 926 400 |
+| `MixedNoise` | `Aegis256` | `off` | 265.81 | 2 208 204 | 134 963 401 | 134 963 473 | 269 926 874 |
+| `MixedNoise` | `Aegis256` | `Deflate` | 101.85 | 2 349 263 | 134 963 200 | 134 963 200 | 269 926 400 |
+| `MixedNoise` | `Aegis256` | `Gzip` | 112.55 | 2 352 110 | 134 963 200 | 134 963 200 | 269 926 400 |
+| `MixedNoise` | `Aegis256` | `Brotli` | 130.85 | 2 322 812 | 134 963 200 | 134 963 200 | 269 926 400 |
+| `Compressible` | `ChaCha20Poly1305` | `off` | 160.65 | 2 268 136 | 134 701 095 | 134 701 115 | 269 402 210 |
+| `Compressible` | `ChaCha20Poly1305` | `Deflate` | 45.27 | 2 314 580 | 1 675 196 | 1 908 736 | 3 583 932 |
+| `Compressible` | `ChaCha20Poly1305` | `Gzip` | 50.09 | 2 316 012 | 1 824 332 | 2 056 192 | 3 880 524 |
+| `Compressible` | `ChaCha20Poly1305` | `Brotli` | 45.77 | 2 264 238 | 481 812 | 704 512 | 1 186 324 |
+| `Compressible` | `Aes256Gcm` | `off` | 268.00 | 2 246 197 | 134 701 056 | 134 701 056 | 269 402 112 |
+| `Compressible` | `Aes256Gcm` | `Deflate` | 46.10 | 2 316 333 | 1 679 356 | 1 908 736 | 3 588 092 |
+| `Compressible` | `Aes256Gcm` | `Gzip` | 43.35 | 2 324 447 | 1 820 975 | 2 056 275 | 3 877 250 |
+| `Compressible` | `Aes256Gcm` | `Brotli` | 46.25 | 2 272 538 | 482 452 | 704 512 | 1 186 964 |
+| `Compressible` | `Aegis128L` | `off` | 356.63 | 2 206 362 | 134 963 492 | 134 963 382 | 269 926 874 |
+| `Compressible` | `Aegis128L` | `Deflate` | 48.28 | 2 290 891 | 1 751 732 | 2 170 880 | 3 922 612 |
+| `Compressible` | `Aegis128L` | `Gzip` | 46.09 | 2 299 479 | 1 895 948 | 2 318 336 | 4 214 284 |
+| `Compressible` | `Aegis128L` | `Brotli` | 40.73 | 2 247 869 | 560 252 | 966 656 | 1 526 908 |
+| `Compressible` | `Aegis256` | `off` | 287.21 | 2 207 305 | 134 963 274 | 134 963 291 | 269 926 565 |
+| `Compressible` | `Aegis256` | `Deflate` | 44.51 | 2 290 230 | 1 755 358 | 2 170 880 | 3 926 238 |
+| `Compressible` | `Aegis256` | `Gzip` | 48.43 | 2 298 841 | 1 897 676 | 2 318 336 | 4 216 012 |
+| `Compressible` | `Aegis256` | `Brotli` | 49.31 | 2 256 725 | 562 628 | 966 656 | 1 529 284 |
 
-Профиль `compressible`:
-
-| Алгоритм | Throughput (MiB/s) | Alloc/MiB (bytes) | Tunnel C->S (bytes) | Tunnel S->C (bytes) | Tunnel Total (bytes) |
-|---|---:|---:|---:|---:|---:|
-| `off` | 27.32 | 2,338,542 | 143,120,373 | 143,120,289 | 286,240,662 |
-| `Deflate` | 38.52 | 2,409,452 | 1,824,013 | 2,028,449 | 3,852,462 |
-| `Gzip` | 34.15 | 2,380,139 | 1,984,465 | 2,185,121 | 4,169,586 |
-| `Brotli` | 36.71 | 2,337,144 | 552,965 | 748,961 | 1,301,926 |
-
-Вывод: сжатие резко снижает объём туннельного трафика (особенно `Brotli`), но не всегда улучшает throughput; по умолчанию оставлено `EnableCompression=false`, `CompressionAlgorithm=Deflate`.
-
-## Результат сравнения AEAD (Release)
-
-Тесты запускались по одному (каждый в отдельном `dotnet test` запуске, с внутренним `warmup`), `128 MiB`, `16 KiB`, `4 streams`, `compression=off`.
-
-- `ChaCha20-Poly1305`: `51.09 MiB/s`, `2,348,914 bytes/MiB`.
-- `AES-256-GCM`: `29.35 MiB/s`, `2,346,777 bytes/MiB`.
-- `AEGIS-128L`: `27.93 MiB/s`, `2,316,319 bytes/MiB`.
-- `AEGIS-256`: `28.86 MiB/s`, `2,324,720 bytes/MiB`.
-
-Вывод: на текущем хосте лучшая пропускная способность у `ChaCha20-Poly1305`; `AES-256-GCM` и AEGIS-алгоритмы заметно медленнее.
+Вывод:
+- на профиле `MixedNoise` сжатие практически не уменьшает tunnel traffic, что и ожидается для данных, похожих на случайный шум; при дефолтном `64 KiB` chunk `compression=off` ожидаемо быстрее compression-вариантов;
+- на профиле `Compressible` `Deflate`/`Gzip`/`Brotli` резко уменьшают объём tunnel traffic, причём `Brotli` даёт минимальный трафик в этой матрице;
+- throughput здесь зависит от конкретной реализации алгоритма и текущего хоста, а не только от степени сжатия;
+- смена дефолтного chunk size с `16 KiB` на `64 KiB` убрала вводящий в заблуждение latency-bound сценарий: `off` больше не выглядит аномально медленным на шумовых данных.
 
 ## Следующие шаги
 

@@ -1,0 +1,136 @@
+using System.Net;
+using System.Net.Sockets;
+using SimpleShadowsocks.Protocol.Crypto;
+
+namespace SimpleShadowsocks.Server.Tunnel;
+
+public sealed class TunnelServerPolicy
+{
+    public static TunnelServerPolicy Default { get; } = new();
+
+    public int MaxConcurrentTunnels { get; init; } = 1024;
+    public int MaxSessionsPerTunnel { get; init; } = 1024;
+    public int ConnectTimeoutMs { get; init; } = 10_000;
+}
+
+public sealed partial class TunnelServer
+{
+    private readonly TcpListener _listener;
+    private readonly byte[] _sharedKey;
+    private readonly TunnelCryptoPolicy _cryptoPolicy;
+    private readonly TunnelServerPolicy _serverPolicy;
+    private int _acceptedTunnelConnections;
+    private int _activeTunnelConnections;
+
+    public int AcceptedTunnelConnections => Volatile.Read(ref _acceptedTunnelConnections);
+
+    public TunnelServer(IPAddress listenAddress, int port)
+    {
+        _listener = new TcpListener(listenAddress, port);
+        _sharedKey = PreSharedKey.Derive32Bytes("dev-shared-key");
+        _cryptoPolicy = TunnelCryptoPolicy.Default;
+        _serverPolicy = TunnelServerPolicy.Default;
+        ValidatePolicy(_serverPolicy);
+    }
+
+    public TunnelServer(
+        IPAddress listenAddress,
+        int port,
+        string sharedKey,
+        TunnelCryptoPolicy? cryptoPolicy = null,
+        TunnelServerPolicy? serverPolicy = null)
+    {
+        _listener = new TcpListener(listenAddress, port);
+        _sharedKey = PreSharedKey.Derive32Bytes(sharedKey);
+        _cryptoPolicy = cryptoPolicy ?? TunnelCryptoPolicy.Default;
+        _serverPolicy = serverPolicy ?? TunnelServerPolicy.Default;
+        ValidatePolicy(_serverPolicy);
+    }
+
+    public async Task RunAsync(CancellationToken cancellationToken)
+    {
+        _listener.Start();
+
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var tunnelClient = await _listener.AcceptTcpClientAsync(cancellationToken);
+                if (!TryAcquireTunnelSlot())
+                {
+                    tunnelClient.Dispose();
+                    continue;
+                }
+
+                Interlocked.Increment(ref _acceptedTunnelConnections);
+                _ = Task.Run(
+                    () => HandleTunnelSafelyAsync(tunnelClient, cancellationToken),
+                    cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            _listener.Stop();
+        }
+    }
+
+    private async Task HandleTunnelSafelyAsync(TcpClient tunnelClient, CancellationToken cancellationToken)
+    {
+        using (tunnelClient)
+        {
+            try
+            {
+                await HandleTunnelAsync(tunnelClient, _sharedKey, _cryptoPolicy, _serverPolicy, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[tunnel] client failed: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeTunnelConnections);
+            }
+        }
+    }
+
+    private static void ValidatePolicy(TunnelServerPolicy policy)
+    {
+        if (policy.MaxConcurrentTunnels <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy.MaxConcurrentTunnels), "MaxConcurrentTunnels must be > 0.");
+        }
+
+        if (policy.MaxSessionsPerTunnel <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy.MaxSessionsPerTunnel), "MaxSessionsPerTunnel must be > 0.");
+        }
+
+        if (policy.ConnectTimeoutMs <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy.ConnectTimeoutMs), "ConnectTimeoutMs must be > 0.");
+        }
+    }
+
+    private bool TryAcquireTunnelSlot()
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _activeTunnelConnections);
+            if (current >= _serverPolicy.MaxConcurrentTunnels)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _activeTunnelConnections, current + 1, current) == current)
+            {
+                return true;
+            }
+        }
+    }
+}

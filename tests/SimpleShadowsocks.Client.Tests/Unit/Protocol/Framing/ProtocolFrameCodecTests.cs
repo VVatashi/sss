@@ -3,6 +3,7 @@ using SimpleShadowsocks.Protocol;
 
 namespace SimpleShadowsocks.Client.Tests;
 
+[Trait(TestCategories.Name, TestCategories.Unit)]
 public sealed class ProtocolFrameCodecTests
 {
     [Fact]
