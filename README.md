@@ -1,67 +1,165 @@
 # SimpleShadowsocks
 
-Простой Shadowsocks-подобный протокол.
+Простой Shadowsocks-подобный стек на .NET 9: туннельный сервер, локальный SOCKS5-клиент и Android UI/VPN-клиент.
 
-## Быстрый старт (сборка, запуск, тесты)
+## Содержание
 
-Требования:
-- `.NET SDK 9.0+`
-- для Android UI-клиента: установленный workload `maui-android` (например, `dotnet workload install maui-android`)
-- для Android UI/VPN-клиента: `minSdkVersion = 26` (Android 8.0+)
+- [Для пользователя](#для-пользователя)
+  - [Что это и когда использовать](#что-это-и-когда-использовать)
+  - [Состав приложений](#состав-приложений)
+  - [Готовые релизы и бинарники](#готовые-релизы-и-бинарники)
+  - [Установка и настройка](#установка-и-настройка)
+  - [Запуск](#запуск)
+  - [Проверка работы](#проверка-работы)
+- [Для разработчика](#для-разработчика)
+  - [Технические требования](#технические-требования)
+  - [Сборка из исходников](#сборка-из-исходников)
+  - [Тестирование](#тестирование)
+  - [Архитектура решения](#архитектура-решения)
+  - [Детальный разбор протокола](#детальный-разбор-протокола)
+  - [Ключевые архитектурные решения](#ключевые-архитектурные-решения)
+  - [Ограничения текущей версии](#ограничения-текущей-версии)
+  - [Следующие итерации](#следующие-итерации)
 
-Команды запускать из корня репозитория.
+## Для пользователя
 
-### 1) Сборка
+### Что это и когда использовать
+
+SimpleShadowsocks позволяет поднять защищенный TCP/UDP-туннель между клиентом и сервером:
+
+- на сервере запускается tunnel endpoint;
+- на клиенте поднимается локальный SOCKS5-прокси (например `127.0.0.1:1080`);
+- приложения направляют трафик в этот SOCKS5-прокси;
+- данные идут к вашему серверу в зашифрованном виде.
+
+Подходит для личного использования и тестовых окружений, где нужен простой управляемый туннель без сложной инфраструктуры.
+
+### Состав приложений
+
+В проект входят 3 пользовательских приложения:
+
+1. `SimpleShadowsocks.Server` (CLI)
+- Принимает туннельные соединения от клиентов.
+- Разворачивается на VPS/сервере с публичным IP или DNS.
+
+2. `SimpleShadowsocks.Client` (CLI)
+- Поднимает локальный SOCKS5 (`CONNECT` + `UDP ASSOCIATE`).
+- Подключается к `SimpleShadowsocks.Server`.
+
+3. `SimpleShadowsocks.Client.Maui` (Android)
+- UI-клиент для Android.
+- Содержит режим VPN (`VpnService`), который маршрутизирует TCP/UDP/DNS через туннель.
+
+### Готовые релизы и бинарники
+
+Актуально на 16 марта 2026 года (данные из GitHub Releases):
+
+- Последний релиз: [`v0.1.0`](https://github.com/VVatashi/sss/releases/tag/v0.1.0)
+- Дата публикации: `2026-03-15 21:18:22 UTC`
+
+Доступные артефакты релиза `v0.1.0`:
+
+- Сервер:
+  - [`server-win-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/server-win-x64.zip)
+  - [`server-linux-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/server-linux-x64.zip)
+  - [`server-osx-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/server-osx-x64.zip)
+  - [`server-osx-arm64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/server-osx-arm64.zip)
+- Клиент CLI:
+  - [`client-win-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/client-win-x64.zip)
+  - [`client-linux-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/client-linux-x64.zip)
+  - [`client-osx-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/client-osx-x64.zip)
+  - [`client-osx-arm64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/client-osx-arm64.zip)
+- Android:
+  - [`com.simpleshadowsocks.client.maui-Signed.apk`](https://github.com/VVatashi/sss/releases/download/v0.1.0/com.simpleshadowsocks.client.maui-Signed.apk)
+
+### Установка и настройка
+
+#### 1) Сервер
+
+1. Скачайте архив `server-<platform>.zip` из релиза.
+2. Распакуйте на сервере.
+3. Создайте/обновите `appsettings.json` рядом с `SimpleShadowsocks.Server.dll`:
+
+```json
+{
+  "ListenPort": 8388,
+  "SharedKey": "your-strong-key",
+  "HandshakeMaxClockSkewSeconds": 60,
+  "ReplayWindowSeconds": 300,
+  "MaxConcurrentTunnels": 1024,
+  "MaxSessionsPerTunnel": 1024,
+  "ConnectTimeoutMs": 10000
+}
+```
+
+`SharedKey` на клиенте и сервере должен быть одинаковым.
+
+Поддерживаемые форматы `SharedKey`:
+
+- `hex:<64 hex символа>` (32 байта)
+- `base64:<...>` (ровно 32 байта после декодирования)
+- обычная строка-пароль (из нее вычисляется `SHA-256`)
+
+#### 2) Клиент CLI
+
+1. Скачайте архив `client-<platform>.zip`.
+2. Распакуйте локально.
+3. Настройте `appsettings.json`:
+
+```json
+{
+  "ListenPort": 1080,
+  "RemoteHost": "your-server-host",
+  "RemotePort": 8388,
+  "RemoteServers": [],
+  "SharedKey": "your-strong-key",
+  "ProtocolVersion": 2,
+  "EnableCompression": false,
+  "CompressionAlgorithm": "Deflate",
+  "TunnelCipherAlgorithm": "ChaCha20Poly1305"
+}
+```
+
+Если используете несколько серверов, задайте `RemoteServers` списком. При непустом `RemoteServers` используется именно он (балансировка `round-robin`).
+
+#### 3) Android клиент
+
+1. Скачайте APK из релиза и установите на устройство.
+2. При первом запуске заполните поля:
+- `Local SOCKS5 Port`
+- `Tunnel Host`
+- `Tunnel Port`
+- `Shared Key`
+- `Cipher Algorithm`
+- `Enable Compression` / `Compression Algorithm` (опционально)
+3. Нажмите `Start`.
+4. Подтвердите системный VPN-диалог Android (однократно для первого старта).
+
+Важно:
+
+- Для Android VPN MVP должен быть отключен `Private DNS`, иначе `DNS-over-TLS (:853)` не пойдет через текущую реализацию.
+
+### Запуск
+
+#### Сервер (CLI)
 
 ```powershell
-dotnet build src\SimpleShadowsocks.Protocol\SimpleShadowsocks.Protocol.csproj
-dotnet build src\SimpleShadowsocks.Client.Core\SimpleShadowsocks.Client.Core.csproj
-dotnet build src\SimpleShadowsocks.Server.Core\SimpleShadowsocks.Server.Core.csproj
-dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
-dotnet build src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj
-dotnet build src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csproj -f net9.0-android
-dotnet build tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj
+dotnet SimpleShadowsocks.Server.dll 8388
 ```
 
-### 1.1) Сборка Release-бинарников (Windows/macOS/Linux)
+Аргументы: `<listenPort> [sharedKey]`
 
-Ниже команды `framework-dependent` publish (требуется установленный .NET runtime на целевой машине).
+#### Клиент (CLI)
 
 ```powershell
-# Windows x64
-dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r win-x64 --self-contained false
-dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r win-x64 --self-contained false
-
-# Linux x64
-dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r linux-x64 --self-contained false
-dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r linux-x64 --self-contained false
-
-# macOS x64
-dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r osx-x64 --self-contained false
-dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r osx-x64 --self-contained false
-
-# macOS ARM64 (Apple Silicon)
-dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r osx-arm64 --self-contained false
-dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r osx-arm64 --self-contained false
+dotnet SimpleShadowsocks.Client.dll 1080 your-server-host 8388
 ```
 
-Результат publish:
-- `bin/SimpleShadowsocks.Server/Release/net9.0/<RID>/publish`
-- `bin/SimpleShadowsocks.Client/Release/net9.0/<RID>/publish`
+Аргументы: `<listenPort> <remoteHost> <remotePort> [sharedKey]`
 
-### 1.2) Пример запуска сервера как systemd unit (Linux)
+После запуска клиент слушает локальный SOCKS5 на `127.0.0.1:1080`.
 
-Пример для `linux-x64` publish.
-
-1. Опубликовать сервер:
-
-```bash
-dotnet publish src/SimpleShadowsocks.Server/SimpleShadowsocks.Server.csproj -c Release -r linux-x64 --self-contained false
-```
-
-2. Скопировать publish-директорию на сервер, например в `/opt/simple-shadowsocks/server`.
-
-3. Создать unit-файл `/etc/systemd/system/simple-shadowsocks-server.service`:
+#### Linux: запуск сервера как systemd unit
 
 ```ini
 [Unit]
@@ -78,168 +176,97 @@ ExecStart=/usr/bin/dotnet /opt/simple-shadowsocks/server/SimpleShadowsocks.Serve
 Restart=always
 RestartSec=2
 Environment=DOTNET_ENVIRONMENT=Production
-
-# Опционально поднять лимит файловых дескрипторов под нагрузкой
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-4. Применить и запустить:
+### Проверка работы
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now simple-shadowsocks-server
-sudo systemctl status simple-shadowsocks-server
-```
+1. Запустите сервер.
+2. Запустите клиент.
+3. В приложении/браузере укажите SOCKS5-прокси `127.0.0.1:1080`.
+4. Проверьте, что трафик проходит через туннель.
 
-5. Смотреть логи:
+## Для разработчика
 
-```bash
-journalctl -u simple-shadowsocks-server -f
-```
+### Технические требования
 
-### 2) Настройка ключа
+- `.NET SDK 9.0+`
+- Зафиксированная версия SDK в `global.json`: `9.0.312`
+- На уровне решения сборка ограничена в один поток (`Directory.Build.rsp`, `Directory.Build.props`), чтобы исключить конфликты артефактов
+- Для MAUI Android: workload `maui-android` (локальную MAUI/Android сборку в этом проекте рекомендуется выполнять только на подготовленном окружении)
 
-Клиент и сервер должны использовать одинаковый `SharedKey`.
+Команды запускать из корня репозитория.
 
-Файлы конфигурации:
-- `src/SimpleShadowsocks.Client/appsettings.json`
-- `src/SimpleShadowsocks.Server/appsettings.json`
+### Сборка из исходников
 
-Поддерживаемые форматы `SharedKey`:
-- `hex:<64 hex символа>` (ровно 32 байта)
-- `base64:<...>` (должно декодироваться ровно в 32 байта)
-- обычная строка-пароль (из нее вычисляется `SHA-256`, 32 байта)
-
-Параметры crypto policy (в `appsettings.json` клиента и сервера):
-- `HandshakeMaxClockSkewSeconds` - максимально допустимое расхождение времени при handshake.
-- `ReplayWindowSeconds` - окно хранения идентификаторов handshake для защиты от повторов.
-
-Параметры connection policy (в `appsettings.json` клиента):
-- `HeartbeatIntervalSeconds` - интервал heartbeat (`Ping`) по туннелю.
-- `IdleTimeoutSeconds` - максимальный простой без входящих кадров до принудительного разрыва туннеля.
-- `ReconnectBaseDelayMs` - базовая задержка reconnect.
-- `ReconnectMaxDelayMs` - верхняя граница задержки reconnect.
-- `ReconnectMaxAttempts` - число попыток reconnect перед ошибкой.
-- `MaxConcurrentSessions` - лимит активных мультиплексированных сессий на один клиентский туннель.
-- `SessionReceiveChannelCapacity` - размер буфера входящих DATA-кадров на сессию (backpressure).
-
-Параметры выбора tunnel-серверов (в `appsettings.json` клиента):
-- `RemoteHost`, `RemotePort` - одиночный сервер (обратная совместимость).
-- `RemoteServers` - список серверов для балансировки `round-robin`, формат:
-  - `{ "Host": "1.2.3.4", "Port": 8388 }`
-  - `{ "Host": "tunnel-2.example.org", "Port": 8388 }`
-
-Если `RemoteServers` не пустой, клиент использует именно его.  
-Если переданы CLI-аргументы `remoteHost/remotePort`, они переопределяют список и включают режим одиночного сервера.
-
-Параметры протокола (в `appsettings.json` клиента):
-- `ProtocolVersion` - версия протокола кадров (`1` или `2`).
-- `EnableCompression` - включение сжатия payload в `v2` (`false` по умолчанию).
-- `CompressionAlgorithm` - алгоритм сжатия payload в `v2`: `Deflate`, `Gzip`, `Brotli` (`Deflate` по умолчанию).
-- `TunnelCipherAlgorithm` - AEAD-алгоритм туннеля: `ChaCha20Poly1305`, `Aes256Gcm`, `Aegis128L`, `Aegis256`.
-
-Параметры server policy (в `appsettings.json` сервера):
-- `MaxConcurrentTunnels` - лимит одновременных tunnel-соединений.
-- `MaxSessionsPerTunnel` - лимит сессий в одном tunnel-соединении.
-- `ConnectTimeoutMs` - таймаут подключения сервера к целевому upstream-хосту для кадра `CONNECT`.
-
-### 3) Запуск
-
-Сначала сервер туннеля:
-```powershell
-dotnet run --project src\SimpleShadowsocks.Server -- 8388
-```
-
-Потом клиентский SOCKS5-прокси:
-```powershell
-dotnet run --project src\SimpleShadowsocks.Client -- 1080 127.0.0.1 8388
-```
-
-После запуска клиент слушает `127.0.0.1:1080`.
-
-Аргументы:
-- Client: `<listenPort> <remoteHost> <remotePort> [sharedKey]`
-- Server: `<listenPort> [sharedKey]`
-
-### 3.1) Android UI-клиент (MAUI)
-
-В решении добавлен проект:
-- `src/SimpleShadowsocks.Client.Maui` - Android UI для запуска/остановки локального SOCKS5-клиента, который использует `SimpleShadowsocks.Client.Core`.
-
-Запуск на подключенном Android-устройстве или эмуляторе:
+Рекомендуемая последовательность (сначала общие DLL, затем приложения по одному):
 
 ```powershell
+# Библиотеки
 dotnet build src\SimpleShadowsocks.Protocol\SimpleShadowsocks.Protocol.csproj
 dotnet build src\SimpleShadowsocks.Client.Core\SimpleShadowsocks.Client.Core.csproj
-dotnet build src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csproj -f net9.0-android
-dotnet build src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csproj -f net9.0-android -t:Run
+dotnet build src\SimpleShadowsocks.Server.Core\SimpleShadowsocks.Server.Core.csproj
+
+# Приложения
+dotnet build src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj
+dotnet build src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj
+
+# Тестовый проект
+dotnet build tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj
 ```
 
-Примечания по сборке Android:
-- для `Debug` в проекте включен fallback через `jarsigner`, так как на части окружений `apksigner` падает с `MSB6006: "java.exe" завершилась с кодом 1`;
-- предупреждение `XA0141` по `libsodium.so` (и при наличии собственного `libhev-socks5-tunnel.so`) не блокирует текущую сборку, но требует 16KB-page-size-совместимых native-библиотек для Android 16+.
+Публикация Release-бинарников (framework-dependent):
 
-### 3.2) Android VPN MVP (`VpnService` + TCP + DNS через туннель)
+```powershell
+# Windows x64
+dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r win-x64 --self-contained false
+dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r win-x64 --self-contained false
 
-В `SimpleShadowsocks.Client.Maui` добавлен MVP-режим Android VPN:
-- `SocksVpnService` (Foreground `VpnService`) поднимает TUN-интерфейс и держит процесс в фоне;
-- локальный SOCKS5 (`SimpleShadowsocks.Client.Core`) запускается внутри сервиса;
-- DNS обслуживается встроенным `mapdns` внутри `hev-socks5-tunnel`;
-- TCP-трафик из TUN передается в `hev-socks5-tunnel`, загруженный в тот же процесс приложения.
+# Linux x64
+dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r linux-x64 --self-contained false
+dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r linux-x64 --self-contained false
 
-Важно:
-- для работы VPN MVP нужна native library `heiher/hev-socks5-tunnel`;
-- интеграция запускает `hev_socks5_tunnel_main_from_str(...)` in-process через `DllImport`;
-- библиотека должна быть упакована в ABI-папку проекта:
-  - `src/SimpleShadowsocks.Client.Maui/Platforms/Android/NativeLibs/arm64-v8a/libhev-socks5-tunnel.so`
-  - `src/SimpleShadowsocks.Client.Maui/Platforms/Android/NativeLibs/x86_64/libhev-socks5-tunnel.so` (для эмулятора);
-- запуск из `AppDataDirectory` не используется;
-- если библиотека отсутствует, сервис завершится с ошибкой `hev-socks5-tunnel native library is missing`.
-- при первом `Start` Android показывает системный диалог VPN-разрешения; после подтверждения запуск продолжается автоматически (повторное нажатие не требуется).
+# macOS x64
+dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r osx-x64 --self-contained false
+dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r osx-x64 --self-contained false
 
-Текущий MVP покрывает:
-- TCP через туннель;
-- принудительный DNS через `mapdns` в `hev-socks5-tunnel`.
-- TUN fd передается напрямую в `hev-socks5-tunnel` внутри того же процесса через native API `hev_socks5_tunnel_main_from_str(...)`; межпроцессная передача fd не используется.
-- исходящее tunnel-подключение самого клиента исключается из VPN через `VpnService.Protect(...)`, чтобы uplink к вашему серверу не зацикливался обратно в TUN.
-- Android `Private DNS` / DNS-over-TLS (`:853`) этим MVP не поддерживается; для проверки обычного DNS через VPN на устройстве должен быть отключен `Private DNS`.
+# macOS ARM64
+dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r osx-arm64 --self-contained false
+dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r osx-arm64 --self-contained false
+```
 
-Поля в UI:
-- `Local SOCKS5 Port` - локальный порт прокси на устройстве.
-- `Tunnel Host` / `Tunnel Port` - адрес tunnel-сервера.
-- `Shared Key` - общий ключ (должен совпадать с сервером).
-- `Enable Compression` и `Compression Algorithm` - параметры компрессии `v2`.
-- `Cipher Algorithm` - выбор AEAD-алгоритма туннеля.
-- запуск выполняется через Android `ForegroundService`, поэтому прокси продолжает работать в фоне после скрытия UI, пока не нажата `Stop`.
-- в UI есть read-only лог с автопрокруткой, куда выводятся `Console.Write*`, этапы запуска VPN и ошибки.
-- лог можно скопировать в буфер обмена кнопкой `Copy Logs` или тапом по полю лога.
-- введенные пользователем параметры автоматически сохраняются в локальные `Preferences` и восстанавливаются при следующем запуске приложения.
+Результаты публикации:
 
-### 4) Тесты
+- `bin/SimpleShadowsocks.Server/Release/net9.0/<RID>/publish`
+- `bin/SimpleShadowsocks.Client/Release/net9.0/<RID>/publish`
+
+### Тестирование
+
+Базовый прогон:
 
 ```powershell
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj
 ```
 
-Категории тестов:
-- `Unit` - быстрые проверки кодека и crypto-handshake.
-- `Integration` - SOCKS5 и tunnel end-to-end сценарии.
-- `Performance` - длительные perf-замеры throughput/allocations.
+Категории:
 
-Физическая структура тестового проекта:
-- `tests/SimpleShadowsocks.Client.Tests/Infrastructure` - общие test helpers, категории и сетевые harness-утилиты.
-- `tests/SimpleShadowsocks.Client.Tests/Unit/Protocol` - unit-тесты `SimpleShadowsocks.Protocol`.
-- `tests/SimpleShadowsocks.Client.Tests/Features/ClientCore/Socks5` - feature/integration тесты SOCKS5-клиента из `SimpleShadowsocks.Client.Core`.
-- `tests/SimpleShadowsocks.Client.Tests/Features/ClientCore/Tunnel` - feature/integration тесты tunnel/multiplexing/reconnect для `SimpleShadowsocks.Client.Core`.
-- `tests/SimpleShadowsocks.Client.Tests/Performance` - матричные perf-тесты `cipher x compression` и общая perf-harness логика.
+- `Unit`
+- `Integration`
+- `Performance`
 
-Последовательный запуск по стадиям:
+Скрипт последовательного запуска:
 
 ```powershell
 pwsh .\tests\run-tests.ps1
+```
+
+По умолчанию запускаются только `Unit` + `Integration`; performance-тесты включаются только явно:
+
+```powershell
+pwsh .\tests\run-tests.ps1 -IncludePerformance
 ```
 
 Ручной запуск по категориям:
@@ -250,242 +277,121 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj --filter "Category=Performance"
 ```
 
-Perf-матрицы `cipher x compression` (Release):
+### Архитектура решения
 
-```powershell
-dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "Category=Performance" --logger "console;verbosity=detailed"
-```
+Слои решения:
 
-Точечный perf/profile запуск можно ограничивать через env vars:
+1. `SimpleShadowsocks.Protocol`
+- Wire-модели, framing/serialization, crypto-handshake, AEAD-шифрование, compression codecs.
 
-```powershell
-$env:SS_PERF_CIPHERS = "Aes256Gcm"
-$env:SS_PERF_COMPRESSIONS = "off,Deflate"
-$env:SS_PERF_CHUNK_KB = "64"
-dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj -c Release --filter "FullyQualifiedName~PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_Matrix_MixedNoisePayload" --logger "console;verbosity=detailed"
-```
+2. `SimpleShadowsocks.Client.Core`
+- SOCKS5 сервер (`CONNECT`, `UDP ASSOCIATE`), мультиплексированный tunnel client, reconnect/heartbeat/session restore.
 
-Примечание по perf-тестам:
-- добавлено подробное stage-логирование (`[perf] ...`) для диагностики зависаний;
-- добавлены встроенные таймауты на этапы `warmup` и `measurement`, чтобы тест не зависал бесконечно.
-- `MixedNoise` использует детерминированный набор chunk'ов с псевдослучайным шумом, подготовленный до warmup и measurement, чтобы сжатие не выглядело нереалистично эффективным.
-- `Compressible` использует заранее подготовленные хорошо сжимаемые chunk'и для сравнения с шумовым профилем на той же матрице `cipher x compression`.
-- timed section для perf-замера начинается только после preconnect всех SOCKS/tunnel-сессий, поэтому handshake/setup больше не занижают throughput.
-- порядок `compression`-режимов ротируется между cipher-ами, чтобы `off` не измерялся всегда первым на холодном состоянии.
-- доступны env overrides для узкого прогона: `SS_PERF_CIPHERS`, `SS_PERF_COMPRESSIONS`, `SS_PERF_TOTAL_MB`, `SS_PERF_CHUNK_KB`, `SS_PERF_STREAMS`, `SS_PERF_PAYLOAD_VARIANTS`.
+3. `SimpleShadowsocks.Server.Core`
+- Tunnel server: handshake, диспетчеризация кадров, управление сессиями, проксирование в upstream TCP/UDP.
 
-## Что уже реализовано
+4. Тонкие хосты:
+- `SimpleShadowsocks.Client` (CLI launcher)
+- `SimpleShadowsocks.Server` (CLI launcher)
+- `SimpleShadowsocks.Client.Maui` (Android UI/VPN launcher)
 
-- Решение и проекты на `.NET 9`:
-  - `SimpleShadowsocks.Client.Core`
-  - `SimpleShadowsocks.Client`
-  - `SimpleShadowsocks.Server.Core`
-  - `SimpleShadowsocks.Server`
-  - `SimpleShadowsocks.Protocol`
+Ключевые директории:
 
-- Клиентский SOCKS5:
-  - handshake `VER=5`, метод `NO AUTH (0x00)`
-  - `CONNECT (0x01)`
-  - адреса `IPv4`, `IPv6`, `Domain`
-  - корректные SOCKS5 reply-коды
+- `src/SimpleShadowsocks.Protocol`
+- `src/SimpleShadowsocks.Client.Core/Socks5`
+- `src/SimpleShadowsocks.Client.Core/Tunnel`
+- `src/SimpleShadowsocks.Server.Core/Tunnel`
+- `tests/SimpleShadowsocks.Client.Tests`
 
-- Внутренний протокол клиент<->сервер:
-  - framing/serialization (`ProtocolFrameCodec`, `ProtocolPayloadSerializer`)
-  - кадры `Connect/Data/Close/Ping/Pong`
-  - передача трафика через туннель `Client <-> Server`
-  - мультиплексирование нескольких `sessionId` в одном TCP-туннеле
-  - ordering/replay policy на уровне прикладных кадров через монотонный `Sequence` per session
-  - heartbeat/idle timeout: клиент отправляет `Ping`, контролирует отсутствие входящего трафика и сбрасывает зависшее туннельное соединение
-  - reconnect policy: повторные подключения с экспоненциальной задержкой в пределах настроек policy
-  - graceful session migration/resume: при reconnect клиент пытается прозрачно переоткрыть активные `sessionId` (re-`CONNECT`) и продолжить работу существующих SOCKS5 TCP-соединений
-  - клиент поддерживает группу tunnel-серверов с выбором `round-robin`
-  - привязка TCP-сессии SOCKS5 к выбранному tunnel-серверу (sticky per client TCP session)
-  - версия протокола кадров увеличена до `v2` (добавлены flags и опциональное сжатие payload)
-  - поддержаны алгоритмы сжатия payload в `v2`: `Deflate`, `Gzip`, `Brotli`
-  - алгоритм сжатия кодируется в `FLAGS` каждого кадра `v2` и выбирается клиентом через конфиг
-  - сервер совместим с `v1` и `v2`; версия соединения фиксируется по первому кадру клиента
-  - при несовместимости версии клиент закрывает соединение с понятной ошибкой
-  - снижены лишние аллокации в горячем пути кодека/сериализации:
-    - чтение сжатых payload через `ArrayPool<byte>` без промежуточного heap-массива для compressed frame
-    - сериализация `CONNECT` для IP/Domain без промежуточных буферов (`TryWriteBytes`/span-based ASCII encode)
+### Детальный разбор протокола
 
-- Поточное шифрование туннеля:
-  - AEAD-алгоритмы: `ChaCha20-Poly1305`, `AES-256-GCM`, `AEGIS-128L`, `AEGIS-256`
-  - клиент выбирает алгоритм через `TunnelCipherAlgorithm` в конфиге
-  - сервер поддерживает все перечисленные AEAD-алгоритмы и принимает выбор клиента из crypto-handshake
-  - реализации AEAD вынесены в отдельные классы с общим интерфейсом (`IAeadCipherImpl`) и фабрикой выбора алгоритма (`AeadCipherFactory`) без изменения wire-формата
-  - для `ChaCha20-Poly1305`/`AES-256-GCM` используются `System.Security.Cryptography` при доступности, fallback - BouncyCastle
-  - для `AEGIS-128L`/`AEGIS-256` используется `NSec.Cryptography` (libsodium backend) с runtime-проверкой поддержки
-  - pre-shared key из конфигурации
-  - защищенный crypto-handshake v2 (HMAC + timestamp + handshake counter + negotiated algorithm) c проверкой времени на обеих сторонах
-  - HKDF-разделение ключевого материала: отдельный ключ для MAC handshake и отдельный transport key для AEAD
-  - последующий обмен всеми кадрами в зашифрованном и аутентифицированном виде
-  - nonce policy: уникальный nonce на каждый AEAD-record через base nonce + counter
-  - защита от повторного использования nonce при исчерпании счетчика (требуется re-key)
-  - replay protection на сервере для handshake (bounded cache + replay window)
-  - снижены лишние аллокации в AEAD data path: nonce и 4-byte length prefix больше не создаются заново на каждый record
+Поддерживаются две версии framing.
 
-- Сервер туннеля:
-  - принимает `CONNECT` кадр
-  - подключается к целевому хосту с ограничением по `ConnectTimeoutMs`
-  - возвращает код результата
-  - передает `DATA` в обе стороны
-  - держит несколько независимых upstream-сессий в одном соединении с клиентом
-  - ограничивает число tunnel-соединений и число сессий на туннель (hard limits)
-  - обработка `CONNECT` выполняется неблокирующе для read-loop туннеля (медленный/недоступный upstream не блокирует другие сессии)
-  - убран `FlushAsync` на каждый `DATA` frame в `upstream`, чтобы не форсировать лишние syscalls на горячем пути
+`v1`:
 
-- Тесты:
-  - unit + integration тесты SOCKS5, протокола и туннеля
-  - есть узкий crypto regression-тест handshake+record roundtrip для `AEGIS-128L`
-  - есть проверка multiplexing: две сессии через один туннель
-  - есть проверка reconnect после перезапуска tunnel-сервера
-  - есть проверка graceful migration активной сессии через reconnect туннеля
-  - есть проверка ограничения сессий на сервере и валидации reconnect policy
-  - есть проверка round-robin распределения по группе tunnel-серверов
-  - есть проверка, что медленный/таймаутный `CONNECT` не блокирует другие сессии
-  - есть проверка туннеля с `AES-256-GCM`
-  - есть проверки туннеля с `AEGIS-128L` и `AEGIS-256`
-  - есть две perf-матрицы `cipher x compression`: для `MixedNoise` и для `Compressible`
-  - есть проверки `v1/v2` и round-trip со сжатием в `v2`
-  - профиль `MixedNoise` предвычисляется как псевдослучайный шум до начала измерения
-  - текущий набор: `32` теста, проходят
-
-- Артефакты сборки вынесены в корневые каталоги:
-  - `bin/<ProjectName>/...`
-  - `obj/<ProjectName>/...`
-
-## Текущая структура проекта
-
-- `src/SimpleShadowsocks.Client.Core` - runtime-код локального SOCKS5-proxy и клиента туннеля.
-  - `Socks5/Socks5Server.cs` - lifecycle, accept-loop, выбор tunnel-сервера.
-  - `Socks5/Socks5Server.Protocol.cs` - SOCKS5 handshake, парсинг `CONNECT`, reply.
-  - `Socks5/Socks5Server.Relay.cs` - direct relay и relay через multiplexed tunnel.
-  - `Tunnel/TunnelClientMultiplexer.cs` - public API и базовое состояние multiplexer.
-  - `Tunnel/TunnelClientMultiplexer.Connection.cs` - connect/reconnect lifecycle и cleanup соединения.
-  - `Tunnel/TunnelClientMultiplexer.Loops.cs` - read/write/heartbeat loops.
-  - `Tunnel/TunnelClientMultiplexer.Sessions.cs` - open/restore/send логика tunnel-сессий.
-  - `Tunnel/TunnelClientMultiplexer.Models.cs` - внутренние модели состояния сессии и outbound frame.
-- `src/SimpleShadowsocks.Client` - thin launcher клиента, конфиг и `Program.cs`.
-- `src/SimpleShadowsocks.Server.Core` - runtime-код сервера туннеля.
-  - `Tunnel/TunnelServer.cs` - server policy, accept-loop и lifecycle tunnel-соединений.
-  - `Tunnel/TunnelServer.Connection.cs` - handshake tunnel-соединения и dispatch входящих кадров.
-  - `Tunnel/TunnelServer.Connect.cs` - обработка `CONNECT` и подключение к upstream.
-  - `Tunnel/TunnelServer.Sessions.cs` - lifecycle tunnel-сессий, отправка кадров и `SessionContext`.
-- `src/SimpleShadowsocks.Server` - thin launcher сервера, конфиг и `Program.cs`.
-- `src/SimpleShadowsocks.Protocol` - модели протокола, кодек и crypto-утилиты.
-- `tests/SimpleShadowsocks.Client.Tests` - тестовый проект с вертикальным делением по типу теста и горизонтальным по подсистемам.
-  - `Infrastructure` - общие test helpers и categories.
-  - `Unit/Protocol` - unit-покрытие кодека и crypto-handshake для `SimpleShadowsocks.Protocol`.
-  - `Features/ClientCore/Socks5` - feature/integration сценарии SOCKS5.
-  - `Features/ClientCore/Tunnel` - feature/integration сценарии tunnel/reconnect/multiplexing.
-  - `Performance` - perf-матрицы и общие perf helpers.
-  - тестовый проект подключает `SimpleShadowsocks.Client.Core`, `SimpleShadowsocks.Server.Core` и `SimpleShadowsocks.Protocol` через `ProjectReference`.
-
-## Формат и правила протокола
-
-Поддерживаются две версии framing:
-
-`v1` (legacy, без flags):
 ```text
 +--------+----------+------------+-------------+-----------+--------------+
 | VER(1) | TYPE(1)  | SESSION(4) | SEQUENCE(8) | LEN(4)    | PAYLOAD(N)   |
 +--------+----------+------------+-------------+-----------+--------------+
 ```
 
-`v2` (текущая, с flags):
+`v2`:
+
 ```text
 +--------+----------+----------+------------+-------------+-----------+--------------+
 | VER(1) | TYPE(1)  | FLAGS(1) | SESSION(4) | SEQUENCE(8) | LEN(4)    | PAYLOAD(N)   |
 +--------+----------+----------+------------+-------------+-----------+--------------+
 ```
 
-Где:
-- `VER`: версия кадра (`1` или `2`).
-- `TYPE`: `Connect(1)`, `Data(2)`, `Close(3)`, `Ping(4)`, `Pong(5)`.
+Поля:
+
+- `VER`: версия кадра (`1` или `2`)
+- `TYPE`: `Connect(1)`, `Data(2)`, `Close(3)`, `Ping(4)`, `Pong(5)`, `UdpAssociate(6)`, `UdpData(7)`
 - `FLAGS` (только `v2`):
-  - `0x01` (`PayloadCompressed`) - `PAYLOAD` сжат.
-  - `0x02` (`CompressionEnabled`) - сторона поддерживает/включила сжатие на этом соединении.
-  - `0x0C` (`CompressionAlgorithmMask`) - код алгоритма сжатия:
-    - `00` = `Deflate`
-    - `01` = `Gzip`
-    - `10` = `Brotli`
-- `SESSION`: ID логической мультиплексированной сессии (`0` зарезервирован для control-frame, например heartbeat).
-- `SEQUENCE`: монотонный счётчик кадров внутри `SESSION`.
-- `LEN`: длина `PAYLOAD` в байтах.
-- `PAYLOAD`: полезные данные кадра.
+  - `0x01` `PayloadCompressed`
+  - `0x02` `CompressionEnabled`
+  - `0x0C` `CompressionAlgorithmMask` (`Deflate`, `Gzip`, `Brotli`)
+- `SESSION`: идентификатор логической сессии (`0` зарезервирован для control-frame)
+- `SEQUENCE`: монотонный счетчик кадров в рамках сессии
+- `LEN`: длина payload
 
-Правила обработки:
-- Максимальный размер payload: `1 MiB` (`ProtocolConstants.MaxPayloadLength`).
-- Сервер принимает `v1` и `v2`; версия соединения фиксируется по первому кадру и не может меняться в рамках одного tunnel-соединения.
-- Клиент проверяет, что ответы приходят в ожидаемой версии, иначе закрывает соединение с понятной ошибкой.
-- Для `v2` алгоритм сжатия выбирается клиентом (`CompressionAlgorithm`) и кодируется в `FLAGS` кадра.
-- Ordering/replay policy на прикладных кадрах: ожидается строго возрастающий `SEQUENCE` per `SESSION`; при нарушении сессия закрывается.
+Правила:
 
-Crypto-handshake (transport encryption):
-- Используется handshake версии `v2` (магии `TSC2`/`TSS2`).
-- Клиент передаёт выбранный AEAD-алгоритм в `ClientHello`.
-- Сервер отвечает `ServerHello` с подтверждённым алгоритмом (в текущей реализации равным выбору клиента).
-- При несовпадении/неподдерживаемом алгоритме handshake завершается ошибкой.
+- максимум `PAYLOAD`: `1 MiB` (`ProtocolConstants.MaxPayloadLength`)
+- сервер принимает `v1` и `v2`; версия фиксируется первым кадром
+- клиент валидирует версию ответов и закрывает туннель при несовпадении
+- для `v2` алгоритм компрессии кодируется во `FLAGS`
+- при нарушении monotonic `SEQUENCE` сессия закрывается (ordering/replay policy)
 
-## Ограничения текущей версии
+Crypto-handshake:
 
-- Нет ротации ключей.
-- При нарушении sequence policy сессия закрывается без механизма selective recovery/retransmit.
-- Session migration/resume выполняется best-effort: при длительном недоступном upstream или ошибке повторного `CONNECT` конкретная сессия завершается.
+- версия `v2`, магии `TSC2`/`TSS2`
+- pre-shared key + HMAC + timestamp + handshake counter
+- защита от replay через bounded cache и replay window
+- клиент выбирает `TunnelCipherAlgorithm`, сервер подтверждает поддерживаемый алгоритм
+- HKDF разделяет материал на MAC-key и transport-key
+- после handshake все кадры идут через AEAD duplex stream
+- nonce policy: base nonce + counter, с защитой от overflow
 
-## Результат матрицы производительности (Release)
+Поддерживаемые AEAD:
 
-Тесты:
-- `PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_Matrix_MixedNoisePayload`
-- `PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_Matrix_CompressiblePayload`
+- `ChaCha20-Poly1305`
+- `AES-256-GCM`
+- `AEGIS-128L`
+- `AEGIS-256`
 
-Параметры: `128 MiB`, `64 KiB`, `4 streams`.
+### Ключевые архитектурные решения
 
-| Payload | Cipher | Compression | Throughput (MiB/s) | Alloc/MiB (bytes) | Tunnel C->S (bytes) | Tunnel S->C (bytes) | Tunnel Total (bytes) |
-|---|---|---|---:|---:|---:|---:|---:|
-| `MixedNoise` | `ChaCha20Poly1305` | `off` | 125.76 | 2 283 688 | 134 701 115 | 134 701 115 | 269 402 230 |
-| `MixedNoise` | `ChaCha20Poly1305` | `Deflate` | 80.56 | 2 431 463 | 134 701 056 | 134 701 056 | 269 402 112 |
-| `MixedNoise` | `ChaCha20Poly1305` | `Gzip` | 80.68 | 2 397 237 | 134 701 056 | 134 701 056 | 269 402 112 |
-| `MixedNoise` | `ChaCha20Poly1305` | `Brotli` | 107.72 | 2 374 116 | 134 701 056 | 134 701 056 | 269 402 112 |
-| `MixedNoise` | `Aes256Gcm` | `off` | 233.40 | 2 246 878 | 134 701 115 | 134 701 115 | 269 402 230 |
-| `MixedNoise` | `Aes256Gcm` | `Deflate` | 108.50 | 2 379 194 | 134 701 056 | 134 701 056 | 269 402 112 |
-| `MixedNoise` | `Aes256Gcm` | `Gzip` | 115.03 | 2 380 323 | 134 701 056 | 134 701 056 | 269 402 112 |
-| `MixedNoise` | `Aes256Gcm` | `Brotli` | 124.48 | 2 361 796 | 134 701 056 | 134 701 056 | 269 402 112 |
-| `MixedNoise` | `Aegis128L` | `off` | 307.71 | 2 209 200 | 134 963 200 | 134 963 200 | 269 926 400 |
-| `MixedNoise` | `Aegis128L` | `Deflate` | 111.68 | 2 344 754 | 134 963 200 | 134 963 200 | 269 926 400 |
-| `MixedNoise` | `Aegis128L` | `Gzip` | 116.16 | 2 344 999 | 134 963 200 | 134 963 200 | 269 926 400 |
-| `MixedNoise` | `Aegis128L` | `Brotli` | 131.80 | 2 321 708 | 134 963 200 | 134 963 200 | 269 926 400 |
-| `MixedNoise` | `Aegis256` | `off` | 265.81 | 2 208 204 | 134 963 401 | 134 963 473 | 269 926 874 |
-| `MixedNoise` | `Aegis256` | `Deflate` | 101.85 | 2 349 263 | 134 963 200 | 134 963 200 | 269 926 400 |
-| `MixedNoise` | `Aegis256` | `Gzip` | 112.55 | 2 352 110 | 134 963 200 | 134 963 200 | 269 926 400 |
-| `MixedNoise` | `Aegis256` | `Brotli` | 130.85 | 2 322 812 | 134 963 200 | 134 963 200 | 269 926 400 |
-| `Compressible` | `ChaCha20Poly1305` | `off` | 160.65 | 2 268 136 | 134 701 095 | 134 701 115 | 269 402 210 |
-| `Compressible` | `ChaCha20Poly1305` | `Deflate` | 45.27 | 2 314 580 | 1 675 196 | 1 908 736 | 3 583 932 |
-| `Compressible` | `ChaCha20Poly1305` | `Gzip` | 50.09 | 2 316 012 | 1 824 332 | 2 056 192 | 3 880 524 |
-| `Compressible` | `ChaCha20Poly1305` | `Brotli` | 45.77 | 2 264 238 | 481 812 | 704 512 | 1 186 324 |
-| `Compressible` | `Aes256Gcm` | `off` | 268.00 | 2 246 197 | 134 701 056 | 134 701 056 | 269 402 112 |
-| `Compressible` | `Aes256Gcm` | `Deflate` | 46.10 | 2 316 333 | 1 679 356 | 1 908 736 | 3 588 092 |
-| `Compressible` | `Aes256Gcm` | `Gzip` | 43.35 | 2 324 447 | 1 820 975 | 2 056 275 | 3 877 250 |
-| `Compressible` | `Aes256Gcm` | `Brotli` | 46.25 | 2 272 538 | 482 452 | 704 512 | 1 186 964 |
-| `Compressible` | `Aegis128L` | `off` | 356.63 | 2 206 362 | 134 963 492 | 134 963 382 | 269 926 874 |
-| `Compressible` | `Aegis128L` | `Deflate` | 48.28 | 2 290 891 | 1 751 732 | 2 170 880 | 3 922 612 |
-| `Compressible` | `Aegis128L` | `Gzip` | 46.09 | 2 299 479 | 1 895 948 | 2 318 336 | 4 214 284 |
-| `Compressible` | `Aegis128L` | `Brotli` | 40.73 | 2 247 869 | 560 252 | 966 656 | 1 526 908 |
-| `Compressible` | `Aegis256` | `off` | 287.21 | 2 207 305 | 134 963 274 | 134 963 291 | 269 926 565 |
-| `Compressible` | `Aegis256` | `Deflate` | 44.51 | 2 290 230 | 1 755 358 | 2 170 880 | 3 926 238 |
-| `Compressible` | `Aegis256` | `Gzip` | 48.43 | 2 298 841 | 1 897 676 | 2 318 336 | 4 216 012 |
-| `Compressible` | `Aegis256` | `Brotli` | 49.31 | 2 256 725 | 562 628 | 966 656 | 1 529 284 |
+1. Multiplexing нескольких session в одном TCP-туннеле
+- снижает overhead на соединения и упрощает управление reconnect.
 
-Вывод:
-- на профиле `MixedNoise` сжатие практически не уменьшает tunnel traffic, что и ожидается для данных, похожих на случайный шум; при дефолтном `64 KiB` chunk `compression=off` ожидаемо быстрее compression-вариантов;
-- на профиле `Compressible` `Deflate`/`Gzip`/`Brotli` резко уменьшают объём tunnel traffic, причём `Brotli` даёт минимальный трафик в этой матрице;
-- throughput здесь зависит от конкретной реализации алгоритма и текущего хоста, а не только от степени сжатия;
-- смена дефолтного chunk size с `16 KiB` на `64 KiB` убрала вводящий в заблуждение latency-bound сценарий: `off` больше не выглядит аномально медленным на шумовых данных.
+2. Sticky-привязка SOCKS5 TCP-сессии к выбранному tunnel-серверу
+- предотвращает дрейф long-lived сессий между серверами при `round-robin`.
 
-## Следующие шаги
+3. Reconnect + session migration/resume
+- при разрыве туннеля клиент пытается прозрачно восстановить активные session.
 
-1. Добавить ротацию pre-shared key и процедуру key update.
-2. Добавить метрики по sequence violations и отказам сессий.
-3. Добавить persist replay-cache (или distributed replay-cache) для multi-instance server deployment.
-4. Добавить deadline/timeout policy для операции session-resume (отдельно от reconnect policy).
+4. Неблокирующий `CONNECT` на сервере
+- медленные upstream-коннекты не должны блокировать read-loop всего туннеля.
+
+5. Вынесенный protocol/crypto слой
+- `Protocol` изолирован от хостов и может эволюционировать отдельно.
+
+6. Опциональная компрессия только в `v2`
+- позволяет сохранять совместимость с `v1` и гибко выбирать профиль трафика.
+
+### Ограничения текущей версии
+
+- Нет ротации pre-shared key.
+- Нет selective recovery/retransmit при sequence-ошибках.
+- Session resume best-effort: конкретная сессия может завершиться при неуспешном re-`CONNECT`.
+- SOCKS5 UDP relay поддерживает только `FRAG=0`.
+- Android VPN MVP не поддерживает режим `Private DNS`/DoT (`:853`) через текущий pipeline.
+
+### Следующие итерации
+
+1. Добавить ротацию ключей и key-update процедуру.
+2. Добавить метрики по sequence violations, reconnect и session-failures.
+3. Добавить persist/distributed replay-cache для multi-instance серверов.
+4. Ввести отдельные timeout/deadline policy для session-resume.
+
