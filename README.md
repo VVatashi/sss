@@ -16,6 +16,7 @@
   - [Сборка из исходников](#сборка-из-исходников)
   - [Тестирование](#тестирование)
   - [Архитектура решения](#архитектура-решения)
+  - [Логирование](#логирование)
   - [Детальный разбор протокола](#детальный-разбор-протокола)
   - [Ключевые архитектурные решения](#ключевые-архитектурные-решения)
   - [Ограничения текущей версии](#ограничения-текущей-версии)
@@ -54,23 +55,25 @@ SimpleShadowsocks позволяет поднять защищенный TCP/UDP
 
 Актуально на 16 марта 2026 года (данные из GitHub Releases):
 
-- Последний релиз: [`v0.1.0`](https://github.com/VVatashi/sss/releases/tag/v0.1.0)
-- Дата публикации: `2026-03-15 21:18:22 UTC`
+- Последний релиз: [`v0.2.0`](https://github.com/VVatashi/sss/releases/tag/v0.2.0)
+- Дата публикации: `2026-03-16 15:18:11 UTC`
+- Описание релиза: `Add UDP support`
+- Предыдущий релиз: [`v0.1.0`](https://github.com/VVatashi/sss/releases/tag/v0.1.0)
 
-Доступные артефакты релиза `v0.1.0`:
+Доступные артефакты релиза `v0.2.0`:
 
 - Сервер:
-  - [`server-win-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/server-win-x64.zip)
-  - [`server-linux-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/server-linux-x64.zip)
-  - [`server-osx-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/server-osx-x64.zip)
-  - [`server-osx-arm64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/server-osx-arm64.zip)
+  - [`server-win-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.2.0/server-win-x64.zip)
+  - [`server-linux-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.2.0/server-linux-x64.zip)
+  - [`server-osx-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.2.0/server-osx-x64.zip)
+  - [`server-osx-arm64.zip`](https://github.com/VVatashi/sss/releases/download/v0.2.0/server-osx-arm64.zip)
 - Клиент CLI:
-  - [`client-win-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/client-win-x64.zip)
-  - [`client-linux-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/client-linux-x64.zip)
-  - [`client-osx-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/client-osx-x64.zip)
-  - [`client-osx-arm64.zip`](https://github.com/VVatashi/sss/releases/download/v0.1.0/client-osx-arm64.zip)
+  - [`client-win-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.2.0/client-win-x64.zip)
+  - [`client-linux-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.2.0/client-linux-x64.zip)
+  - [`client-osx-x64.zip`](https://github.com/VVatashi/sss/releases/download/v0.2.0/client-osx-x64.zip)
+  - [`client-osx-arm64.zip`](https://github.com/VVatashi/sss/releases/download/v0.2.0/client-osx-arm64.zip)
 - Android:
-  - [`com.simpleshadowsocks.client.maui-Signed.apk`](https://github.com/VVatashi/sss/releases/download/v0.1.0/com.simpleshadowsocks.client.maui-Signed.apk)
+  - [`com.simpleshadowsocks.client.maui-Signed.apk`](https://github.com/VVatashi/sss/releases/download/v0.2.0/com.simpleshadowsocks.client.maui-Signed.apk)
 
 ### Установка и настройка
 
@@ -236,8 +239,11 @@ dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c R
 # macOS ARM64
 dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r osx-arm64 --self-contained false
 dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r osx-arm64 --self-contained false
+```
 
-# Android
+MAUI/Android publish рекомендуется выполнять в отдельном подготовленном окружении (CI или выделенная Android build-машина), а не в обычном локальном контуре разработки.
+
+```powershell
 dotnet publish src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csproj -c Release -f net9.0-android
 ```
 
