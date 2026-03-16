@@ -1,6 +1,9 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using SimpleShadowsocks.Client.Tunnel;
+using SimpleShadowsocks.Protocol;
+using SimpleShadowsocks.Protocol.Crypto;
 using SimpleShadowsocks.Server.Tunnel;
 
 namespace SimpleShadowsocks.Client.Tests;
@@ -57,6 +60,63 @@ public sealed partial class TunnelIntegrationTests
         await stream2.WriteAsync(TestNetwork.BuildConnectRequestIPv4(IPAddress.Loopback, echo.Port));
         var secondConnect = await TestNetwork.ReadExactAsync(stream2, 10);
         Assert.NotEqual((byte)0x00, secondConnect[1]);
+    }
+
+    [Fact]
+    public async Task Socks5Client_FailsOverToNextTunnelServer_WhenFirstServerRejectsConnect()
+    {
+        await using var echo = await TestNetwork.StartEchoServerAsync();
+        await using var tunnelA = await TestNetwork.StartTunnelServerAsync(new TunnelServerPolicy
+        {
+            MaxConcurrentTunnels = 32,
+            MaxSessionsPerTunnel = 1
+        });
+        await using var tunnelB = await TestNetwork.StartTunnelServerAsync();
+        await using var socks = await TestNetwork.StartSocksServerAsync(
+            new (string Host, int Port)[]
+            {
+                ("127.0.0.1", tunnelA.Port),
+                ("127.0.0.1", tunnelB.Port)
+            });
+
+        await using var occupier = new TunnelClientMultiplexer(
+            "127.0.0.1",
+            tunnelA.Port,
+            PreSharedKey.Derive32Bytes("dev-shared-key"),
+            TunnelCryptoPolicy.Default,
+            TunnelConnectionPolicy.Default);
+
+        var (occupiedSessionId, occupiedReply, _) = await occupier.OpenSessionAsync(
+            new ConnectRequest(AddressType.IPv4, "127.0.0.1", (ushort)echo.Port),
+            CancellationToken.None);
+        Assert.Equal((byte)0x00, occupiedReply);
+
+        try
+        {
+            await RunSingleSocksEchoRequestAsync(socks.Port, echo.Port, "failover-connect");
+        }
+        finally
+        {
+            await occupier.CloseSessionAsync(occupiedSessionId, 0x00, CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task Connect_WithUnresolvableDomain_ReturnsHostUnreachable()
+    {
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var socks = await TestNetwork.StartSocksServerAsync(tunnel.Port);
+        using var tcpClient = await TestNetwork.ConnectAsync(socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        var greeting = await TestNetwork.ReadExactAsync(stream, 2);
+        Assert.Equal(new byte[] { 0x05, 0x00 }, greeting);
+
+        var connectRequest = TestNetwork.BuildConnectRequestDomain("nonexistent.invalid", 80);
+        await stream.WriteAsync(connectRequest);
+        var connectResponse = await TestNetwork.ReadExactAsync(stream, 10);
+        Assert.Equal((byte)0x04, connectResponse[1]);
     }
 
     private static async Task RunSingleSocksEchoRequestAsync(int socksPort, int echoPort, string message)

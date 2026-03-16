@@ -64,20 +64,22 @@ Console.CancelKeyPress += (_, eventArgs) =>
     cts.Cancel();
 };
 
-Console.WriteLine("SimpleShadowsocks.Client");
-Console.WriteLine($"SOCKS5 listen: 127.0.0.1:{listenPort}");
+StructuredLog.Info("client-host", "CONTROL", "SimpleShadowsocks.Client started");
+StructuredLog.Info("client-host", "SOCKS5", $"listen=127.0.0.1:{listenPort}");
 if (remoteServers.Count > 0)
 {
-    Console.WriteLine($"Tunnel servers ({remoteServers.Count}): {string.Join(", ", remoteServers.Select(s => $"{s.Item1}:{s.Item2}"))}");
+    StructuredLog.Info("client-host", "TUNNEL/TCP", $"servers={string.Join(", ", remoteServers.Select(s => $"{s.Item1}:{s.Item2}"))}");
 }
 else
 {
-    Console.WriteLine($"Tunnel server: {remoteHost}:{remotePort}");
+    StructuredLog.Info("client-host", "TUNNEL/TCP", $"server={remoteHost}:{remotePort}");
 }
-Console.WriteLine($"Protocol version: {ProtocolConstants.Version}");
-Console.WriteLine($"Configured tunnel protocol: v{protocolVersion}, compression={(enableCompression ? "on" : "off")} ({compressionAlgorithm})");
-Console.WriteLine($"Configured AEAD: {tunnelCipherAlgorithm}");
-Console.WriteLine("Press Ctrl+C to stop.");
+StructuredLog.Info("client-host", "CONTROL", $"protocol_version={ProtocolConstants.Version}");
+StructuredLog.Info(
+    "client-host",
+    "TUNNEL/TCP",
+    $"configured_tunnel_protocol=v{protocolVersion}, compression={(enableCompression ? "on" : "off")}({compressionAlgorithm}), aead={tunnelCipherAlgorithm}");
+StructuredLog.Info("client-host", "CONTROL", "press Ctrl+C to stop");
 
 var server = remoteServers.Count > 0
     ? new Socks5Server(

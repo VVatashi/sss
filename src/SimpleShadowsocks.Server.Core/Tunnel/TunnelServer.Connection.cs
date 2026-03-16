@@ -299,9 +299,51 @@ public sealed partial class TunnelServer
             return;
         }
 
-        var datagram = ProtocolPayloadSerializer.DeserializeUdpDatagram(frame.Payload.Span);
-        var remoteEndPoint = await ResolveRemoteEndPointAsync(datagram, cancellationToken);
-        await udpSession.UpstreamClient.SendAsync(datagram.Payload.ToArray(), remoteEndPoint, cancellationToken);
+        UdpDatagram datagram;
+        IPEndPoint remoteEndPoint;
+        try
+        {
+            datagram = ProtocolPayloadSerializer.DeserializeUdpDatagram(frame.Payload.Span);
+            remoteEndPoint = await ResolveRemoteEndPointAsync(datagram, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            StructuredLog.Error("tunnel-server", "TUNNEL/UDP", "invalid UDP payload", ex, frame.SessionId);
+            await CloseSessionAsync(
+                sessions,
+                frame.SessionId,
+                sendCloseToClient: true,
+                secureStream,
+                writeLock,
+                writeOptions,
+                CancellationToken.None);
+            return;
+        }
+
+        try
+        {
+            await udpSession.UpstreamClient.SendAsync(datagram.Payload.ToArray(), remoteEndPoint, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            StructuredLog.Error("tunnel-server", "TUNNEL/UDP", "upstream UDP send failed", ex, frame.SessionId);
+            await CloseSessionAsync(
+                sessions,
+                frame.SessionId,
+                sendCloseToClient: true,
+                secureStream,
+                writeLock,
+                writeOptions,
+                CancellationToken.None);
+        }
     }
 
     private static async Task HandleCloseFrameAsync(
@@ -377,7 +419,8 @@ public sealed partial class TunnelServer
         }
 
         var addresses = await Dns.GetHostAddressesAsync(datagram.Address, cancellationToken);
-        var selected = addresses.FirstOrDefault(ip => ip.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6);
+        var selected = addresses.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork)
+            ?? addresses.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetworkV6);
         if (selected is null)
         {
             throw new InvalidDataException($"Unable to resolve UDP destination '{datagram.Address}'.");

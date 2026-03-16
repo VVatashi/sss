@@ -62,8 +62,14 @@ public sealed partial class TunnelServer
             catch (Exception ex)
             {
                 upstreamClient.Dispose();
-                Console.WriteLine($"[tunnel] connect failed {request.Address}:{request.Port} ({ex.Message})");
-                await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x05, writeLock, writeOptions, cancellationToken);
+                var replyCode = MapUpstreamConnectFailureToReplyCode(ex, cancellationToken);
+                StructuredLog.Error(
+                    "tunnel-server",
+                    "TUNNEL/TCP",
+                    $"upstream connect failed target={request.Address}:{request.Port} reply={replyCode}",
+                    ex,
+                    frame.SessionId);
+                await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode, writeLock, writeOptions, cancellationToken);
                 return;
             }
 
@@ -115,7 +121,11 @@ public sealed partial class TunnelServer
                 }
             }, context.Cancellation.Token);
 
-            Console.WriteLine($"[tunnel] proxy {request.Address}:{request.Port} session={frame.SessionId}");
+            StructuredLog.Info(
+                "tunnel-server",
+                "TUNNEL/TCP",
+                $"session opened target={request.Address}:{request.Port}",
+                frame.SessionId);
             await SendConnectReplyAsync(secureStream, frame.SessionId, replyCode: 0x00, writeLock, writeOptions, cancellationToken);
         }
         finally
@@ -236,6 +246,7 @@ public sealed partial class TunnelServer
                 }
                 finally
                 {
+                    StructuredLog.Info("tunnel-server", "TUNNEL/UDP", "session closed", context.SessionId);
                     await CloseSessionAsync(
                         sessions,
                         context.SessionId,
@@ -247,6 +258,7 @@ public sealed partial class TunnelServer
                 }
             }, context.Cancellation.Token);
 
+            StructuredLog.Info("tunnel-server", "TUNNEL/UDP", "session opened", frame.SessionId);
             await SendUdpAssociateReplyAsync(secureStream, frame.SessionId, replyCode: 0x00, writeLock, writeOptions, cancellationToken);
         }
         finally
@@ -332,5 +344,37 @@ public sealed partial class TunnelServer
         {
             throw new TimeoutException($"Connect timeout after {connectTimeoutMs} ms.");
         }
+    }
+
+    private static byte MapUpstreamConnectFailureToReplyCode(Exception exception, CancellationToken cancellationToken)
+    {
+        if (exception is OperationCanceledException && cancellationToken.IsCancellationRequested)
+        {
+            return 0x01;
+        }
+
+        if (exception is TimeoutException)
+        {
+            return 0x04; // Host unreachable.
+        }
+
+        if (exception is InvalidDataException or FormatException or ArgumentException or NotSupportedException)
+        {
+            return 0x08; // Address type not supported / invalid target format.
+        }
+
+        if (exception is SocketException socketException)
+        {
+            return socketException.SocketErrorCode switch
+            {
+                SocketError.NetworkUnreachable or SocketError.NetworkDown or SocketError.NetworkReset => 0x03,
+                SocketError.HostUnreachable or SocketError.HostNotFound or SocketError.NoData or SocketError.TryAgain or SocketError.TimedOut => 0x04,
+                SocketError.ConnectionRefused => 0x05,
+                SocketError.AddressFamilyNotSupported or SocketError.AddressNotAvailable => 0x08,
+                _ => 0x01
+            };
+        }
+
+        return 0x01;
     }
 }

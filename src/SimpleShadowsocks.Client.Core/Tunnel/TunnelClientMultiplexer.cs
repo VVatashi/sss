@@ -92,6 +92,11 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
             {
                 _sessions.TryRemove(sessionId, out _);
                 state.ReaderWriter.Writer.TryComplete();
+                StructuredLog.Warn("tunnel-client", "TUNNEL/TCP", $"session open rejected reply={replyCode}", sessionId);
+            }
+            else
+            {
+                StructuredLog.Info("tunnel-client", "TUNNEL/TCP", $"session opened target={connectRequest.Address}:{connectRequest.Port}", sessionId);
             }
 
             return (sessionId, replyCode, state.ReaderWriter.Reader);
@@ -128,11 +133,17 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
             {
                 _sessions.TryRemove(sessionId, out _);
                 state.UdpReaderWriter?.Writer.TryComplete();
+                StructuredLog.Warn("tunnel-client", "TUNNEL/UDP", $"session open rejected reply={replyCode}", sessionId);
             }
 
             if (state.UdpReaderWriter is null)
             {
                 throw new InvalidOperationException("UDP session is not initialized.");
+            }
+
+            if (replyCode == 0x00)
+            {
+                StructuredLog.Info("tunnel-client", "TUNNEL/UDP", "session opened", sessionId);
             }
 
             return (sessionId, replyCode, state.UdpReaderWriter.Reader);
@@ -175,6 +186,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
 
             state.ReaderWriter?.Writer.TryComplete();
             state.UdpReaderWriter?.Writer.TryComplete();
+            StructuredLog.Info("tunnel-client", state.IsUdp ? "TUNNEL/UDP" : "TUNNEL/TCP", "session closed", sessionId);
         }
     }
 

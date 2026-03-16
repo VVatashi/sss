@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
 
 namespace SimpleShadowsocks.Server.Tunnel;
@@ -50,6 +51,7 @@ public sealed partial class TunnelServer
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         _listener.Start();
+        StructuredLog.Info("tunnel-server", "TUNNEL/TCP", $"listening on {_listener.LocalEndpoint}");
 
         try
         {
@@ -58,11 +60,19 @@ public sealed partial class TunnelServer
                 var tunnelClient = await _listener.AcceptTcpClientAsync(cancellationToken);
                 if (!TryAcquireTunnelSlot())
                 {
+                    StructuredLog.Warn(
+                        "tunnel-server",
+                        "TUNNEL/TCP",
+                        $"reject connection remote={tunnelClient.Client.RemoteEndPoint}: max concurrent tunnels reached");
                     tunnelClient.Dispose();
                     continue;
                 }
 
                 Interlocked.Increment(ref _acceptedTunnelConnections);
+                StructuredLog.Info(
+                    "tunnel-server",
+                    "TUNNEL/TCP",
+                    $"accepted tunnel connection remote={tunnelClient.Client.RemoteEndPoint} local={tunnelClient.Client.LocalEndPoint}");
                 _ = Task.Run(
                     () => HandleTunnelSafelyAsync(tunnelClient, cancellationToken),
                     cancellationToken);
@@ -74,6 +84,7 @@ public sealed partial class TunnelServer
         finally
         {
             _listener.Stop();
+            StructuredLog.Info("tunnel-server", "TUNNEL/TCP", "listener stopped");
         }
     }
 
@@ -90,7 +101,7 @@ public sealed partial class TunnelServer
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[tunnel] client failed: {ex.Message}");
+                StructuredLog.Error("tunnel-server", "TUNNEL/TCP", "tunnel client failed", ex);
             }
             finally
             {

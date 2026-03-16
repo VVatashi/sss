@@ -21,12 +21,13 @@ public sealed partial class Socks5Server
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[socks5] connect failed {request.Host}:{request.Port} ({ex.Message})");
+            StructuredLog.Error("socks5-server", "SOCKS5/TCP", $"direct connect failed target={request.Host}:{request.Port}", ex);
             await SendReplyAsync(clientStream, replyCode: 0x05, null, cancellationToken);
             return;
         }
 
         var boundEndPoint = upstream.Client.LocalEndPoint as IPEndPoint;
+        StructuredLog.Info("socks5-server", "SOCKS5/TCP", $"direct connect established target={request.Host}:{request.Port}");
         await SendReplyAsync(clientStream, replyCode: 0x00, boundEndPoint, cancellationToken);
 
         using var upstreamStream = upstream.GetStream();
@@ -36,33 +37,81 @@ public sealed partial class Socks5Server
     private async Task HandleViaTunnelAsync(
         NetworkStream clientStream,
         Socks5ConnectRequest request,
-        TunnelClientMultiplexer multiplexer,
+        IReadOnlyList<TunnelClientMultiplexer> multiplexers,
         CancellationToken cancellationToken)
     {
         var connectRequest = new ConnectRequest(ToProtocolAddressType(request.AddressType), request.Host, (ushort)request.Port);
-        uint sessionId;
-        byte replyCode;
-        ChannelReader<byte[]> reader;
-        try
+        byte lastReplyCode = 0x01;
+        Exception? lastOpenError = null;
+
+        for (var attempt = 0; attempt < multiplexers.Count; attempt++)
         {
-            (sessionId, replyCode, reader) = await multiplexer.OpenSessionAsync(connectRequest, cancellationToken);
+            var multiplexer = multiplexers[attempt];
+            var isFinalAttempt = attempt == multiplexers.Count - 1;
+
+            uint sessionId;
+            byte replyCode;
+            ChannelReader<byte[]> reader;
+            try
+            {
+                (sessionId, replyCode, reader) = await multiplexer.OpenSessionAsync(connectRequest, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                lastOpenError = ex;
+                if (isFinalAttempt)
+                {
+                    StructuredLog.Error("socks5-server", "TUNNEL/TCP", "all tunnel servers failed to open CONNECT session", ex);
+                }
+                else
+                {
+                    StructuredLog.Warn("socks5-server", "TUNNEL/TCP", "tunnel server failed to open CONNECT session; trying next");
+                }
+
+                continue;
+            }
+
+            if (replyCode != 0x00)
+            {
+                lastReplyCode = replyCode;
+                if (isFinalAttempt)
+                {
+                    StructuredLog.Error(
+                        "socks5-server",
+                        "TUNNEL/TCP",
+                        $"all tunnel servers rejected CONNECT target={request.Host}:{request.Port} final_reply={replyCode}",
+                        new IOException("No tunnel server accepted CONNECT."),
+                        sessionId);
+                }
+                else
+                {
+                    StructuredLog.Warn(
+                        "socks5-server",
+                        "TUNNEL/TCP",
+                        $"tunnel server rejected CONNECT target={request.Host}:{request.Port} reply={replyCode}; trying next",
+                        sessionId);
+                }
+
+                continue;
+            }
+
+            StructuredLog.Info(
+                "socks5-server",
+                "TUNNEL/TCP",
+                $"tunnel session opened target={request.Host}:{request.Port}",
+                sessionId);
+            await SendReplyAsync(clientStream, replyCode: 0x00, new IPEndPoint(IPAddress.Any, 0), cancellationToken);
+            await RelayViaTunnelAsync(clientStream, multiplexer, reader, sessionId, cancellationToken);
+            return;
         }
-        catch (Exception ex)
+
+        if (lastOpenError is not null && lastReplyCode == 0x01)
         {
-            Console.WriteLine($"[socks5] tunnel connect failed ({ex.Message})");
             await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
             return;
         }
 
-        if (replyCode != 0x00)
-        {
-            Console.WriteLine($"[socks5] connect failed {request.Host}:{request.Port} (remote reply={replyCode})");
-            await SendReplyAsync(clientStream, replyCode, null, cancellationToken);
-            return;
-        }
-
-        await SendReplyAsync(clientStream, replyCode: 0x00, new IPEndPoint(IPAddress.Any, 0), cancellationToken);
-        await RelayViaTunnelAsync(clientStream, multiplexer, reader, sessionId, cancellationToken);
+        await SendReplyAsync(clientStream, replyCode: lastReplyCode, null, cancellationToken);
     }
 
     private static async Task RelayViaTunnelAsync(
@@ -117,6 +166,7 @@ public sealed partial class Socks5Server
             try
             {
                 await multiplexer.CloseSessionAsync(sessionId, 0x00, CancellationToken.None);
+                StructuredLog.Info("socks5-server", "TUNNEL/TCP", "tunnel session closed", sessionId);
             }
             catch
             {
@@ -135,6 +185,7 @@ public sealed partial class Socks5Server
 
         var requestedClientEndPoint = TryGetRequestedUdpClientEndPoint(request);
         IPEndPoint? activeClientEndPoint = requestedClientEndPoint;
+        var fragmentReassembler = new Socks5UdpFragmentReassembler();
 
         using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var relayToken = relayCts.Token;
@@ -157,8 +208,24 @@ public sealed partial class Socks5Server
                         continue;
                     }
 
-                    var destinationEndPoint = await ResolveUdpRemoteEndPointAsync(requestDatagram, relayToken);
-                    await udpRelay.SendAsync(requestDatagram.Payload.ToArray(), destinationEndPoint, relayToken);
+                    if (!fragmentReassembler.TryReassemble(requestDatagram, out var assembledDatagram))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        var destinationEndPoint = await ResolveUdpRemoteEndPointAsync(assembledDatagram, relayToken);
+                        await udpRelay.SendAsync(assembledDatagram.Payload.ToArray(), destinationEndPoint, relayToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch
+                    {
+                    }
+
                     continue;
                 }
 
@@ -167,12 +234,22 @@ public sealed partial class Socks5Server
                     continue;
                 }
 
-                var responseDatagram = BuildUdpRequestDatagram(
-                    ToProtocolAddressType(received.RemoteEndPoint.Address),
-                    received.RemoteEndPoint.Address.ToString(),
-                    (ushort)received.RemoteEndPoint.Port,
-                    received.Buffer);
-                await udpRelay.SendAsync(responseDatagram, activeClientEndPoint, relayToken);
+                try
+                {
+                    var responseDatagram = BuildUdpRequestDatagram(
+                        ToProtocolAddressType(received.RemoteEndPoint.Address),
+                        received.RemoteEndPoint.Address.ToString(),
+                        (ushort)received.RemoteEndPoint.Port,
+                        received.Buffer);
+                    await udpRelay.SendAsync(responseDatagram, activeClientEndPoint, relayToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                }
             }
         }, relayToken);
 
@@ -203,16 +280,19 @@ public sealed partial class Socks5Server
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[socks5] tunnel udp associate failed ({ex.Message})");
+            StructuredLog.Error("socks5-server", "TUNNEL/UDP", "tunnel udp session open failed", ex);
             await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
             return;
         }
 
         if (replyCode != 0x00)
         {
+            StructuredLog.Warn("socks5-server", "TUNNEL/UDP", $"tunnel udp associate rejected reply={replyCode}", sessionId);
             await SendReplyAsync(clientStream, replyCode, null, cancellationToken);
             return;
         }
+
+        StructuredLog.Info("socks5-server", "TUNNEL/UDP", "tunnel udp session opened", sessionId);
 
         using var udpRelay = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
         var relayEndPoint = (IPEndPoint)udpRelay.Client.LocalEndPoint!;
@@ -220,6 +300,7 @@ public sealed partial class Socks5Server
 
         var requestedClientEndPoint = TryGetRequestedUdpClientEndPoint(request);
         IPEndPoint? activeClientEndPoint = requestedClientEndPoint;
+        var fragmentReassembler = new Socks5UdpFragmentReassembler();
 
         using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var relayToken = relayCts.Token;
@@ -245,7 +326,22 @@ public sealed partial class Socks5Server
                     continue;
                 }
 
-                await multiplexer.SendUdpDataAsync(sessionId, requestDatagram, relayToken);
+                if (!fragmentReassembler.TryReassemble(requestDatagram, out var assembledDatagram))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    await multiplexer.SendUdpDataAsync(sessionId, assembledDatagram, relayToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                }
             }
         }, relayToken);
 
@@ -258,12 +354,22 @@ public sealed partial class Socks5Server
                     continue;
                 }
 
-                var socksDatagram = BuildUdpRequestDatagram(
-                    datagram.AddressType,
-                    datagram.Address,
-                    datagram.Port,
-                    datagram.Payload.Span);
-                await udpRelay.SendAsync(socksDatagram, activeClientEndPoint, relayToken);
+                try
+                {
+                    var socksDatagram = BuildUdpRequestDatagram(
+                        datagram.AddressType,
+                        datagram.Address,
+                        datagram.Port,
+                        datagram.Payload.Span);
+                    await udpRelay.SendAsync(socksDatagram, activeClientEndPoint, relayToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                }
             }
         }, relayToken);
 
@@ -282,6 +388,7 @@ public sealed partial class Socks5Server
             try
             {
                 await multiplexer.CloseSessionAsync(sessionId, 0x00, CancellationToken.None);
+                StructuredLog.Info("socks5-server", "TUNNEL/UDP", "tunnel udp session closed", sessionId);
             }
             catch
             {
@@ -346,7 +453,8 @@ public sealed partial class Socks5Server
         }
 
         var addresses = await Dns.GetHostAddressesAsync(datagram.Address, cancellationToken);
-        var selected = addresses.FirstOrDefault(ip => ip.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6);
+        var selected = addresses.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork)
+            ?? addresses.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetworkV6);
         if (selected is null)
         {
             throw new InvalidDataException($"Failed to resolve UDP destination: {datagram.Address}");

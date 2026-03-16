@@ -236,6 +236,9 @@ dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c R
 # macOS ARM64
 dotnet publish src\SimpleShadowsocks.Server\SimpleShadowsocks.Server.csproj -c Release -r osx-arm64 --self-contained false
 dotnet publish src\SimpleShadowsocks.Client\SimpleShadowsocks.Client.csproj -c Release -r osx-arm64 --self-contained false
+
+# Android
+dotnet publish src\SimpleShadowsocks.Client.Maui\SimpleShadowsocks.Client.Maui.csproj -c Release -f net9.0-android
 ```
 
 Результаты публикации:
@@ -257,6 +260,13 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - `Integration`
 - `Performance`
 
+Ключевые сценарии, покрытые тестами:
+
+- TCP: SOCKS5 `CONNECT` (standalone + через tunnel), relay данных, классифицированные коды ошибок upstream на сервере, failover на следующий tunnel-сервер при отказе `CONNECT`.
+- UDP: SOCKS5 `UDP ASSOCIATE` работает только через tunnel и UDP relay на сервере; relay датаграмм до IP и domain (`localhost`), поддержка и тесты реассамблинга фрагментов `FRAG`.
+- Performance: отдельный UDP benchmark-тест для `UDP ASSOCIATE` через tunnel (throughput + packets/sec).
+- Наблюдаемость: при `UDP ASSOCIATE` без tunnel backend пишется явный лог `UDP disabled: no tunnel backend` и инкрементируется .NET-метрика `socks5_udp_associate_rejected_no_tunnel_backend_total`.
+
 Скрипт последовательного запуска:
 
 ```powershell
@@ -276,6 +286,15 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj --filter "Category=Integration"
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj --filter "Category=Performance"
 ```
+
+Полезные переменные окружения для performance-тестов (стабилизация под слабые/загруженные машины):
+
+- `SS_PERF_TOTAL_MB` (по умолчанию `128`)
+- `SS_PERF_CHUNK_KB` (по умолчанию `64`)
+- `SS_PERF_STREAMS` (по умолчанию `4`)
+- `SS_PERF_PAYLOAD_VARIANTS` (по умолчанию `256`)
+- `SS_PERF_WARMUP_TIMEOUT_SEC` (по умолчанию `90`)
+- `SS_PERF_MEASUREMENT_TIMEOUT_SEC` (по умолчанию `600`)
 
 ### Архитектура решения
 
@@ -302,6 +321,29 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - `src/SimpleShadowsocks.Client.Core/Tunnel`
 - `src/SimpleShadowsocks.Server.Core/Tunnel`
 - `tests/SimpleShadowsocks.Client.Tests`
+
+### Логирование
+
+Логирование унифицировано по формату для всех runtime-компонентов (`Client`, `Server`, `Client.Core`, `Server.Core`):
+
+- timestamp в UTC (`ISO-8601`, поле в начале строки);
+- уровень (`level`);
+- компонент (`component`);
+- протокол (`protocol`);
+- идентификатор сессии (`session`, `-` если не применимо);
+- сообщение (`msg`) и поля ошибки (`error_type`, `error`) при исключениях.
+
+Пример:
+
+```text
+2026-03-16T19:10:42.1234567+00:00 level=INFO component=socks5-server protocol=TUNNEL/UDP session=42 msg="tunnel udp session opened"
+```
+
+Политика:
+
+- логируются подключения/соединения (start/listen/accept/open/close);
+- логируются ошибки/сбои;
+- отсутствует логирование в hot-path на каждый пакет данных.
 
 ### Детальный разбор протокола
 
@@ -365,8 +407,9 @@ Crypto-handshake:
 1. Multiplexing нескольких session в одном TCP-туннеле
 - снижает overhead на соединения и упрощает управление reconnect.
 
-2. Sticky-привязка SOCKS5 TCP-сессии к выбранному tunnel-серверу
-- предотвращает дрейф long-lived сессий между серверами при `round-robin`.
+2. Sticky-привязка SOCKS5 TCP-сессии к выбранному tunnel-серверу + failover на CONNECT
+- при успешном `CONNECT` сессия закрепляется за выбранным сервером;
+- если конкретный сервер вернул ошибку на `CONNECT`, клиент пробует следующий сервер из списка (`round-robin`-порядок).
 
 3. Reconnect + session migration/resume
 - при разрыве туннеля клиент пытается прозрачно восстановить активные session.
@@ -385,7 +428,6 @@ Crypto-handshake:
 - Нет ротации pre-shared key.
 - Нет selective recovery/retransmit при sequence-ошибках.
 - Session resume best-effort: конкретная сессия может завершиться при неуспешном re-`CONNECT`.
-- SOCKS5 UDP relay поддерживает только `FRAG=0`.
 - Android VPN MVP не поддерживает режим `Private DNS`/DoT (`:853`) через текущий pipeline.
 
 ### Следующие итерации
@@ -394,4 +436,3 @@ Crypto-handshake:
 2. Добавить метрики по sequence violations, reconnect и session-failures.
 3. Добавить persist/distributed replay-cache для multi-instance серверов.
 4. Ввести отдельные timeout/deadline policy для session-resume.
-

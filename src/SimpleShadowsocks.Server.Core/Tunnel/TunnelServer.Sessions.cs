@@ -55,6 +55,11 @@ public sealed partial class TunnelServer
 
         context.Cancellation.Cancel();
         context.Dispose();
+        StructuredLog.Info(
+            "tunnel-server",
+            context is UdpSessionContext ? "TUNNEL/UDP" : "TUNNEL/TCP",
+            "session disposed",
+            sessionId);
 
         if (sendCloseToClient)
         {

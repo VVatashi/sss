@@ -209,6 +209,26 @@ internal static class TestNetwork
         ];
     }
 
+    public static byte[] BuildConnectRequestDomain(string domain, int port)
+    {
+        var domainBytes = System.Text.Encoding.ASCII.GetBytes(domain);
+        if (domainBytes.Length == 0 || domainBytes.Length > 255)
+        {
+            throw new ArgumentOutOfRangeException(nameof(domain), "Domain length must be in 1..255 bytes.");
+        }
+
+        var request = new byte[4 + 1 + domainBytes.Length + 2];
+        request[0] = 0x05;
+        request[1] = 0x01;
+        request[2] = 0x00;
+        request[3] = 0x03;
+        request[4] = (byte)domainBytes.Length;
+        Buffer.BlockCopy(domainBytes, 0, request, 5, domainBytes.Length);
+        request[^2] = (byte)(port >> 8);
+        request[^1] = (byte)port;
+        return request;
+    }
+
     public static byte[] BuildBindRequestIPv4(IPAddress address, int port)
     {
         var ipBytes = address.GetAddressBytes();
@@ -272,18 +292,23 @@ internal static class TestNetwork
 
     public static byte[] BuildSocks5UdpDatagram(IPAddress destinationAddress, int destinationPort, byte[] payload)
     {
-        var addressType = destinationAddress.AddressFamily switch
-        {
-            AddressFamily.InterNetwork => AddressType.IPv4,
-            AddressFamily.InterNetworkV6 => AddressType.IPv6,
-            _ => throw new InvalidDataException($"Unsupported address family: {destinationAddress.AddressFamily}.")
-        };
+        return BuildSocks5UdpDatagram(destinationAddress.ToString(), destinationPort, payload);
+    }
+
+    public static byte[] BuildSocks5UdpDatagram(IPAddress destinationAddress, int destinationPort, byte[] payload, byte fragment)
+    {
+        return BuildSocks5UdpDatagram(destinationAddress.ToString(), destinationPort, payload, fragment);
+    }
+
+    public static byte[] BuildSocks5UdpDatagram(string destinationAddressOrHost, int destinationPort, byte[] payload, byte fragment = 0x00)
+    {
+        var addressType = TryResolveAddressType(destinationAddressOrHost);
         var request = ProtocolPayloadSerializer.SerializeConnectRequest(
-            new ConnectRequest(addressType, destinationAddress.ToString(), (ushort)destinationPort));
+            new ConnectRequest(addressType, destinationAddressOrHost, (ushort)destinationPort));
         var datagram = new byte[3 + request.Length + payload.Length];
         datagram[0] = 0x00;
         datagram[1] = 0x00;
-        datagram[2] = 0x00;
+        datagram[2] = fragment;
         Buffer.BlockCopy(request, 0, datagram, 3, request.Length);
         Buffer.BlockCopy(payload, 0, datagram, 3 + request.Length, payload.Length);
         return datagram;
@@ -303,6 +328,21 @@ internal static class TestNetwork
         }
 
         return (address, udpDatagram.Port, udpDatagram.Payload.ToArray());
+    }
+
+    private static AddressType TryResolveAddressType(string destinationAddressOrHost)
+    {
+        if (!IPAddress.TryParse(destinationAddressOrHost, out var ipAddress))
+        {
+            return AddressType.Domain;
+        }
+
+        return ipAddress.AddressFamily switch
+        {
+            AddressFamily.InterNetwork => AddressType.IPv4,
+            AddressFamily.InterNetworkV6 => AddressType.IPv6,
+            _ => throw new InvalidDataException($"Unsupported address family: {ipAddress.AddressFamily}.")
+        };
     }
 
     internal readonly record struct Socks5Reply(byte ReplyCode, IPEndPoint? BoundEndPoint);
