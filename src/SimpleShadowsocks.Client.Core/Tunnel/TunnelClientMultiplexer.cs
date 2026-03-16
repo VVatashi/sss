@@ -83,10 +83,20 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         try
         {
             var replyCode = await ConnectSessionAsync(sessionId, state, cancellationToken);
+            if (state.ReaderWriter is null)
+            {
+                throw new InvalidOperationException("TCP session is not initialized.");
+            }
+
             if (replyCode != 0x00)
             {
                 _sessions.TryRemove(sessionId, out _);
                 state.ReaderWriter.Writer.TryComplete();
+                StructuredLog.Warn("tunnel-client", "TUNNEL/TCP", $"session open rejected reply={replyCode}", sessionId);
+            }
+            else
+            {
+                StructuredLog.Info("tunnel-client", "TUNNEL/TCP", $"session opened target={connectRequest.Address}:{connectRequest.Port}", sessionId);
             }
 
             return (sessionId, replyCode, state.ReaderWriter.Reader);
@@ -94,7 +104,54 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         catch
         {
             _sessions.TryRemove(sessionId, out _);
-            state.ReaderWriter.Writer.TryComplete();
+            state.ReaderWriter?.Writer.TryComplete();
+            throw;
+        }
+    }
+
+    public async Task<(uint SessionId, byte ReplyCode, ChannelReader<UdpDatagram> Reader)> OpenUdpSessionAsync(
+        CancellationToken cancellationToken)
+    {
+        await EnsureConnectedAsync(cancellationToken);
+        if (_sessions.Count >= _connectionPolicy.MaxConcurrentSessions)
+        {
+            throw new InvalidOperationException(
+                $"Max concurrent sessions limit reached: {_connectionPolicy.MaxConcurrentSessions}.");
+        }
+
+        var sessionId = (uint)Interlocked.Increment(ref _nextSessionId);
+        var state = new SessionState(_connectionPolicy.SessionReceiveChannelCapacity);
+        if (!_sessions.TryAdd(sessionId, state))
+        {
+            throw new InvalidOperationException("Failed to register tunnel UDP session.");
+        }
+
+        try
+        {
+            var replyCode = await ConnectSessionAsync(sessionId, state, cancellationToken);
+            if (replyCode != 0x00)
+            {
+                _sessions.TryRemove(sessionId, out _);
+                state.UdpReaderWriter?.Writer.TryComplete();
+                StructuredLog.Warn("tunnel-client", "TUNNEL/UDP", $"session open rejected reply={replyCode}", sessionId);
+            }
+
+            if (state.UdpReaderWriter is null)
+            {
+                throw new InvalidOperationException("UDP session is not initialized.");
+            }
+
+            if (replyCode == 0x00)
+            {
+                StructuredLog.Info("tunnel-client", "TUNNEL/UDP", "session opened", sessionId);
+            }
+
+            return (sessionId, replyCode, state.UdpReaderWriter.Reader);
+        }
+        catch
+        {
+            _sessions.TryRemove(sessionId, out _);
+            state.UdpReaderWriter?.Writer.TryComplete();
             throw;
         }
     }
@@ -102,6 +159,12 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
     public Task SendDataAsync(uint sessionId, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
         return SendSessionFrameAsync(sessionId, FrameType.Data, payload, cancellationToken);
+    }
+
+    public Task SendUdpDataAsync(uint sessionId, UdpDatagram datagram, CancellationToken cancellationToken)
+    {
+        var payload = ProtocolPayloadSerializer.SerializeUdpDatagram(datagram);
+        return SendSessionFrameAsync(sessionId, FrameType.UdpData, payload, cancellationToken);
     }
 
     public async Task CloseSessionAsync(uint sessionId, byte reasonCode, CancellationToken cancellationToken)
@@ -121,7 +184,9 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
             {
             }
 
-            state.ReaderWriter.Writer.TryComplete();
+            state.ReaderWriter?.Writer.TryComplete();
+            state.UdpReaderWriter?.Writer.TryComplete();
+            StructuredLog.Info("tunnel-client", state.IsUdp ? "TUNNEL/UDP" : "TUNNEL/TCP", "session closed", sessionId);
         }
     }
 

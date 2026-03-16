@@ -29,12 +29,18 @@ public sealed partial class TunnelClientMultiplexer
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
+                    StructuredLog.Info(
+                        "tunnel-client",
+                        "TUNNEL/TCP",
+                        $"connecting remote={_remoteHost}:{_remotePort} attempt={attempt}/{_connectionPolicy.ReconnectMaxAttempts}");
                     await ConnectOnceAsync(cancellationToken);
                     await RestoreSessionsAsync(cancellationToken);
+                    StructuredLog.Info("tunnel-client", "TUNNEL/TCP", "connected");
                     return;
                 }
                 catch (Exception ex)
                 {
+                    StructuredLog.Error("tunnel-client", "TUNNEL/TCP", "connect attempt failed", ex);
                     lastError = ex;
                     await HandleConnectionFaultAsync(preserveSessions: true);
 
@@ -155,6 +161,7 @@ public sealed partial class TunnelClientMultiplexer
         if (preserveSessions)
         {
             var error = _connectionError ?? new IOException("Tunnel connection fault.");
+            StructuredLog.Error("tunnel-client", "TUNNEL/TCP", "connection fault; preserving sessions", error);
             foreach (var (_, state) in _sessions)
             {
                 state.NotifyConnectionFault(error);
@@ -162,10 +169,20 @@ public sealed partial class TunnelClientMultiplexer
             return;
         }
 
+        if (_connectionError is not null)
+        {
+            StructuredLog.Error("tunnel-client", "TUNNEL/TCP", "connection closed; dropping all sessions", _connectionError);
+        }
+        else
+        {
+            StructuredLog.Warn("tunnel-client", "TUNNEL/TCP", "connection closed; dropping all sessions");
+        }
+
         foreach (var (sessionId, state) in _sessions.ToArray())
         {
             state.MarkClosed();
-            state.ReaderWriter.Writer.TryComplete();
+            state.ReaderWriter?.Writer.TryComplete();
+            state.UdpReaderWriter?.Writer.TryComplete();
             if (_connectionError is not null)
             {
                 state.FailConnect(_connectionError);

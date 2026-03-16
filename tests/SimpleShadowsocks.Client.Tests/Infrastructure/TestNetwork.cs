@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using SimpleShadowsocks.Client.Socks5;
 using SimpleShadowsocks.Client.Tunnel;
+using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
 using SimpleShadowsocks.Server.Tunnel;
 
@@ -130,6 +131,33 @@ internal static class TestNetwork
         return new RunningEchoServer(port, cts, runTask);
     }
 
+    public static Task<RunningUdpEchoServer> StartUdpEchoServerAsync()
+    {
+        var port = AllocateUnusedUdpPort();
+        var udp = new UdpClient(new IPEndPoint(IPAddress.Loopback, port));
+        var cts = new CancellationTokenSource();
+        var runTask = Task.Run(async () =>
+        {
+            try
+            {
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    var received = await udp.ReceiveAsync(cts.Token);
+                    await udp.SendAsync(received.Buffer, received.RemoteEndPoint, cts.Token);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                udp.Dispose();
+            }
+        }, cts.Token);
+
+        return Task.FromResult(new RunningUdpEchoServer(port, cts, runTask));
+    }
+
     public static async Task<TcpClient> ConnectAsync(int port)
     {
         var client = new TcpClient();
@@ -166,6 +194,12 @@ internal static class TestNetwork
         return port;
     }
 
+    public static int AllocateUnusedUdpPort()
+    {
+        using var udp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        return ((IPEndPoint)udp.Client.LocalEndPoint!).Port;
+    }
+
     public static byte[] BuildConnectRequestIPv4(IPAddress address, int port)
     {
         var ipBytes = address.GetAddressBytes();
@@ -175,12 +209,41 @@ internal static class TestNetwork
         ];
     }
 
+    public static byte[] BuildConnectRequestDomain(string domain, int port)
+    {
+        var domainBytes = System.Text.Encoding.ASCII.GetBytes(domain);
+        if (domainBytes.Length == 0 || domainBytes.Length > 255)
+        {
+            throw new ArgumentOutOfRangeException(nameof(domain), "Domain length must be in 1..255 bytes.");
+        }
+
+        var request = new byte[4 + 1 + domainBytes.Length + 2];
+        request[0] = 0x05;
+        request[1] = 0x01;
+        request[2] = 0x00;
+        request[3] = 0x03;
+        request[4] = (byte)domainBytes.Length;
+        Buffer.BlockCopy(domainBytes, 0, request, 5, domainBytes.Length);
+        request[^2] = (byte)(port >> 8);
+        request[^1] = (byte)port;
+        return request;
+    }
+
     public static byte[] BuildBindRequestIPv4(IPAddress address, int port)
     {
         var ipBytes = address.GetAddressBytes();
         return
         [
             0x05, 0x02, 0x00, 0x01, ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3], (byte)(port >> 8), (byte)port
+        ];
+    }
+
+    public static byte[] BuildUdpAssociateRequestIPv4(IPAddress address, int port)
+    {
+        var ipBytes = address.GetAddressBytes();
+        return
+        [
+            0x05, 0x03, 0x00, 0x01, ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3], (byte)(port >> 8), (byte)port
         ];
     }
 
@@ -207,18 +270,82 @@ internal static class TestNetwork
     {
         var header = await ReadExactAsync(stream, 4);
         var addressType = header[3];
-        var addressLength = addressType switch
+        var addressBytes = addressType switch
         {
-            0x01 => 4,
-            0x04 => 16,
+            0x01 => await ReadExactAsync(stream, 4),
+            0x04 => await ReadExactAsync(stream, 16),
+            0x03 => await ReadExactAsync(stream, (await ReadExactAsync(stream, 1))[0]),
             _ => throw new InvalidDataException($"Unexpected address type in SOCKS5 reply: {addressType}")
         };
+        var portBytes = await ReadExactAsync(stream, 2);
+        var port = (portBytes[0] << 8) | portBytes[1];
 
-        await ReadExactAsync(stream, addressLength + 2);
-        return new Socks5Reply(header[1]);
+        var endpoint = addressType switch
+        {
+            0x01 => new IPEndPoint(new IPAddress(addressBytes), port),
+            0x04 => new IPEndPoint(new IPAddress(addressBytes), port),
+            _ => null
+        };
+
+        return new Socks5Reply(header[1], endpoint);
     }
 
-    internal readonly record struct Socks5Reply(byte ReplyCode);
+    public static byte[] BuildSocks5UdpDatagram(IPAddress destinationAddress, int destinationPort, byte[] payload)
+    {
+        return BuildSocks5UdpDatagram(destinationAddress.ToString(), destinationPort, payload);
+    }
+
+    public static byte[] BuildSocks5UdpDatagram(IPAddress destinationAddress, int destinationPort, byte[] payload, byte fragment)
+    {
+        return BuildSocks5UdpDatagram(destinationAddress.ToString(), destinationPort, payload, fragment);
+    }
+
+    public static byte[] BuildSocks5UdpDatagram(string destinationAddressOrHost, int destinationPort, byte[] payload, byte fragment = 0x00)
+    {
+        var addressType = TryResolveAddressType(destinationAddressOrHost);
+        var request = ProtocolPayloadSerializer.SerializeConnectRequest(
+            new ConnectRequest(addressType, destinationAddressOrHost, (ushort)destinationPort));
+        var datagram = new byte[3 + request.Length + payload.Length];
+        datagram[0] = 0x00;
+        datagram[1] = 0x00;
+        datagram[2] = fragment;
+        Buffer.BlockCopy(request, 0, datagram, 3, request.Length);
+        Buffer.BlockCopy(payload, 0, datagram, 3 + request.Length, payload.Length);
+        return datagram;
+    }
+
+    public static (IPAddress SourceAddress, int SourcePort, byte[] Payload) ParseSocks5UdpDatagram(byte[] datagram)
+    {
+        if (datagram.Length < 3 || datagram[0] != 0 || datagram[1] != 0 || datagram[2] != 0)
+        {
+            throw new InvalidDataException("Invalid SOCKS5 UDP header.");
+        }
+
+        var udpDatagram = ProtocolPayloadSerializer.DeserializeUdpDatagram(datagram.AsSpan(3));
+        if (!IPAddress.TryParse(udpDatagram.Address, out var address))
+        {
+            throw new InvalidDataException($"Invalid source address in UDP datagram: {udpDatagram.Address}.");
+        }
+
+        return (address, udpDatagram.Port, udpDatagram.Payload.ToArray());
+    }
+
+    private static AddressType TryResolveAddressType(string destinationAddressOrHost)
+    {
+        if (!IPAddress.TryParse(destinationAddressOrHost, out var ipAddress))
+        {
+            return AddressType.Domain;
+        }
+
+        return ipAddress.AddressFamily switch
+        {
+            AddressFamily.InterNetwork => AddressType.IPv4,
+            AddressFamily.InterNetworkV6 => AddressType.IPv6,
+            _ => throw new InvalidDataException($"Unsupported address family: {ipAddress.AddressFamily}.")
+        };
+    }
+
+    internal readonly record struct Socks5Reply(byte ReplyCode, IPEndPoint? BoundEndPoint);
 
     internal sealed class RunningSocksServer : IAsyncDisposable
     {
@@ -285,6 +412,36 @@ internal static class TestNetwork
     internal sealed class RunningEchoServer : IAsyncDisposable
     {
         public RunningEchoServer(int port, CancellationTokenSource cts, Task runTask)
+        {
+            Port = port;
+            _cts = cts;
+            _runTask = runTask;
+        }
+
+        public int Port { get; }
+        private readonly CancellationTokenSource _cts;
+        private readonly Task _runTask;
+
+        public async ValueTask DisposeAsync()
+        {
+            _cts.Cancel();
+            try
+            {
+                await _runTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                _cts.Dispose();
+            }
+        }
+    }
+
+    internal sealed class RunningUdpEchoServer : IAsyncDisposable
+    {
+        public RunningUdpEchoServer(int port, CancellationTokenSource cts, Task runTask)
         {
             Port = port;
             _cts = cts;

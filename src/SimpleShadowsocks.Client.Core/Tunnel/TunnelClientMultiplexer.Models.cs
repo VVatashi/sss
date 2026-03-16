@@ -18,14 +18,27 @@ public sealed partial class TunnelClientMultiplexer
         private TaskCompletionSource<bool> _activeReady =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public ConnectRequest ConnectRequest { get; }
-
-        public Channel<byte[]> ReaderWriter { get; }
+        public bool IsUdp { get; }
+        public ConnectRequest? ConnectRequest { get; }
+        public Channel<byte[]>? ReaderWriter { get; }
+        public Channel<UdpDatagram>? UdpReaderWriter { get; }
 
         public SessionState(ConnectRequest connectRequest, int receiveChannelCapacity)
         {
+            IsUdp = false;
             ConnectRequest = connectRequest;
             ReaderWriter = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(receiveChannelCapacity)
+            {
+                SingleReader = true,
+                SingleWriter = true,
+                FullMode = BoundedChannelFullMode.Wait
+            });
+        }
+
+        public SessionState(int receiveChannelCapacity)
+        {
+            IsUdp = true;
+            UdpReaderWriter = Channel.CreateBounded<UdpDatagram>(new BoundedChannelOptions(receiveChannelCapacity)
             {
                 SingleReader = true,
                 SingleWriter = true,
@@ -164,7 +177,8 @@ public sealed partial class TunnelClientMultiplexer
             {
                 if (_awaitingConnectReply)
                 {
-                    if (frameType != FrameType.Connect || sequence != 0)
+                    var validConnectReply = IsUdp ? FrameType.UdpAssociate : FrameType.Connect;
+                    if (frameType != validConnectReply || sequence != 0)
                     {
                         return false;
                     }

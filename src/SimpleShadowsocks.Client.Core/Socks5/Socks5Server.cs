@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using System.Net;
 using System.Net.Sockets;
 using SimpleShadowsocks.Client.Tunnel;
@@ -12,9 +13,13 @@ public sealed partial class Socks5Server
     private const byte AuthNone = 0x00;
     private const byte AuthNoAcceptableMethods = 0xFF;
     private const byte CommandConnect = 0x01;
+    private const byte CommandUdpAssociate = 0x03;
     private const byte AddressTypeIPv4 = 0x01;
     private const byte AddressTypeDomain = 0x03;
     private const byte AddressTypeIPv6 = 0x04;
+    private static readonly Meter Socks5Meter = new("SimpleShadowsocks.Client.Core.Socks5", "1.0.0");
+    private static readonly Counter<long> UdpAssociateRejectedNoTunnelBackendCounter = Socks5Meter.CreateCounter<long>(
+        "socks5_udp_associate_rejected_no_tunnel_backend_total");
 
     private readonly TcpListener _listener;
     private readonly List<(string Host, int Port)> _remoteServers = new();
@@ -27,6 +32,9 @@ public sealed partial class Socks5Server
     private readonly Action<Socket>? _configureTunnelSocket;
     private List<TunnelClientMultiplexer>? _multiplexers;
     private int _nextMultiplexerIndex = -1;
+    private long _udpAssociateRejectedNoTunnelBackendCount;
+
+    public long UdpAssociateRejectedNoTunnelBackendCount => Volatile.Read(ref _udpAssociateRejectedNoTunnelBackendCount);
 
     public Socks5Server(IPAddress listenAddress, int port)
     {
@@ -98,6 +106,7 @@ public sealed partial class Socks5Server
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         _listener.Start();
+        StructuredLog.Info("socks5-server", "SOCKS5", $"listening on {_listener.LocalEndpoint}");
         if (_remoteServers.Count > 0)
         {
             _multiplexers = new List<TunnelClientMultiplexer>(_remoteServers.Count);
@@ -121,6 +130,10 @@ public sealed partial class Socks5Server
             while (!cancellationToken.IsCancellationRequested)
             {
                 var client = await _listener.AcceptTcpClientAsync(cancellationToken);
+                StructuredLog.Info(
+                    "socks5-server",
+                    "SOCKS5",
+                    $"accepted client remote={client.Client.RemoteEndPoint} local={client.Client.LocalEndPoint}");
                 _ = Task.Run(() => HandleClientSafelyAsync(client, cancellationToken), cancellationToken);
             }
         }
@@ -138,6 +151,7 @@ public sealed partial class Socks5Server
             }
 
             _listener.Stop();
+            StructuredLog.Info("socks5-server", "SOCKS5", "listener stopped");
         }
     }
 
@@ -154,7 +168,7 @@ public sealed partial class Socks5Server
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[socks5] client failed: {ex.Message}");
+                StructuredLog.Error("socks5-server", "SOCKS5", "client handling failed", ex);
             }
         }
     }
@@ -162,7 +176,7 @@ public sealed partial class Socks5Server
     private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
     {
         using var clientStream = client.GetStream();
-        var selectedMultiplexer = SelectMultiplexerForClient();
+        var candidateMultiplexers = SelectMultiplexersForClient();
 
         if (!await HandleGreetingAsync(clientStream, cancellationToken))
         {
@@ -175,27 +189,61 @@ public sealed partial class Socks5Server
             return;
         }
 
-        Console.WriteLine($"[socks5] proxy {request.Value.Host}:{request.Value.Port}");
-
-        if (selectedMultiplexer is null)
+        switch (request.Value.Command)
         {
-            await HandleDirectAsync(clientStream, request.Value, cancellationToken);
-            return;
-        }
+            case CommandConnect:
+                StructuredLog.Info("socks5-server", "SOCKS5/TCP", $"connect request target={request.Value.Host}:{request.Value.Port}");
+                if (candidateMultiplexers.Count == 0)
+                {
+                    await HandleDirectAsync(clientStream, request.Value, cancellationToken);
+                    return;
+                }
 
-        await HandleViaTunnelAsync(clientStream, request.Value, selectedMultiplexer, cancellationToken);
+                await HandleViaTunnelAsync(clientStream, request.Value, candidateMultiplexers, cancellationToken);
+                return;
+
+            case CommandUdpAssociate:
+                StructuredLog.Info("socks5-server", "SOCKS5/UDP", $"udp associate request client={request.Value.Host}:{request.Value.Port}");
+                if (candidateMultiplexers.Count == 0)
+                {
+                    Interlocked.Increment(ref _udpAssociateRejectedNoTunnelBackendCount);
+                    UdpAssociateRejectedNoTunnelBackendCounter.Add(1);
+                    StructuredLog.Warn("socks5-server", "SOCKS5/UDP", "UDP disabled: no tunnel backend");
+                    await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
+                    return;
+                }
+
+                await HandleUdpAssociateViaTunnelAsync(clientStream, request.Value, candidateMultiplexers[0], cancellationToken);
+                return;
+
+            default:
+                await SendReplyAsync(clientStream, replyCode: 0x07, null, cancellationToken);
+                return;
+        }
     }
 
-    private TunnelClientMultiplexer? SelectMultiplexerForClient()
+    private IReadOnlyList<TunnelClientMultiplexer> SelectMultiplexersForClient()
     {
         var multiplexers = _multiplexers;
         if (multiplexers is null || multiplexers.Count == 0)
         {
-            return null;
+            return Array.Empty<TunnelClientMultiplexer>();
         }
 
         var index = Interlocked.Increment(ref _nextMultiplexerIndex);
-        var normalizedIndex = (index & int.MaxValue) % multiplexers.Count;
-        return multiplexers[normalizedIndex];
+        var startIndex = (index & int.MaxValue) % multiplexers.Count;
+
+        if (multiplexers.Count == 1)
+        {
+            return multiplexers;
+        }
+
+        var ordered = new TunnelClientMultiplexer[multiplexers.Count];
+        for (var offset = 0; offset < multiplexers.Count; offset++)
+        {
+            ordered[offset] = multiplexers[(startIndex + offset) % multiplexers.Count];
+        }
+
+        return ordered;
     }
 }

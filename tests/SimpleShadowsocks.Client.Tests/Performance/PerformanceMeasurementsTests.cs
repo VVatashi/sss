@@ -8,8 +8,8 @@ namespace SimpleShadowsocks.Client.Tests;
 [Trait(TestCategories.Name, TestCategories.Performance)]
 public sealed partial class PerformanceMeasurementsTests
 {
-    private static readonly TimeSpan WarmupTimeout = TimeSpan.FromSeconds(90);
-    private static readonly TimeSpan MeasurementTimeout = TimeSpan.FromSeconds(300);
+    private static TimeSpan WarmupTimeout => TimeSpan.FromSeconds(GetPerfIntOverride("SS_PERF_WARMUP_TIMEOUT_SEC", 90));
+    private static TimeSpan MeasurementTimeout => TimeSpan.FromSeconds(GetPerfIntOverride("SS_PERF_MEASUREMENT_TIMEOUT_SEC", 600));
     private static readonly TunnelCipherAlgorithm[] CipherAlgorithms =
     [
         TunnelCipherAlgorithm.ChaCha20Poly1305,

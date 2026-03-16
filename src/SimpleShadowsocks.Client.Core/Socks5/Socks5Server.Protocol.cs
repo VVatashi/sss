@@ -78,13 +78,13 @@ public sealed partial class Socks5Server
 
         var port = (ushort)((portBytes[0] << 8) | portBytes[1]);
 
-        if (command != CommandConnect)
+        if (command is not CommandConnect and not CommandUdpAssociate)
         {
             await SendReplyAsync(stream, replyCode: 0x07, null, cancellationToken);
             return null;
         }
 
-        return new Socks5ConnectRequest(host, port, addressType);
+        return new Socks5ConnectRequest(command, host, port, addressType);
     }
 
     private static async Task<string?> ReadIPv4AddressAsync(NetworkStream stream, CancellationToken cancellationToken)
@@ -143,6 +143,16 @@ public sealed partial class Socks5Server
         };
     }
 
+    private static AddressType ToProtocolAddressType(IPAddress ipAddress)
+    {
+        return ipAddress.AddressFamily switch
+        {
+            AddressFamily.InterNetwork => AddressType.IPv4,
+            AddressFamily.InterNetworkV6 => AddressType.IPv6,
+            _ => throw new InvalidDataException($"Unsupported IP address family: {ipAddress.AddressFamily}")
+        };
+    }
+
     private static async Task SendReplyAsync(
         NetworkStream stream,
         byte replyCode,
@@ -191,5 +201,223 @@ public sealed partial class Socks5Server
         }
 
         return true;
+    }
+
+    private static byte[] BuildUdpRequestDatagram(AddressType addressType, string address, ushort port, ReadOnlySpan<byte> payload)
+    {
+        var endpointPayload = ProtocolPayloadSerializer.SerializeConnectRequest(new ConnectRequest(addressType, address, port));
+        var datagram = new byte[3 + endpointPayload.Length + payload.Length];
+        datagram[0] = 0x00;
+        datagram[1] = 0x00;
+        datagram[2] = 0x00;
+        Buffer.BlockCopy(endpointPayload, 0, datagram, 3, endpointPayload.Length);
+        payload.CopyTo(datagram.AsSpan(3 + endpointPayload.Length));
+        return datagram;
+    }
+
+    private static bool TryParseUdpRequestDatagram(ReadOnlySpan<byte> datagram, out Socks5UdpClientDatagram parsed)
+    {
+        parsed = default;
+        if (datagram.Length < 3)
+        {
+            return false;
+        }
+
+        if (datagram[0] != 0x00 || datagram[1] != 0x00)
+        {
+            return false;
+        }
+
+        try
+        {
+            var fragment = datagram[2];
+            parsed = new Socks5UdpClientDatagram(fragment, ProtocolPayloadSerializer.DeserializeUdpDatagram(datagram.Slice(3)));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private readonly record struct Socks5UdpClientDatagram(byte Fragment, UdpDatagram Datagram);
+
+    private sealed class Socks5UdpFragmentReassembler
+    {
+        private static readonly TimeSpan DefaultTtl = TimeSpan.FromSeconds(5);
+        private readonly Dictionary<UdpFragmentKey, FragmentState> _states = new();
+
+        public bool TryReassemble(Socks5UdpClientDatagram incoming, out UdpDatagram datagram)
+        {
+            datagram = default;
+            CleanupExpired(DateTime.UtcNow);
+
+            if (incoming.Fragment == 0x00)
+            {
+                return TryAssign(incoming.Datagram, out datagram);
+            }
+
+            var fragmentIndex = (byte)(incoming.Fragment & 0x7F);
+            var isLastFragment = (incoming.Fragment & 0x80) != 0;
+            if (fragmentIndex == 0)
+            {
+                return false;
+            }
+
+            var key = new UdpFragmentKey(
+                incoming.Datagram.AddressType,
+                incoming.Datagram.Address,
+                incoming.Datagram.Port);
+            if (!_states.TryGetValue(key, out var state))
+            {
+                state = new FragmentState();
+                _states[key] = state;
+            }
+
+            if (!state.TryAddFragment(fragmentIndex, isLastFragment, incoming.Datagram.Payload.Span, DateTime.UtcNow))
+            {
+                _states.Remove(key);
+                return false;
+            }
+
+            if (!state.TryBuildPayload(out var payload))
+            {
+                return false;
+            }
+
+            _states.Remove(key);
+            var assembled = new UdpDatagram(
+                incoming.Datagram.AddressType,
+                incoming.Datagram.Address,
+                incoming.Datagram.Port,
+                payload);
+            return TryAssign(assembled, out datagram);
+        }
+
+        private void CleanupExpired(DateTime utcNow)
+        {
+            if (_states.Count == 0)
+            {
+                return;
+            }
+
+            List<UdpFragmentKey>? expiredKeys = null;
+            foreach (var (key, state) in _states)
+            {
+                if (!state.IsExpired(utcNow))
+                {
+                    continue;
+                }
+
+                expiredKeys ??= new List<UdpFragmentKey>();
+                expiredKeys.Add(key);
+            }
+
+            if (expiredKeys is null)
+            {
+                return;
+            }
+
+            foreach (var key in expiredKeys)
+            {
+                _states.Remove(key);
+            }
+        }
+
+        private static bool TryAssign(UdpDatagram source, out UdpDatagram destination)
+        {
+            if (source.Payload.Length > ProtocolConstants.MaxPayloadLength)
+            {
+                destination = default;
+                return false;
+            }
+
+            destination = source;
+            return true;
+        }
+
+        private sealed class FragmentState
+        {
+            private readonly Dictionary<byte, byte[]> _payloadByIndex = new();
+            private byte? _lastFragmentIndex;
+            private byte _highestFragmentIndex;
+            private DateTime _expiresAtUtc = DateTime.UtcNow + DefaultTtl;
+
+            public bool IsExpired(DateTime utcNow) => utcNow >= _expiresAtUtc;
+
+            public bool TryAddFragment(byte fragmentIndex, bool isLast, ReadOnlySpan<byte> payload, DateTime utcNow)
+            {
+                if (fragmentIndex < _highestFragmentIndex)
+                {
+                    // RFC 1928: when fragment number decreases, queue should reinitialize.
+                    _payloadByIndex.Clear();
+                    _lastFragmentIndex = null;
+                    _highestFragmentIndex = 0;
+                }
+
+                if (_payloadByIndex.ContainsKey(fragmentIndex))
+                {
+                    return false;
+                }
+
+                if (_lastFragmentIndex is not null && fragmentIndex > _lastFragmentIndex.Value)
+                {
+                    return false;
+                }
+
+                _payloadByIndex[fragmentIndex] = payload.ToArray();
+                if (fragmentIndex > _highestFragmentIndex)
+                {
+                    _highestFragmentIndex = fragmentIndex;
+                }
+
+                if (isLast)
+                {
+                    _lastFragmentIndex = fragmentIndex;
+                }
+
+                _expiresAtUtc = utcNow + DefaultTtl;
+                return true;
+            }
+
+            public bool TryBuildPayload(out byte[] payload)
+            {
+                payload = Array.Empty<byte>();
+                if (_lastFragmentIndex is null)
+                {
+                    return false;
+                }
+
+                var lastIndex = _lastFragmentIndex.Value;
+                var totalLength = 0;
+                for (byte index = 1; index <= lastIndex; index++)
+                {
+                    if (!_payloadByIndex.TryGetValue(index, out var chunk))
+                    {
+                        return false;
+                    }
+
+                    totalLength += chunk.Length;
+                    if (totalLength > ProtocolConstants.MaxPayloadLength)
+                    {
+                        return false;
+                    }
+                }
+
+                var combined = new byte[totalLength];
+                var offset = 0;
+                for (byte index = 1; index <= lastIndex; index++)
+                {
+                    var chunk = _payloadByIndex[index];
+                    Buffer.BlockCopy(chunk, 0, combined, offset, chunk.Length);
+                    offset += chunk.Length;
+                }
+
+                payload = combined;
+                return true;
+            }
+        }
+
+        private readonly record struct UdpFragmentKey(AddressType AddressType, string Address, ushort Port);
     }
 }

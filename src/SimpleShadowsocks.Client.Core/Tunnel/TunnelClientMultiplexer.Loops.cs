@@ -7,6 +7,7 @@ public sealed partial class TunnelClientMultiplexer
 {
     private async Task ReadLoopAsync(int generation, CancellationToken cancellationToken)
     {
+        var preserveSessionsOnFault = true;
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -56,18 +57,59 @@ public sealed partial class TunnelClientMultiplexer
                 switch (frame.Type)
                 {
                     case FrameType.Connect:
+                    case FrameType.UdpAssociate:
                         state.CompleteConnectReply(frame.Payload.Length >= 1 ? frame.Payload.Span[0] : (byte)0x01);
                         break;
 
                     case FrameType.Data:
-                        await state.ReaderWriter.Writer.WriteAsync(DetachPayload(frame.Payload), cancellationToken);
+                        if (state.ReaderWriter is not null)
+                        {
+                            await state.ReaderWriter.Writer.WriteAsync(DetachPayload(frame.Payload), cancellationToken);
+                        }
+                        break;
+
+                    case FrameType.UdpData:
+                        if (state.UdpReaderWriter is not null)
+                        {
+                            try
+                            {
+                                var datagram = ProtocolPayloadSerializer.DeserializeUdpDatagram(frame.Payload.Span);
+                                await state.UdpReaderWriter.Writer.WriteAsync(datagram, cancellationToken);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                throw;
+                            }
+                            catch (Exception ex)
+                            {
+                                StructuredLog.Error(
+                                    "tunnel-client",
+                                    "TUNNEL/UDP",
+                                    "invalid UDP frame payload",
+                                    ex,
+                                    frame.SessionId);
+                                try
+                                {
+                                    await CloseSessionAsync(frame.SessionId, 0x08, CancellationToken.None);
+                                }
+                                catch
+                                {
+                                }
+                            }
+                        }
                         break;
 
                     case FrameType.Close:
                         state.MarkClosed();
                         state.FailConnect(new IOException("Session closed by remote."));
-                        state.ReaderWriter.Writer.TryComplete();
+                        state.ReaderWriter?.Writer.TryComplete();
+                        state.UdpReaderWriter?.Writer.TryComplete();
                         _sessions.TryRemove(frame.SessionId, out _);
+                        StructuredLog.Info(
+                            "tunnel-client",
+                            state.IsUdp ? "TUNNEL/UDP" : "TUNNEL/TCP",
+                            "session closed by remote",
+                            frame.SessionId);
                         break;
 
                     case FrameType.Ping:
@@ -88,6 +130,13 @@ public sealed partial class TunnelClientMultiplexer
         }
         catch (Exception ex)
         {
+            if (ex is InvalidDataException)
+            {
+                // AEAD auth failure / protocol corruption is fatal:
+                // do not keep sessions waiting for reconnect, fail them fast.
+                preserveSessionsOnFault = false;
+            }
+
             _connectionError = ex;
             throw new IOException(
                 $"Tunnel read loop failed: {ex.Message}",
@@ -95,7 +144,7 @@ public sealed partial class TunnelClientMultiplexer
         }
         finally
         {
-            await HandleConnectionFaultAsync(preserveSessions: true, expectedGeneration: generation);
+            await HandleConnectionFaultAsync(preserveSessions: preserveSessionsOnFault, expectedGeneration: generation);
         }
     }
 

@@ -75,9 +75,17 @@ public sealed partial class PerformanceMeasurementsTests
             tasks.Add(RunSingleStreamAsync(socksPort, echoPort, streamBytes, chunkBytes, payloadSet, streamId, cts.Token));
         }
 
+        var allTasks = Task.WhenAll(tasks);
+        if (await Task.WhenAny(allTasks, Task.Delay(timeout)) != allTasks)
+        {
+            cts.Cancel();
+            await DrainTasksAfterTimeoutAsync(tasks);
+            throw new TimeoutException($"[perf] {stage} timeout after {timeout.TotalSeconds}s.");
+        }
+
         try
         {
-            await Task.WhenAll(tasks);
+            await allTasks;
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -104,9 +112,17 @@ public sealed partial class PerformanceMeasurementsTests
             tasks.Add(RunPreparedStreamAsync(connectedStream, chunkBytes, payloadSet, cts.Token));
         }
 
+        var allTasks = Task.WhenAll(tasks);
+        if (await Task.WhenAny(allTasks, Task.Delay(timeout)) != allTasks)
+        {
+            cts.Cancel();
+            await DrainTasksAfterTimeoutAsync(tasks);
+            throw new TimeoutException($"[perf] {stage} timeout after {timeout.TotalSeconds}s.");
+        }
+
         try
         {
-            await Task.WhenAll(tasks);
+            await allTasks;
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -127,6 +143,7 @@ public sealed partial class PerformanceMeasurementsTests
     {
         _output.WriteLine($"[perf] stream#{streamId}: connecting to SOCKS 127.0.0.1:{socksPort}");
         using var tcpClient = new TcpClient();
+        using var cancellationRegistration = cancellationToken.Register(static state => ((TcpClient)state!).Dispose(), tcpClient);
         await tcpClient.ConnectAsync(IPAddress.Loopback, socksPort, cancellationToken);
         using var stream = tcpClient.GetStream();
         _output.WriteLine($"[perf] stream#{streamId}: SOCKS TCP connected");
@@ -198,6 +215,7 @@ public sealed partial class PerformanceMeasurementsTests
     {
         _output.WriteLine($"[perf] stream#{streamId}: connecting to SOCKS 127.0.0.1:{socksPort}");
         var tcpClient = new TcpClient();
+        using var cancellationRegistration = cancellationToken.Register(static state => ((TcpClient)state!).Dispose(), tcpClient);
         try
         {
             await tcpClient.ConnectAsync(IPAddress.Loopback, socksPort, cancellationToken);
@@ -236,6 +254,8 @@ public sealed partial class PerformanceMeasurementsTests
         PayloadSet payloadSet,
         CancellationToken cancellationToken)
     {
+        using var cancellationRegistration =
+            cancellationToken.Register(static state => ((TcpClient)state!).Dispose(), connectedStream.Client);
         long sent = 0;
         var chunkIndex = 0;
         var lastLoggedMiB = 0;
@@ -276,5 +296,11 @@ public sealed partial class PerformanceMeasurementsTests
         }
 
         _output.WriteLine($"[perf] stream#{connectedStream.StreamId}: completed");
+    }
+
+    private static async Task DrainTasksAfterTimeoutAsync(IReadOnlyList<Task> tasks)
+    {
+        var drainTask = Task.WhenAll(tasks);
+        await Task.WhenAny(drainTask, Task.Delay(TimeSpan.FromSeconds(5)));
     }
 }

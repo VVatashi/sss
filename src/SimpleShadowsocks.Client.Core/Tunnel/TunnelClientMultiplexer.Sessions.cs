@@ -22,10 +22,14 @@ public sealed partial class TunnelClientMultiplexer
     private async Task<byte> ConnectSessionAsync(uint sessionId, SessionState state, CancellationToken cancellationToken)
     {
         state.BeginConnectAttempt();
-        var payload = ProtocolPayloadSerializer.SerializeConnectRequest(state.ConnectRequest);
+        var frameType = state.IsUdp ? FrameType.UdpAssociate : FrameType.Connect;
+        var payload = state.IsUdp
+            ? Array.Empty<byte>()
+            : ProtocolPayloadSerializer.SerializeConnectRequest(
+                state.ConnectRequest ?? throw new InvalidOperationException("TCP session does not have CONNECT payload."));
         try
         {
-            await SendFrameAsync(new ProtocolFrame(FrameType.Connect, sessionId, 0, payload), cancellationToken);
+            await SendFrameAsync(new ProtocolFrame(frameType, sessionId, 0, payload), cancellationToken);
         }
         catch (Exception ex)
         {
@@ -57,18 +61,19 @@ public sealed partial class TunnelClientMultiplexer
             }
             catch (Exception ex)
             {
-                state.ReaderWriter.Writer.TryComplete(ex);
-                state.MarkClosed();
-                state.FailConnect(ex);
-                _sessions.TryRemove(sessionId, out _);
-                continue;
+                // Keep sessions alive across transient reconnect failures:
+                // EnsureConnected() will retry with a fresh tunnel connection.
+                state.NotifyConnectionFault(ex);
+                throw;
             }
 
             if (replyCode != 0x00)
             {
                 state.MarkClosed();
                 state.FailConnect(new IOException($"Session resume failed with remote reply code {replyCode}."));
-                state.ReaderWriter.Writer.TryComplete(
+                state.ReaderWriter?.Writer.TryComplete(
+                    new IOException($"Session resume failed with remote reply code {replyCode}."));
+                state.UdpReaderWriter?.Writer.TryComplete(
                     new IOException($"Session resume failed with remote reply code {replyCode}."));
                 _sessions.TryRemove(sessionId, out _);
             }

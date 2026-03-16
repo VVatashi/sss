@@ -74,6 +74,38 @@ public static class ProtocolPayloadSerializer
         return BinaryPrimitives.ReadUInt64BigEndian(payload);
     }
 
+    public static byte[] SerializeUdpDatagram(UdpDatagram datagram)
+    {
+        var endpointPayload = SerializeConnectRequest(new ConnectRequest(datagram.AddressType, datagram.Address, datagram.Port));
+        var payload = new byte[endpointPayload.Length + datagram.Payload.Length];
+        Buffer.BlockCopy(endpointPayload, 0, payload, 0, endpointPayload.Length);
+        datagram.Payload.CopyTo(payload.AsMemory(endpointPayload.Length));
+        return payload;
+    }
+
+    public static UdpDatagram DeserializeUdpDatagram(ReadOnlySpan<byte> payload)
+    {
+        var request = DeserializeConnectRequest(payload);
+        var endpointLength = request.AddressType switch
+        {
+            AddressType.IPv4 => 1 + 4 + 2,
+            AddressType.IPv6 => 1 + 16 + 2,
+            AddressType.Domain => 1 + 1 + Encoding.ASCII.GetByteCount(request.Address) + 2,
+            _ => throw new InvalidDataException($"Unsupported UDP address type: {request.AddressType}.")
+        };
+
+        if (payload.Length < endpointLength)
+        {
+            throw new InvalidDataException("UDP payload is too short.");
+        }
+
+        return new UdpDatagram(
+            request.AddressType,
+            request.Address,
+            request.Port,
+            payload.Slice(endpointLength).ToArray());
+    }
+
     private static byte[] SerializeIpConnectRequest(ConnectRequest request, AddressFamily expectedFamily, int ipLength)
     {
         if (!IPAddress.TryParse(request.Address, out var ipAddress))

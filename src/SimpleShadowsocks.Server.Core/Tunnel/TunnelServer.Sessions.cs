@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Sockets;
 using SimpleShadowsocks.Protocol;
 
@@ -22,6 +23,22 @@ public sealed partial class TunnelServer
             cancellationToken);
     }
 
+    private static Task SendUdpAssociateReplyAsync(
+        Stream stream,
+        uint sessionId,
+        byte replyCode,
+        SemaphoreSlim writeLock,
+        ProtocolWriteOptions writeOptions,
+        CancellationToken cancellationToken)
+    {
+        return SendFrameLockedAsync(
+            stream,
+            new ProtocolFrame(FrameType.UdpAssociate, sessionId, 0, new[] { replyCode }),
+            writeLock,
+            writeOptions,
+            cancellationToken);
+    }
+
     private static async Task CloseSessionAsync(
         ConcurrentDictionary<uint, SessionContext> sessions,
         uint sessionId,
@@ -38,6 +55,11 @@ public sealed partial class TunnelServer
 
         context.Cancellation.Cancel();
         context.Dispose();
+        StructuredLog.Info(
+            "tunnel-server",
+            context is UdpSessionContext ? "TUNNEL/UDP" : "TUNNEL/TCP",
+            "session disposed",
+            sessionId);
 
         if (sendCloseToClient)
         {
@@ -74,23 +96,19 @@ public sealed partial class TunnelServer
         }
     }
 
-    private sealed class SessionContext : IDisposable
+    private abstract class SessionContext : IDisposable
     {
         private readonly object _sequenceLock = new();
         private ulong _nextSendSequence;
         private ulong _nextExpectedIncomingSequence;
 
-        public SessionContext(uint sessionId, TcpClient upstreamClient, NetworkStream upstreamStream, CancellationTokenSource cancellation)
+        protected SessionContext(uint sessionId, CancellationTokenSource cancellation)
         {
             SessionId = sessionId;
-            UpstreamClient = upstreamClient;
-            UpstreamStream = upstreamStream;
             Cancellation = cancellation;
         }
 
         public uint SessionId { get; }
-        public TcpClient UpstreamClient { get; }
-        public NetworkStream UpstreamStream { get; }
         public CancellationTokenSource Cancellation { get; }
         public Task? UpstreamToClientTask { get; set; }
 
@@ -125,9 +143,43 @@ public sealed partial class TunnelServer
             }
         }
 
-        public void Dispose()
+        public abstract void Dispose();
+    }
+
+    private sealed class TcpSessionContext : SessionContext
+    {
+        public TcpSessionContext(uint sessionId, TcpClient upstreamClient, NetworkStream upstreamStream, CancellationTokenSource cancellation)
+            : base(sessionId, cancellation)
+        {
+            UpstreamClient = upstreamClient;
+            UpstreamStream = upstreamStream;
+        }
+
+        public TcpClient UpstreamClient { get; }
+        public NetworkStream UpstreamStream { get; }
+
+        public override void Dispose()
         {
             try { UpstreamStream.Dispose(); } catch { }
+            try { UpstreamClient.Dispose(); } catch { }
+            try { Cancellation.Dispose(); } catch { }
+        }
+    }
+
+    private sealed class UdpSessionContext : SessionContext
+    {
+        public UdpSessionContext(uint sessionId, UdpClient upstreamClient, CancellationTokenSource cancellation)
+            : base(sessionId, cancellation)
+        {
+            UpstreamClient = upstreamClient;
+            LastRemoteEndPoint = null;
+        }
+
+        public UdpClient UpstreamClient { get; }
+        public IPEndPoint? LastRemoteEndPoint { get; set; }
+
+        public override void Dispose()
+        {
             try { UpstreamClient.Dispose(); } catch { }
             try { Cancellation.Dispose(); } catch { }
         }

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Sockets;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
@@ -117,7 +118,23 @@ public sealed partial class TunnelServer
                 writeOptions,
                 serverPolicy,
                 cancellationToken),
+            FrameType.UdpAssociate => HandleUdpAssociateFrameDispatchAsync(
+                secureStream,
+                writeLock,
+                sessions,
+                pendingConnectSessions,
+                frame,
+                writeOptions,
+                serverPolicy,
+                cancellationToken),
             FrameType.Data => HandleDataFrameAsync(
+                secureStream,
+                writeLock,
+                sessions,
+                frame,
+                writeOptions,
+                cancellationToken),
+            FrameType.UdpData => HandleUdpDataFrameAsync(
                 secureStream,
                 writeLock,
                 sessions,
@@ -167,6 +184,31 @@ public sealed partial class TunnelServer
         return Task.CompletedTask;
     }
 
+    private static Task HandleUdpAssociateFrameDispatchAsync(
+        Stream secureStream,
+        SemaphoreSlim writeLock,
+        ConcurrentDictionary<uint, SessionContext> sessions,
+        ConcurrentDictionary<uint, byte> pendingConnectSessions,
+        ProtocolFrame frame,
+        ProtocolWriteOptions writeOptions,
+        TunnelServerPolicy serverPolicy,
+        CancellationToken cancellationToken)
+    {
+        _ = Task.Run(
+            () => HandleUdpAssociateFrameSafelyAsync(
+                secureStream,
+                writeLock,
+                sessions,
+                pendingConnectSessions,
+                frame,
+                writeOptions,
+                serverPolicy,
+                cancellationToken),
+            cancellationToken);
+
+        return Task.CompletedTask;
+    }
+
     private static async Task HandleDataFrameAsync(
         Stream secureStream,
         SemaphoreSlim writeLock,
@@ -177,6 +219,19 @@ public sealed partial class TunnelServer
     {
         if (!sessions.TryGetValue(frame.SessionId, out var session))
         {
+            return;
+        }
+
+        if (session is not TcpSessionContext tcpSession)
+        {
+            await CloseSessionAsync(
+                sessions,
+                frame.SessionId,
+                sendCloseToClient: true,
+                secureStream,
+                writeLock,
+                writeOptions,
+                CancellationToken.None);
             return;
         }
 
@@ -195,8 +250,99 @@ public sealed partial class TunnelServer
 
         if (!frame.Payload.IsEmpty)
         {
-            await session.UpstreamStream.WriteAsync(frame.Payload, cancellationToken);
-            await session.UpstreamStream.FlushAsync(cancellationToken);
+            await tcpSession.UpstreamStream.WriteAsync(frame.Payload, cancellationToken);
+            await tcpSession.UpstreamStream.FlushAsync(cancellationToken);
+        }
+    }
+
+    private static async Task HandleUdpDataFrameAsync(
+        Stream secureStream,
+        SemaphoreSlim writeLock,
+        ConcurrentDictionary<uint, SessionContext> sessions,
+        ProtocolFrame frame,
+        ProtocolWriteOptions writeOptions,
+        CancellationToken cancellationToken)
+    {
+        if (!sessions.TryGetValue(frame.SessionId, out var session))
+        {
+            return;
+        }
+
+        if (session is not UdpSessionContext udpSession)
+        {
+            await CloseSessionAsync(
+                sessions,
+                frame.SessionId,
+                sendCloseToClient: true,
+                secureStream,
+                writeLock,
+                writeOptions,
+                CancellationToken.None);
+            return;
+        }
+
+        if (!session.TryAcceptIncomingSequence(frame.Sequence))
+        {
+            await CloseSessionAsync(
+                sessions,
+                frame.SessionId,
+                sendCloseToClient: true,
+                secureStream,
+                writeLock,
+                writeOptions,
+                CancellationToken.None);
+            return;
+        }
+
+        if (frame.Payload.IsEmpty)
+        {
+            return;
+        }
+
+        UdpDatagram datagram;
+        IPEndPoint remoteEndPoint;
+        try
+        {
+            datagram = ProtocolPayloadSerializer.DeserializeUdpDatagram(frame.Payload.Span);
+            remoteEndPoint = await ResolveRemoteEndPointAsync(datagram, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            StructuredLog.Error("tunnel-server", "TUNNEL/UDP", "invalid UDP payload", ex, frame.SessionId);
+            await CloseSessionAsync(
+                sessions,
+                frame.SessionId,
+                sendCloseToClient: true,
+                secureStream,
+                writeLock,
+                writeOptions,
+                CancellationToken.None);
+            return;
+        }
+
+        try
+        {
+            await udpSession.UpstreamClient.SendAsync(datagram.Payload.ToArray(), remoteEndPoint, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            StructuredLog.Error("tunnel-server", "TUNNEL/UDP", "upstream UDP send failed", ex, frame.SessionId);
+            await CloseSessionAsync(
+                sessions,
+                frame.SessionId,
+                sendCloseToClient: true,
+                secureStream,
+                writeLock,
+                writeOptions,
+                CancellationToken.None);
         }
     }
 
@@ -263,5 +409,23 @@ public sealed partial class TunnelServer
             writeLock,
             writeOptions,
             cancellationToken);
+    }
+
+    private static async Task<IPEndPoint> ResolveRemoteEndPointAsync(UdpDatagram datagram, CancellationToken cancellationToken)
+    {
+        if (datagram.AddressType is AddressType.IPv4 or AddressType.IPv6)
+        {
+            return new IPEndPoint(IPAddress.Parse(datagram.Address), datagram.Port);
+        }
+
+        var addresses = await Dns.GetHostAddressesAsync(datagram.Address, cancellationToken);
+        var selected = addresses.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork)
+            ?? addresses.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetworkV6);
+        if (selected is null)
+        {
+            throw new InvalidDataException($"Unable to resolve UDP destination '{datagram.Address}'.");
+        }
+
+        return new IPEndPoint(selected, datagram.Port);
     }
 }
