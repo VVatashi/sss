@@ -78,13 +78,13 @@ public sealed partial class Socks5Server
 
         var port = (ushort)((portBytes[0] << 8) | portBytes[1]);
 
-        if (command != CommandConnect)
+        if (command is not CommandConnect and not CommandUdpAssociate)
         {
             await SendReplyAsync(stream, replyCode: 0x07, null, cancellationToken);
             return null;
         }
 
-        return new Socks5ConnectRequest(host, port, addressType);
+        return new Socks5ConnectRequest(command, host, port, addressType);
     }
 
     private static async Task<string?> ReadIPv4AddressAsync(NetworkStream stream, CancellationToken cancellationToken)
@@ -143,6 +143,16 @@ public sealed partial class Socks5Server
         };
     }
 
+    private static AddressType ToProtocolAddressType(IPAddress ipAddress)
+    {
+        return ipAddress.AddressFamily switch
+        {
+            AddressFamily.InterNetwork => AddressType.IPv4,
+            AddressFamily.InterNetworkV6 => AddressType.IPv6,
+            _ => throw new InvalidDataException($"Unsupported IP address family: {ipAddress.AddressFamily}")
+        };
+    }
+
     private static async Task SendReplyAsync(
         NetworkStream stream,
         byte replyCode,
@@ -191,5 +201,46 @@ public sealed partial class Socks5Server
         }
 
         return true;
+    }
+
+    private static byte[] BuildUdpRequestDatagram(AddressType addressType, string address, ushort port, ReadOnlySpan<byte> payload)
+    {
+        var endpointPayload = ProtocolPayloadSerializer.SerializeConnectRequest(new ConnectRequest(addressType, address, port));
+        var datagram = new byte[3 + endpointPayload.Length + payload.Length];
+        datagram[0] = 0x00;
+        datagram[1] = 0x00;
+        datagram[2] = 0x00;
+        Buffer.BlockCopy(endpointPayload, 0, datagram, 3, endpointPayload.Length);
+        payload.CopyTo(datagram.AsSpan(3 + endpointPayload.Length));
+        return datagram;
+    }
+
+    private static bool TryParseUdpRequestDatagram(ReadOnlySpan<byte> datagram, out UdpDatagram parsed)
+    {
+        parsed = default;
+        if (datagram.Length < 3)
+        {
+            return false;
+        }
+
+        if (datagram[0] != 0x00 || datagram[1] != 0x00)
+        {
+            return false;
+        }
+
+        if (datagram[2] != 0x00)
+        {
+            return false;
+        }
+
+        try
+        {
+            parsed = ProtocolPayloadSerializer.DeserializeUdpDatagram(datagram.Slice(3));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 }

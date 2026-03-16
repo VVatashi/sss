@@ -2,7 +2,8 @@ param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Debug",
     [switch]$NoBuild,
-    [switch]$NoRestore
+    [switch]$NoRestore,
+    [switch]$IncludePerformance
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,4 +45,7 @@ function Invoke-TestStage {
 
 Invoke-TestStage -Name "Unit tests" -Category "Unit"
 Invoke-TestStage -Name "Integration tests" -Category "Integration"
-Invoke-TestStage -Name "Performance tests" -Category "Performance"
+
+if ($IncludePerformance) {
+    Invoke-TestStage -Name "Performance tests" -Category "Performance"
+}

@@ -133,6 +133,7 @@ public sealed partial class PerformanceMeasurementsTests
                         using (client)
                         {
                             using var upstream = new TcpClient();
+                            using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
 
                             try
                             {
@@ -140,9 +141,27 @@ public sealed partial class PerformanceMeasurementsTests
                                 using var clientStream = client.GetStream();
                                 using var upstreamStream = upstream.GetStream();
 
-                                var toServer = CopyAndCountAsync(clientStream, upstreamStream, bytes => Interlocked.Add(ref bytesClientToServer, bytes), cts.Token);
-                                var toClient = CopyAndCountAsync(upstreamStream, clientStream, bytes => Interlocked.Add(ref bytesServerToClient, bytes), cts.Token);
+                                var toServer = CopyAndCountAsync(
+                                    clientStream,
+                                    upstreamStream,
+                                    bytes => Interlocked.Add(ref bytesClientToServer, bytes),
+                                    relayCts.Token);
+                                var toClient = CopyAndCountAsync(
+                                    upstreamStream,
+                                    clientStream,
+                                    bytes => Interlocked.Add(ref bytesServerToClient, bytes),
+                                    relayCts.Token);
+
                                 await Task.WhenAny(toServer, toClient);
+                                relayCts.Cancel();
+
+                                try
+                                {
+                                    await Task.WhenAll(toServer, toClient);
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                }
                             }
                             catch (OperationCanceledException)
                             {

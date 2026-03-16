@@ -68,7 +68,7 @@ public sealed partial class TunnelServer
             }
 
             var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var context = new SessionContext(frame.SessionId, upstreamClient, upstreamClient.GetStream(), sessionCts);
+            var context = new TcpSessionContext(frame.SessionId, upstreamClient, upstreamClient.GetStream(), sessionCts);
             context.MarkConnectReceived();
             if (!sessions.TryAdd(frame.SessionId, context))
             {
@@ -165,6 +165,147 @@ public sealed partial class TunnelServer
             {
             }
         }
+    }
+
+    private static async Task HandleUdpAssociateFrameAsync(
+        Stream secureStream,
+        SemaphoreSlim writeLock,
+        ConcurrentDictionary<uint, SessionContext> sessions,
+        ConcurrentDictionary<uint, byte> pendingConnectSessions,
+        ProtocolFrame frame,
+        ProtocolWriteOptions writeOptions,
+        TunnelServerPolicy serverPolicy,
+        CancellationToken cancellationToken)
+    {
+        if (!pendingConnectSessions.TryAdd(frame.SessionId, 0))
+        {
+            await SendUdpAssociateReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, writeOptions, cancellationToken);
+            return;
+        }
+
+        try
+        {
+            if (frame.Sequence != 0)
+            {
+                await SendUdpAssociateReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, writeOptions, cancellationToken);
+                return;
+            }
+
+            if (sessions.Count >= serverPolicy.MaxSessionsPerTunnel || sessions.ContainsKey(frame.SessionId))
+            {
+                await SendUdpAssociateReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, writeOptions, cancellationToken);
+                return;
+            }
+
+            var upstreamClient = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
+            var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var context = new UdpSessionContext(frame.SessionId, upstreamClient, sessionCts);
+            context.MarkConnectReceived();
+            if (!sessions.TryAdd(frame.SessionId, context))
+            {
+                context.Dispose();
+                await SendUdpAssociateReplyAsync(secureStream, frame.SessionId, replyCode: 0x01, writeLock, writeOptions, cancellationToken);
+                return;
+            }
+
+            context.UpstreamToClientTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!context.Cancellation.Token.IsCancellationRequested)
+                    {
+                        var result = await context.UpstreamClient.ReceiveAsync(context.Cancellation.Token);
+                        var addressType = ToProtocolAddressType(result.RemoteEndPoint.Address);
+                        var datagram = new UdpDatagram(
+                            addressType,
+                            result.RemoteEndPoint.Address.ToString(),
+                            (ushort)result.RemoteEndPoint.Port,
+                            result.Buffer);
+                        var payload = ProtocolPayloadSerializer.SerializeUdpDatagram(datagram);
+                        var sequence = context.TakeNextSendSequence();
+                        await SendFrameLockedAsync(
+                            secureStream,
+                            new ProtocolFrame(FrameType.UdpData, context.SessionId, sequence, payload),
+                            writeLock,
+                            writeOptions,
+                            context.Cancellation.Token);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                finally
+                {
+                    await CloseSessionAsync(
+                        sessions,
+                        context.SessionId,
+                        sendCloseToClient: true,
+                        secureStream,
+                        writeLock,
+                        writeOptions,
+                        CancellationToken.None);
+                }
+            }, context.Cancellation.Token);
+
+            await SendUdpAssociateReplyAsync(secureStream, frame.SessionId, replyCode: 0x00, writeLock, writeOptions, cancellationToken);
+        }
+        finally
+        {
+            pendingConnectSessions.TryRemove(frame.SessionId, out _);
+        }
+    }
+
+    private static async Task HandleUdpAssociateFrameSafelyAsync(
+        Stream secureStream,
+        SemaphoreSlim writeLock,
+        ConcurrentDictionary<uint, SessionContext> sessions,
+        ConcurrentDictionary<uint, byte> pendingConnectSessions,
+        ProtocolFrame frame,
+        ProtocolWriteOptions writeOptions,
+        TunnelServerPolicy serverPolicy,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await HandleUdpAssociateFrameAsync(
+                secureStream,
+                writeLock,
+                sessions,
+                pendingConnectSessions,
+                frame,
+                writeOptions,
+                serverPolicy,
+                cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch
+        {
+            try
+            {
+                await SendUdpAssociateReplyAsync(
+                    secureStream,
+                    frame.SessionId,
+                    replyCode: 0x05,
+                    writeLock,
+                    writeOptions,
+                    CancellationToken.None);
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static AddressType ToProtocolAddressType(IPAddress ipAddress)
+    {
+        return ipAddress.AddressFamily switch
+        {
+            AddressFamily.InterNetwork => AddressType.IPv4,
+            AddressFamily.InterNetworkV6 => AddressType.IPv6,
+            _ => throw new InvalidDataException($"Unsupported address family: {ipAddress.AddressFamily}.")
+        };
     }
 
     private static async Task ConnectUpstreamAsync(

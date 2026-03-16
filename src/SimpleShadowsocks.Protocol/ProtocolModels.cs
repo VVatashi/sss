@@ -25,7 +25,9 @@ public enum FrameType : byte
     Data = 2,
     Close = 3,
     Ping = 4,
-    Pong = 5
+    Pong = 5,
+    UdpAssociate = 6,
+    UdpData = 7
 }
 
 public enum AddressType : byte
@@ -37,6 +39,7 @@ public enum AddressType : byte
 
 public readonly record struct ConnectRequest(AddressType AddressType, string Address, ushort Port);
 public readonly record struct DataChunk(uint SessionId, ReadOnlyMemory<byte> Payload);
+public readonly record struct UdpDatagram(AddressType AddressType, string Address, ushort Port, ReadOnlyMemory<byte> Payload);
 public readonly record struct ProtocolFrame(FrameType Type, uint SessionId, ulong Sequence, ReadOnlyMemory<byte> Payload);
 public readonly record struct ProtocolReadResult(ProtocolFrame Frame, byte Version, byte Flags);
 

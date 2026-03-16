@@ -56,17 +56,30 @@ public sealed partial class TunnelClientMultiplexer
                 switch (frame.Type)
                 {
                     case FrameType.Connect:
+                    case FrameType.UdpAssociate:
                         state.CompleteConnectReply(frame.Payload.Length >= 1 ? frame.Payload.Span[0] : (byte)0x01);
                         break;
 
                     case FrameType.Data:
-                        await state.ReaderWriter.Writer.WriteAsync(DetachPayload(frame.Payload), cancellationToken);
+                        if (state.ReaderWriter is not null)
+                        {
+                            await state.ReaderWriter.Writer.WriteAsync(DetachPayload(frame.Payload), cancellationToken);
+                        }
+                        break;
+
+                    case FrameType.UdpData:
+                        if (state.UdpReaderWriter is not null)
+                        {
+                            var datagram = ProtocolPayloadSerializer.DeserializeUdpDatagram(frame.Payload.Span);
+                            await state.UdpReaderWriter.Writer.WriteAsync(datagram, cancellationToken);
+                        }
                         break;
 
                     case FrameType.Close:
                         state.MarkClosed();
                         state.FailConnect(new IOException("Session closed by remote."));
-                        state.ReaderWriter.Writer.TryComplete();
+                        state.ReaderWriter?.Writer.TryComplete();
+                        state.UdpReaderWriter?.Writer.TryComplete();
                         _sessions.TryRemove(frame.SessionId, out _);
                         break;
 

@@ -165,7 +165,8 @@ public sealed partial class TunnelClientMultiplexer
         foreach (var (sessionId, state) in _sessions.ToArray())
         {
             state.MarkClosed();
-            state.ReaderWriter.Writer.TryComplete();
+            state.ReaderWriter?.Writer.TryComplete();
+            state.UdpReaderWriter?.Writer.TryComplete();
             if (_connectionError is not null)
             {
                 state.FailConnect(_connectionError);

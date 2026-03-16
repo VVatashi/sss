@@ -12,6 +12,7 @@ public sealed partial class Socks5Server
     private const byte AuthNone = 0x00;
     private const byte AuthNoAcceptableMethods = 0xFF;
     private const byte CommandConnect = 0x01;
+    private const byte CommandUdpAssociate = 0x03;
     private const byte AddressTypeIPv4 = 0x01;
     private const byte AddressTypeDomain = 0x03;
     private const byte AddressTypeIPv6 = 0x04;
@@ -175,15 +176,34 @@ public sealed partial class Socks5Server
             return;
         }
 
-        Console.WriteLine($"[socks5] proxy {request.Value.Host}:{request.Value.Port}");
-
-        if (selectedMultiplexer is null)
+        switch (request.Value.Command)
         {
-            await HandleDirectAsync(clientStream, request.Value, cancellationToken);
-            return;
-        }
+            case CommandConnect:
+                Console.WriteLine($"[socks5] proxy tcp {request.Value.Host}:{request.Value.Port}");
+                if (selectedMultiplexer is null)
+                {
+                    await HandleDirectAsync(clientStream, request.Value, cancellationToken);
+                    return;
+                }
 
-        await HandleViaTunnelAsync(clientStream, request.Value, selectedMultiplexer, cancellationToken);
+                await HandleViaTunnelAsync(clientStream, request.Value, selectedMultiplexer, cancellationToken);
+                return;
+
+            case CommandUdpAssociate:
+                Console.WriteLine($"[socks5] proxy udp associate {request.Value.Host}:{request.Value.Port}");
+                if (selectedMultiplexer is null)
+                {
+                    await HandleUdpAssociateDirectAsync(clientStream, request.Value, cancellationToken);
+                    return;
+                }
+
+                await HandleUdpAssociateViaTunnelAsync(clientStream, request.Value, selectedMultiplexer, cancellationToken);
+                return;
+
+            default:
+                await SendReplyAsync(clientStream, replyCode: 0x07, null, cancellationToken);
+                return;
+        }
     }
 
     private TunnelClientMultiplexer? SelectMultiplexerForClient()
