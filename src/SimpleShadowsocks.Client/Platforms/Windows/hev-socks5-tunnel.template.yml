@@ -1,0 +1,15 @@
+tunnel:
+  name: Wintun
+  mtu: 8500
+  multi-queue: false
+  ipv4: 198.18.0.1
+  ipv6: 'fc00::1'
+
+socks5:
+  address: __SOCKS_ADDRESS__
+  port: __SOCKS_PORT__
+  udp: 'udp'
+
+misc:
+  log-file: stderr
+  log-level: warn

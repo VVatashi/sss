@@ -112,6 +112,7 @@ SimpleShadowsocks позволяет поднять защищенный TCP/UDP
 ```json
 {
   "ListenPort": 1080,
+  "ListenAddress": "127.0.0.1",
   "RemoteHost": "your-server-host",
   "RemotePort": 8388,
   "RemoteServers": [],
@@ -122,6 +123,8 @@ SimpleShadowsocks позволяет поднять защищенный TCP/UDP
   "TunnelCipherAlgorithm": "ChaCha20Poly1305"
 }
 ```
+
+`ListenAddress` задаёт локальный адрес, на котором клиент поднимает SOCKS5-сервер. Этот же адрес использует Windows-обвязка `hev-socks5-tunnel`.
 
 Если используете несколько серверов, задайте `RemoteServers` списком. При непустом `RemoteServers` используется именно он (балансировка `round-robin`).
 
@@ -161,6 +164,33 @@ dotnet SimpleShadowsocks.Client.dll 1080 your-server-host 8388
 Аргументы: `<listenPort> <remoteHost> <remotePort> [sharedKey]`
 
 После запуска клиент слушает локальный SOCKS5 на `127.0.0.1:1080`.
+
+#### Windows: полный системный туннель через Wintun
+
+Windows-сборка `SimpleShadowsocks.Client` автоматически копирует рядом с exe:
+
+- `hev-socks5-tunnel.exe`
+- `wintun.dll`
+- `msys-2.0.dll`
+- `run-full-tunnel.ps1`
+- `hev-socks5-tunnel.template.yml`
+
+Запускать нужно из каталога клиента с правами администратора:
+
+```powershell
+.\run-full-tunnel.ps1
+```
+
+Скрипт:
+
+- читает `appsettings.json`;
+- генерирует `hev-socks5-tunnel.yml` из шаблона;
+- запускает `hev-socks5-tunnel` на локальный SOCKS5 клиента (`ListenAddress` + `ListenPort`);
+- создаёт bypass-маршруты для `RemoteHost` или всех `RemoteServers`;
+- отправляет остальной IPv4/IPv6 трафик в интерфейс `Wintun`;
+- при ошибке, штатном завершении или `Ctrl+C` удаляет созданные маршруты и останавливает `hev-socks5-tunnel`.
+
+Для full-tunnel рекомендуется оставлять `ListenAddress` равным `127.0.0.1`.
 
 #### Linux: запуск сервера как systemd unit
 

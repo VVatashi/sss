@@ -7,6 +7,7 @@ using SimpleShadowsocks.Protocol.Crypto;
 
 var config = ClientConfig.Load();
 var listenPort = config.ListenPort;
+var listenAddress = config.GetListenIPAddress();
 var remoteHost = config.RemoteHost;
 var remotePort = config.RemotePort;
 var remoteServers = (config.RemoteServers ?? [])
@@ -65,7 +66,7 @@ Console.CancelKeyPress += (_, eventArgs) =>
 };
 
 StructuredLog.Info("client-host", "CONTROL", "SimpleShadowsocks.Client started");
-StructuredLog.Info("client-host", "SOCKS5", $"listen=127.0.0.1:{listenPort}");
+StructuredLog.Info("client-host", "SOCKS5", $"listen={listenAddress}:{listenPort}");
 if (remoteServers.Count > 0)
 {
     StructuredLog.Info("client-host", "TUNNEL/TCP", $"servers={string.Join(", ", remoteServers.Select(s => $"{s.Item1}:{s.Item2}"))}");
@@ -83,7 +84,7 @@ StructuredLog.Info("client-host", "CONTROL", "press Ctrl+C to stop");
 
 var server = remoteServers.Count > 0
     ? new Socks5Server(
-        IPAddress.Loopback,
+        listenAddress,
         listenPort,
         remoteServers,
         sharedKey,
@@ -93,7 +94,7 @@ var server = remoteServers.Count > 0
         enableCompression,
         compressionAlgorithm)
     : new Socks5Server(
-        IPAddress.Loopback,
+        listenAddress,
         listenPort,
         remoteHost,
         remotePort,
@@ -108,6 +109,7 @@ await server.RunAsync(cts.Token);
 internal sealed class ClientConfig
 {
     public int ListenPort { get; init; } = 1080;
+    public string ListenAddress { get; init; } = IPAddress.Loopback.ToString();
     public string RemoteHost { get; init; } = "127.0.0.1";
     public int RemotePort { get; init; } = 8388;
     public string SharedKey { get; init; } = "dev-shared-key";
@@ -153,6 +155,18 @@ internal sealed class ClientConfig
             $"Supported: {nameof(SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm.Deflate)}, " +
             $"{nameof(SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm.Gzip)}, " +
             $"{nameof(SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm.Brotli)}");
+    }
+
+    public IPAddress GetListenIPAddress()
+    {
+        if (IPAddress.TryParse(ListenAddress, out var parsed))
+        {
+            return parsed;
+        }
+
+        throw new InvalidDataException(
+            $"Unsupported ListenAddress: '{ListenAddress}'. " +
+            "Expected a valid IPv4 or IPv6 literal.");
     }
 
     public static ClientConfig Load()

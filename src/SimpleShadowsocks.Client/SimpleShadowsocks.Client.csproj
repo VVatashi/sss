@@ -7,6 +7,35 @@
   <ItemGroup>
     <None Include="appsettings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="Platforms\Windows\NativeLibs\msys-2.0.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>msys-2.0.dll</TargetPath>
+    </None>
+    <None Include="Platforms\Windows\NativeLibs\wintun.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>wintun.dll</TargetPath>
+    </None>
+    <None Include="Platforms\Windows\NativeLibs\hev-socks5-tunnel.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>hev-socks5-tunnel.exe</TargetPath>
+    </None>
+    <None Include="Platforms\Windows\run-full-tunnel.ps1">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>run-full-tunnel.ps1</TargetPath>
+    </None>
+    <None Include="Platforms\Windows\hev-socks5-tunnel.template.yml">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>hev-socks5-tunnel.template.yml</TargetPath>
     </None>
   </ItemGroup>
 
