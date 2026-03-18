@@ -1,10 +1,13 @@
+using SimpleShadowsocks.Client.Core.Diagnostics;
 using System.Text;
 
 namespace SimpleShadowsocks.Client.Maui.Services;
 
 public static class AppLog
 {
+    private const int MaxMessages = 512;
     private static readonly object Sync = new();
+    private static readonly FixedLogBuffer Buffer = new(MaxMessages);
     private static TextWriter? _originalOut;
     private static TextWriter? _originalError;
     private static bool _initialized;
@@ -30,16 +33,35 @@ public static class AppLog
 
     public static void Write(string message)
     {
-        WriteRaw($"[{DateTime.Now:HH:mm:ss}] {message}");
+        var line = $"[{DateTime.Now:HH:mm:ss}] {message}";
+        AppendLine(line);
+        _originalOut?.WriteLine(line);
+    }
+
+    public static string GetText()
+    {
+        lock (Sync)
+        {
+            return Buffer.BuildText();
+        }
     }
 
     private static void WriteRaw(string message)
     {
+        AppendLine(message);
+    }
+
+    private static void AppendLine(string message)
+    {
+        Action<string>? handlers;
+
         lock (Sync)
         {
-            LineAdded?.Invoke(message);
-            _originalOut?.WriteLine(message);
+            Buffer.Add(message);
+            handlers = LineAdded;
         }
+
+        handlers?.Invoke(message);
     }
 
     private sealed class RelayTextWriter : TextWriter

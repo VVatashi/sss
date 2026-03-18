@@ -12,6 +12,7 @@ public sealed class TunnelServerPolicy
     public int MaxConcurrentTunnels { get; init; } = 1024;
     public int MaxSessionsPerTunnel { get; init; } = 1024;
     public int ConnectTimeoutMs { get; init; } = 10_000;
+    internal Func<ConnectRequest, int, CancellationToken, ValueTask<byte?>>? ConnectReplyOverrideAsync { get; init; }
 }
 
 public sealed partial class TunnelServer

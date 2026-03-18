@@ -57,6 +57,24 @@ public sealed partial class TunnelServer
             var upstreamClient = new TcpClient();
             try
             {
+                var connectReplyOverride = serverPolicy.ConnectReplyOverrideAsync;
+                if (connectReplyOverride is not null)
+                {
+                    var overrideReply = await connectReplyOverride(request, serverPolicy.ConnectTimeoutMs, cancellationToken);
+                    if (overrideReply.HasValue)
+                    {
+                        upstreamClient.Dispose();
+                        await SendConnectReplyAsync(
+                            secureStream,
+                            frame.SessionId,
+                            overrideReply.Value,
+                            writeLock,
+                            writeOptions,
+                            cancellationToken);
+                        return;
+                    }
+                }
+
                 await ConnectUpstreamAsync(upstreamClient, request, serverPolicy.ConnectTimeoutMs, cancellationToken);
             }
             catch (Exception ex)

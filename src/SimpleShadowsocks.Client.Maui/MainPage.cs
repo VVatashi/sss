@@ -1,7 +1,6 @@
 using SimpleShadowsocks.Client.Maui.Services;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
-using System.Text;
 
 namespace SimpleShadowsocks.Client.Maui;
 
@@ -21,7 +20,6 @@ public sealed class MainPage : ContentPage
     private readonly Button _copyLogsButton;
     private readonly Button _startButton;
     private readonly Button _stopButton;
-    private readonly StringBuilder _logBuffer = new();
 
     public MainPage(ProxyRunner proxyRunner, UiConfigStore configStore)
     {
@@ -71,6 +69,7 @@ public sealed class MainPage : ContentPage
         _compressionPicker.SelectedIndexChanged += (_, _) => SaveUiDraft();
         _cipherPicker.SelectedIndexChanged += (_, _) => SaveUiDraft();
         _compressionPicker.IsEnabled = _compressionSwitch.IsToggled;
+        _logEditor.Text = string.Empty;
         _logEditor.GestureRecognizers.Add(new TapGestureRecognizer
         {
             Command = new Command(async () => await CopyLogsAsync())
@@ -114,6 +113,8 @@ public sealed class MainPage : ContentPage
                 }
             }
         };
+
+        RefreshLogView();
     }
 
     private async void StartButtonOnClicked(object? sender, EventArgs e)
@@ -177,9 +178,13 @@ public sealed class MainPage : ContentPage
 
     private void AppendLog(string line)
     {
-        _logBuffer.AppendLine(line);
-        _logEditor.Text = _logBuffer.ToString();
-        _logEditor.CursorPosition = _logEditor.Text.Length;
+        RefreshLogView();
+    }
+
+    protected override void OnAppearing()
+    {
+        base.OnAppearing();
+        RefreshLogView();
     }
 
     private async Task CopyLogsAsync()
@@ -267,6 +272,13 @@ public sealed class MainPage : ContentPage
     {
         _startButton.IsEnabled = !isRunning;
         _stopButton.IsEnabled = isRunning;
+    }
+
+    private void RefreshLogView()
+    {
+        var text = AppLog.GetText();
+        _logEditor.Text = text;
+        _logEditor.CursorPosition = text.Length;
     }
 
     private static View BuildRow(string caption, View control)

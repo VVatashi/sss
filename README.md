@@ -144,6 +144,7 @@ SimpleShadowsocks позволяет поднять защищенный TCP/UDP
 Важно:
 
 - Для Android VPN MVP должен быть отключен `Private DNS`, иначе `DNS-over-TLS (:853)` не пойдет через текущую реализацию.
+- Поле `Logs` в Android-клиенте является только runtime-буфером: оно не сохраняется между запусками приложения и ограничено фиксированным окном последних `512` сообщений.
 
 ### Запуск
 
@@ -309,6 +310,8 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 pwsh .\tests\run-tests.ps1
 ```
 
+Integration-сценарии для `CONNECT timeout`/policy не зависят от внешней сети: они используют детерминированный test-hook в `TunnelServer`, чтобы исключить флейки из-за локальной маршрутизации и особенностей сетевого стека ОС.
+
 По умолчанию запускаются только `Unit` + `Integration`; performance-тесты включаются только явно:
 
 ```powershell
@@ -380,6 +383,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - логируются подключения/соединения (start/listen/accept/open/close);
 - логируются ошибки/сбои;
 - отсутствует логирование в hot-path на каждый пакет данных.
+- Android UI-лог хранит только последние `512` сообщений в кольцевом буфере без сдвига всего массива при вытеснении старых записей.
 
 ### Детальный разбор протокола
 

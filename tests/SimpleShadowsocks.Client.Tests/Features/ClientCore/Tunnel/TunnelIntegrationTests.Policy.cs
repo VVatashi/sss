@@ -10,6 +10,8 @@ namespace SimpleShadowsocks.Client.Tests;
 
 public sealed partial class TunnelIntegrationTests
 {
+    private static readonly IPAddress SlowConnectTestAddress = IPAddress.Parse("203.0.113.1");
+
     [Fact]
     public async Task SlowOrTimedOutConnect_DoesNotBlockOtherSessions_OnSameTunnel()
     {
@@ -18,13 +20,25 @@ public sealed partial class TunnelIntegrationTests
         {
             MaxConcurrentTunnels = 32,
             MaxSessionsPerTunnel = 256,
-            ConnectTimeoutMs = 1200
+            ConnectTimeoutMs = 1200,
+            ConnectReplyOverrideAsync = async (request, connectTimeoutMs, cancellationToken) =>
+            {
+                if (request.AddressType is AddressType.IPv4
+                    && request.Address == SlowConnectTestAddress.ToString()
+                    && request.Port == 81)
+                {
+                    await Task.Delay(connectTimeoutMs + 200, cancellationToken);
+                    return 0x04;
+                }
+
+                return null;
+            }
         });
         await using var socks = await TestNetwork.StartSocksServerAsync(tunnel.Port);
 
         var slowConnectTask = RunSingleSocksConnectExpectFailureAsync(
             socks.Port,
-            IPAddress.Parse("203.0.113.1"),
+            SlowConnectTestAddress,
             81);
 
         await Task.Delay(150);
