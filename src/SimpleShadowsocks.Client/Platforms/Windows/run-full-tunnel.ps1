@@ -268,16 +268,26 @@ function Add-TrackedRoute {
         [int]$RouteMetric = 3
     )
 
-    $route = New-NetRoute `
+    if ($null -eq $RouteStore) {
+        throw "RouteStore is required."
+    }
+
+    $route = Get-NetRoute `
         -PolicyStore ActiveStore `
         -DestinationPrefix $DestinationPrefix `
         -InterfaceIndex $InterfaceIndex `
-        -NextHop $NextHop `
-        -RouteMetric $RouteMetric `
-        -ErrorAction Stop
+        -ErrorAction SilentlyContinue |
+        Where-Object { $_.NextHop -eq $NextHop } |
+        Select-Object -First 1
 
-    if ($null -eq $RouteStore) {
-        throw "RouteStore is required."
+    if ($null -eq $route) {
+        $route = New-NetRoute `
+            -PolicyStore ActiveStore `
+            -DestinationPrefix $DestinationPrefix `
+            -InterfaceIndex $InterfaceIndex `
+            -NextHop $NextHop `
+            -RouteMetric $RouteMetric `
+            -ErrorAction Stop
     }
 
     $RouteStore.Add([pscustomobject]@{
