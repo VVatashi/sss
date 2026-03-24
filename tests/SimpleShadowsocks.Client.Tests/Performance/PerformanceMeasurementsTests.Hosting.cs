@@ -21,7 +21,7 @@ public sealed partial class PerformanceMeasurementsTests
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
-        await WaitUntilReachableAsync(port, cts.Token);
+        await server.WaitUntilStartedAsync();
         return new RunningTunnelServer(port, cts, runTask);
     }
 
@@ -55,7 +55,8 @@ public sealed partial class PerformanceMeasurementsTests
             },
             ProtocolConstants.Version,
             compression.Enabled,
-            compression.Algorithm);
+            compression.Algorithm,
+            routingPolicy: null);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 

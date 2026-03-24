@@ -13,7 +13,8 @@ internal static class TestNetwork
     public static async Task<RunningSocksServer> StartSocksServerAsync(
         int tunnelPort,
         TunnelConnectionPolicy? connectionPolicy = null,
-        TunnelCryptoPolicy? cryptoPolicy = null)
+        TunnelCryptoPolicy? cryptoPolicy = null,
+        TrafficRoutingPolicy? routingPolicy = null)
     {
         var port = AllocateUnusedPort();
         var server = new Socks5Server(
@@ -23,7 +24,8 @@ internal static class TestNetwork
             tunnelPort,
             "dev-shared-key",
             cryptoPolicy ?? TunnelCryptoPolicy.Default,
-            connectionPolicy ?? TunnelConnectionPolicy.Default);
+            connectionPolicy ?? TunnelConnectionPolicy.Default,
+            routingPolicy: routingPolicy);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
@@ -34,7 +36,8 @@ internal static class TestNetwork
     public static async Task<RunningSocksServer> StartSocksServerAsync(
         IReadOnlyList<(string Host, int Port)> tunnelServers,
         TunnelConnectionPolicy? connectionPolicy = null,
-        TunnelCryptoPolicy? cryptoPolicy = null)
+        TunnelCryptoPolicy? cryptoPolicy = null,
+        TrafficRoutingPolicy? routingPolicy = null)
     {
         var port = AllocateUnusedPort();
         var server = new Socks5Server(
@@ -43,7 +46,8 @@ internal static class TestNetwork
             tunnelServers,
             "dev-shared-key",
             cryptoPolicy ?? TunnelCryptoPolicy.Default,
-            connectionPolicy ?? TunnelConnectionPolicy.Default);
+            connectionPolicy ?? TunnelConnectionPolicy.Default,
+            routingPolicy: routingPolicy);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
@@ -51,10 +55,19 @@ internal static class TestNetwork
         return new RunningSocksServer(port, cts, runTask);
     }
 
-    public static async Task<RunningSocksServer> StartStandaloneSocksServerAsync()
+    public static async Task<RunningSocksServer> StartStandaloneSocksServerAsync(TrafficRoutingPolicy? routingPolicy = null)
     {
         var port = AllocateUnusedPort();
-        var server = new Socks5Server(IPAddress.Loopback, port);
+        var server = routingPolicy is null
+            ? new Socks5Server(IPAddress.Loopback, port)
+            : new Socks5Server(
+                IPAddress.Loopback,
+                port,
+                Array.Empty<(string Host, int Port)>(),
+                "dev-shared-key",
+                TunnelCryptoPolicy.Default,
+                TunnelConnectionPolicy.Default,
+                routingPolicy: routingPolicy);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
@@ -69,7 +82,7 @@ internal static class TestNetwork
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
-        await WaitUntilReachableAsync(port, cts.Token);
+        await server.WaitUntilStartedAsync();
         return new RunningTunnelServer(server, port, cts, runTask);
     }
 
@@ -79,7 +92,7 @@ internal static class TestNetwork
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
-        await WaitUntilReachableAsync(port, cts.Token);
+        await server.WaitUntilStartedAsync();
         return new RunningTunnelServer(server, port, cts, runTask);
     }
 

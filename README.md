@@ -120,13 +120,31 @@ SimpleShadowsocks позволяет поднять защищенный TCP/UDP
   "ProtocolVersion": 2,
   "EnableCompression": false,
   "CompressionAlgorithm": "Deflate",
-  "TunnelCipherAlgorithm": "ChaCha20Poly1305"
+  "TunnelCipherAlgorithm": "ChaCha20Poly1305",
+  "TrafficRoutingRules": [
+    {
+      "Match": "*",
+      "Decision": "Tunnel"
+    }
+  ]
 }
 ```
 
 `ListenAddress` задаёт локальный адрес, на котором клиент поднимает SOCKS5-сервер. Этот же адрес использует Windows-обвязка `hev-socks5-tunnel`.
 
 Если используете несколько серверов, задайте `RemoteServers` списком. При непустом `RemoteServers` используется именно он (балансировка `round-robin`).
+
+`TrafficRoutingRules` применяются сверху вниз, первое совпавшее правило определяет маршрут:
+
+- `Decision: "Tunnel"` отправляет трафик через tunnel backend.
+- `Decision: "Direct"` отправляет трафик напрямую.
+- `Decision: "Drop"` принудительно отклоняет TCP `CONNECT` и дропает UDP datagram.
+- `Match: "*"` совпадает со всем трафиком.
+- Для host/domain-правил можно использовать точный host (`api.example.com`) и suffix-маски (`*.example.com` или `.example.com`).
+- Для IP-правил указывайте CIDR-подсеть, например `10.0.0.0/8` или `fd00::/8`.
+- Если `TrafficRoutingRules` отсутствуют, клиент автоматически использует дефолтное правило `* -> Tunnel`, чтобы сохранить прежнее поведение.
+- Если TCP `CONNECT` не совпал ни с одним правилом, клиент пишет warning и отвечает SOCKS5-кодом `0x02` (`connection not allowed`).
+- Для `UDP ASSOCIATE` правила применяются к каждому UDP destination отдельно; datagram без совпавшего правила логируется и отбрасывается.
 
 #### 3) Android клиент
 
@@ -300,7 +318,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 Ключевые сценарии, покрытые тестами:
 
 - TCP: SOCKS5 `CONNECT` (standalone + через tunnel), relay данных, классифицированные коды ошибок upstream на сервере, failover на следующий tunnel-сервер при отказе `CONNECT`.
-- UDP: SOCKS5 `UDP ASSOCIATE` работает только через tunnel и UDP relay на сервере; relay датаграмм до IP и domain (`localhost`), поддержка и тесты реассамблинга фрагментов `FRAG`.
+- UDP: SOCKS5 `UDP ASSOCIATE` поддерживает routing direct/tunnel по destination и UDP relay на сервере; relay датаграмм до IP и domain (`localhost`), поддержка и тесты реассамблинга фрагментов `FRAG`.
 - Performance: отдельный UDP benchmark-тест для `UDP ASSOCIATE` через tunnel (throughput + packets/sec).
 - Наблюдаемость: при `UDP ASSOCIATE` без tunnel backend пишется явный лог `UDP disabled: no tunnel backend` и инкрементируется .NET-метрика `socks5_udp_associate_rejected_no_tunnel_backend_total`.
 

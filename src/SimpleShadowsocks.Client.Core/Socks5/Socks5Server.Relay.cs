@@ -123,6 +123,7 @@ public sealed partial class Socks5Server
     {
         using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var relayToken = relayCts.Token;
+        var clientInitiatedClose = false;
 
         var clientToTunnel = Task.Run(async () =>
         {
@@ -132,6 +133,7 @@ public sealed partial class Socks5Server
                 var read = await clientStream.ReadAsync(buffer, relayToken);
                 if (read == 0)
                 {
+                    clientInitiatedClose = true;
                     await multiplexer.CloseSessionAsync(sessionId, 0x00, relayToken);
                     break;
                 }
@@ -161,16 +163,13 @@ public sealed partial class Socks5Server
         catch (OperationCanceledException)
         {
         }
-        finally
+        catch
         {
-            try
-            {
-                await multiplexer.CloseSessionAsync(sessionId, 0x00, CancellationToken.None);
-                StructuredLog.Info("socks5-server", "TUNNEL/TCP", "tunnel session closed", sessionId);
-            }
-            catch
-            {
-            }
+        }
+
+        if (clientInitiatedClose)
+        {
+            StructuredLog.Info("socks5-server", "TUNNEL/TCP", "tunnel session closed", sessionId);
         }
     }
 
@@ -262,6 +261,217 @@ public sealed partial class Socks5Server
         }
         catch (OperationCanceledException)
         {
+        }
+    }
+
+    private async Task HandleUdpAssociateRoutedAsync(
+        NetworkStream clientStream,
+        Socks5ConnectRequest request,
+        IReadOnlyList<TunnelClientMultiplexer> multiplexers,
+        CancellationToken cancellationToken)
+    {
+        using var udpRelay = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var relayEndPoint = (IPEndPoint)udpRelay.Client.LocalEndPoint!;
+        await SendReplyAsync(clientStream, replyCode: 0x00, relayEndPoint, cancellationToken);
+
+        var requestedClientEndPoint = TryGetRequestedUdpClientEndPoint(request);
+        IPEndPoint? activeClientEndPoint = requestedClientEndPoint;
+        var fragmentReassembler = new Socks5UdpFragmentReassembler();
+
+        using var relayCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var relayToken = relayCts.Token;
+
+        uint? tunnelSessionId = null;
+        ChannelReader<UdpDatagram>? tunnelReader = null;
+        TunnelClientMultiplexer? activeTunnelMultiplexer = null;
+
+        var tcpMonitorTask = WaitForTcpDisconnectAsync(clientStream, relayToken);
+        var udpRelayTask = Task.Run(async () =>
+        {
+            while (!relayToken.IsCancellationRequested)
+            {
+                var received = await udpRelay.ReceiveAsync(relayToken);
+                if (activeClientEndPoint is null)
+                {
+                    activeClientEndPoint = received.RemoteEndPoint;
+                }
+
+                if (AreSameEndpoint(received.RemoteEndPoint, activeClientEndPoint))
+                {
+                    if (!TryParseUdpRequestDatagram(received.Buffer, out var requestDatagram))
+                    {
+                        continue;
+                    }
+
+                    if (!fragmentReassembler.TryReassemble(requestDatagram, out var assembledDatagram))
+                    {
+                        continue;
+                    }
+
+                    var routeRequest = ToUdpRouteRequest(assembledDatagram);
+                    var matchedRule = _routingPolicy?.Match(routeRequest);
+                    if (matchedRule is null)
+                    {
+                        StructuredLog.Warn(
+                            "socks5-server",
+                            "SOCKS5/UDP",
+                            $"udp datagram dropped: no routing rule matched target={assembledDatagram.Address}:{assembledDatagram.Port}");
+                        continue;
+                    }
+
+                    if (matchedRule.Decision == TrafficRouteDecision.Direct)
+                    {
+                        try
+                        {
+                            var destinationEndPoint = await ResolveUdpRemoteEndPointAsync(assembledDatagram, relayToken);
+                            await udpRelay.SendAsync(assembledDatagram.Payload.ToArray(), destinationEndPoint, relayToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch
+                        {
+                        }
+
+                        continue;
+                    }
+
+                    if (matchedRule.Decision == TrafficRouteDecision.Drop)
+                    {
+                        StructuredLog.Warn(
+                            "socks5-server",
+                            "SOCKS5/UDP",
+                            $"udp datagram dropped by routing rule target={assembledDatagram.Address}:{assembledDatagram.Port}");
+                        continue;
+                    }
+
+                    if (multiplexers.Count == 0)
+                    {
+                        StructuredLog.Warn(
+                            "socks5-server",
+                            "SOCKS5/UDP",
+                            $"udp datagram dropped: routed to tunnel but no tunnel backend is configured target={assembledDatagram.Address}:{assembledDatagram.Port}");
+                        continue;
+                    }
+
+                    try
+                    {
+                        if (tunnelSessionId is null || tunnelReader is null || activeTunnelMultiplexer is null)
+                        {
+                            (tunnelSessionId, tunnelReader, activeTunnelMultiplexer) = await OpenUdpTunnelSessionAsync(multiplexers, relayToken);
+                        }
+
+                        await activeTunnelMultiplexer.SendUdpDataAsync(tunnelSessionId.Value, assembledDatagram, relayToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        StructuredLog.Warn(
+                            "socks5-server",
+                            "TUNNEL/UDP",
+                            $"udp datagram forwarding failed target={assembledDatagram.Address}:{assembledDatagram.Port}",
+                            tunnelSessionId);
+                        StructuredLog.Error("socks5-server", "TUNNEL/UDP", "tunnel udp session failed", ex, tunnelSessionId);
+                        tunnelSessionId = null;
+                        tunnelReader = null;
+                        activeTunnelMultiplexer = null;
+                    }
+
+                    continue;
+                }
+
+                if (activeClientEndPoint is null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var responseDatagram = BuildUdpRequestDatagram(
+                        ToProtocolAddressType(received.RemoteEndPoint.Address),
+                        received.RemoteEndPoint.Address.ToString(),
+                        (ushort)received.RemoteEndPoint.Port,
+                        received.Buffer);
+                    await udpRelay.SendAsync(responseDatagram, activeClientEndPoint, relayToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                }
+            }
+        }, relayToken);
+
+        var tunnelToUdpClientTask = Task.Run(async () =>
+        {
+            while (!relayToken.IsCancellationRequested)
+            {
+                if (tunnelReader is null)
+                {
+                    await Task.Delay(20, relayToken);
+                    continue;
+                }
+
+                await foreach (var datagram in tunnelReader.ReadAllAsync(relayToken))
+                {
+                    if (activeClientEndPoint is null)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        var socksDatagram = BuildUdpRequestDatagram(
+                            datagram.AddressType,
+                            datagram.Address,
+                            datagram.Port,
+                            datagram.Payload.Span);
+                        await udpRelay.SendAsync(socksDatagram, activeClientEndPoint, relayToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                tunnelSessionId = null;
+                tunnelReader = null;
+                activeTunnelMultiplexer = null;
+            }
+        }, relayToken);
+
+        await Task.WhenAny(tcpMonitorTask, udpRelayTask, tunnelToUdpClientTask);
+        relayCts.Cancel();
+
+        try
+        {
+            await Task.WhenAll(tcpMonitorTask, udpRelayTask, tunnelToUdpClientTask);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            if (tunnelSessionId is not null && activeTunnelMultiplexer is not null)
+            {
+                try
+                {
+                    await activeTunnelMultiplexer.CloseSessionAsync(tunnelSessionId.Value, 0x00, CancellationToken.None);
+                    StructuredLog.Info("socks5-server", "TUNNEL/UDP", "tunnel udp session closed", tunnelSessionId.Value);
+                }
+                catch
+                {
+                }
+            }
         }
     }
 
@@ -394,6 +604,48 @@ public sealed partial class Socks5Server
             {
             }
         }
+    }
+
+    private static Socks5ConnectRequest ToUdpRouteRequest(UdpDatagram datagram)
+    {
+        var addressType = datagram.AddressType switch
+        {
+            AddressType.IPv4 => AddressTypeIPv4,
+            AddressType.Domain => AddressTypeDomain,
+            AddressType.IPv6 => AddressTypeIPv6,
+            _ => throw new InvalidDataException($"Unsupported UDP address type: {datagram.AddressType}")
+        };
+
+        return new Socks5ConnectRequest(CommandUdpAssociate, datagram.Address, datagram.Port, addressType);
+    }
+
+    private static async Task<(uint SessionId, ChannelReader<UdpDatagram> Reader, TunnelClientMultiplexer Multiplexer)> OpenUdpTunnelSessionAsync(
+        IReadOnlyList<TunnelClientMultiplexer> multiplexers,
+        CancellationToken cancellationToken)
+    {
+        Exception? lastError = null;
+
+        foreach (var multiplexer in multiplexers)
+        {
+            try
+            {
+                var (sessionId, replyCode, reader) = await multiplexer.OpenUdpSessionAsync(cancellationToken);
+                if (replyCode == 0x00)
+                {
+                    StructuredLog.Info("socks5-server", "TUNNEL/UDP", "tunnel udp session opened", sessionId);
+                    return (sessionId, reader, multiplexer);
+                }
+
+                lastError = new IOException($"Tunnel UDP associate rejected with reply={replyCode}.");
+                StructuredLog.Warn("socks5-server", "TUNNEL/UDP", $"tunnel udp associate rejected reply={replyCode}", sessionId);
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+        }
+
+        throw new IOException("Failed to open tunnel UDP session.", lastError);
     }
 
     private static async Task ConnectDirectAsync(TcpClient client, Socks5ConnectRequest request, CancellationToken cancellationToken)

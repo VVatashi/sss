@@ -21,6 +21,7 @@ public sealed partial class TunnelServer
     private readonly byte[] _sharedKey;
     private readonly TunnelCryptoPolicy _cryptoPolicy;
     private readonly TunnelServerPolicy _serverPolicy;
+    private readonly TaskCompletionSource<bool> _startedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _acceptedTunnelConnections;
     private int _activeTunnelConnections;
 
@@ -52,6 +53,7 @@ public sealed partial class TunnelServer
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         _listener.Start();
+        _startedTcs.TrySetResult(true);
         StructuredLog.Info("tunnel-server", "TUNNEL/TCP", $"listening on {_listener.LocalEndpoint}");
 
         try
@@ -87,6 +89,11 @@ public sealed partial class TunnelServer
             _listener.Stop();
             StructuredLog.Info("tunnel-server", "TUNNEL/TCP", "listener stopped");
         }
+    }
+
+    internal Task WaitUntilStartedAsync()
+    {
+        return _startedTcs.Task;
     }
 
     private async Task HandleTunnelSafelyAsync(TcpClient tunnelClient, CancellationToken cancellationToken)

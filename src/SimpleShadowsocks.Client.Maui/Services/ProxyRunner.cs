@@ -50,7 +50,7 @@ public sealed class ProxyRunner
                 options.ProtocolVersion,
                 options.EnableCompression,
                 options.CompressionAlgorithm,
-                configureTunnelSocket);
+                configureTunnelSocket: configureTunnelSocket);
 
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             var linkedToken = _cts.Token;

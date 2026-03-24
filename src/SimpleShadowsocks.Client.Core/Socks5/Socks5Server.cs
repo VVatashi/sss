@@ -29,6 +29,7 @@ public sealed partial class Socks5Server
     private readonly byte _protocolVersion;
     private readonly bool _enableCompression;
     private readonly PayloadCompressionAlgorithm _compressionAlgorithm;
+    private readonly TrafficRoutingPolicy? _routingPolicy;
     private readonly Action<Socket>? _configureTunnelSocket;
     private List<TunnelClientMultiplexer>? _multiplexers;
     private int _nextMultiplexerIndex = -1;
@@ -58,6 +59,7 @@ public sealed partial class Socks5Server
         byte protocolVersion = ProtocolConstants.Version,
         bool enableCompression = false,
         PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate,
+        TrafficRoutingPolicy? routingPolicy = null,
         Action<Socket>? configureTunnelSocket = null)
     {
         _listener = new TcpListener(listenAddress, port);
@@ -68,6 +70,7 @@ public sealed partial class Socks5Server
         _protocolVersion = protocolVersion;
         _enableCompression = enableCompression;
         _compressionAlgorithm = compressionAlgorithm;
+        _routingPolicy = routingPolicy;
         _configureTunnelSocket = configureTunnelSocket;
     }
 
@@ -81,6 +84,7 @@ public sealed partial class Socks5Server
         byte protocolVersion = ProtocolConstants.Version,
         bool enableCompression = false,
         PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate,
+        TrafficRoutingPolicy? routingPolicy = null,
         Action<Socket>? configureTunnelSocket = null)
     {
         _listener = new TcpListener(listenAddress, port);
@@ -100,6 +104,7 @@ public sealed partial class Socks5Server
         _protocolVersion = protocolVersion;
         _enableCompression = enableCompression;
         _compressionAlgorithm = compressionAlgorithm;
+        _routingPolicy = routingPolicy;
         _configureTunnelSocket = configureTunnelSocket;
     }
 
@@ -189,10 +194,54 @@ public sealed partial class Socks5Server
             return;
         }
 
+        var matchedRule = _routingPolicy?.Match(request.Value);
+
         switch (request.Value.Command)
         {
             case CommandConnect:
                 StructuredLog.Info("socks5-server", "SOCKS5/TCP", $"connect request target={request.Value.Host}:{request.Value.Port}");
+                if (matchedRule is null && _routingPolicy is not null)
+                {
+                    StructuredLog.Warn(
+                        "socks5-server",
+                        "SOCKS5/TCP",
+                        $"connect request rejected: no routing rule matched target={request.Value.Host}:{request.Value.Port}");
+                    await SendReplyAsync(clientStream, replyCode: 0x02, null, cancellationToken);
+                    return;
+                }
+
+                if (matchedRule?.Decision == TrafficRouteDecision.Direct)
+                {
+                    await HandleDirectAsync(clientStream, request.Value, cancellationToken);
+                    return;
+                }
+
+                if (matchedRule?.Decision == TrafficRouteDecision.Drop)
+                {
+                    StructuredLog.Warn(
+                        "socks5-server",
+                        "SOCKS5/TCP",
+                        $"connect request dropped by routing rule target={request.Value.Host}:{request.Value.Port}");
+                    await SendReplyAsync(clientStream, replyCode: 0x02, null, cancellationToken);
+                    return;
+                }
+
+                if (matchedRule?.Decision == TrafficRouteDecision.Tunnel)
+                {
+                    if (candidateMultiplexers.Count == 0)
+                    {
+                        StructuredLog.Warn(
+                            "socks5-server",
+                            "SOCKS5/TCP",
+                            $"connect request rejected: routed to tunnel but no tunnel backend is configured target={request.Value.Host}:{request.Value.Port}");
+                        await SendReplyAsync(clientStream, replyCode: 0x01, null, cancellationToken);
+                        return;
+                    }
+
+                    await HandleViaTunnelAsync(clientStream, request.Value, candidateMultiplexers, cancellationToken);
+                    return;
+                }
+
                 if (candidateMultiplexers.Count == 0)
                 {
                     await HandleDirectAsync(clientStream, request.Value, cancellationToken);
@@ -204,6 +253,12 @@ public sealed partial class Socks5Server
 
             case CommandUdpAssociate:
                 StructuredLog.Info("socks5-server", "SOCKS5/UDP", $"udp associate request client={request.Value.Host}:{request.Value.Port}");
+                if (_routingPolicy is not null)
+                {
+                    await HandleUdpAssociateRoutedAsync(clientStream, request.Value, candidateMultiplexers, cancellationToken);
+                    return;
+                }
+
                 if (candidateMultiplexers.Count == 0)
                 {
                     Interlocked.Increment(ref _udpAssociateRejectedNoTunnelBackendCount);

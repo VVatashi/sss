@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using SimpleShadowsocks.Client.Socks5;
 
 namespace SimpleShadowsocks.Client.Tests;
 
@@ -125,5 +126,138 @@ public sealed partial class Socks5ServerTests
         Assert.Equal(IPAddress.Loopback, parsed.SourceAddress);
         Assert.Equal(udpEcho.Port, parsed.SourcePort);
         Assert.Equal(payload, parsed.Payload);
+    }
+
+    [Fact]
+    public async Task UdpAssociate_WithDirectRoutingRule_RelaysDatagramsWithoutTunnel()
+    {
+        var routingPolicy = new TrafficRoutingPolicy(
+        [
+            new TrafficRoutingRule
+            {
+                MatchType = TrafficRouteMatchType.Subnet,
+                Match = "127.0.0.0/8",
+                Decision = TrafficRouteDecision.Direct
+            },
+            new TrafficRoutingRule
+            {
+                MatchType = TrafficRouteMatchType.Any,
+                Match = "*",
+                Decision = TrafficRouteDecision.Tunnel
+            }
+        ]);
+
+        await using var udpEcho = await TestNetwork.StartUdpEchoServerAsync();
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var socks = await TestNetwork.StartSocksServerAsync(tunnel.Port, routingPolicy: routingPolicy);
+        var acceptedBefore = tunnel.Server.AcceptedTunnelConnections;
+        using var tcpClient = await TestNetwork.ConnectAsync(socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        var greetingResponse = await TestNetwork.ReadExactAsync(stream, 2);
+        Assert.Equal(new byte[] { 0x05, 0x00 }, greetingResponse);
+
+        var udpAssociateRequest = TestNetwork.BuildUdpAssociateRequestIPv4(IPAddress.Any, 0);
+        await stream.WriteAsync(udpAssociateRequest);
+        var associateReply = await TestNetwork.ReadSocks5ReplyAsync(stream);
+        Assert.Equal((byte)0x00, associateReply.ReplyCode);
+        Assert.NotNull(associateReply.BoundEndPoint);
+
+        using var udpClient = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var payload = Encoding.ASCII.GetBytes("udp-direct-with-routing-rule");
+        var udpPacket = TestNetwork.BuildSocks5UdpDatagram(IPAddress.Loopback, udpEcho.Port, payload);
+        await udpClient.SendAsync(udpPacket, associateReply.BoundEndPoint!, CancellationToken.None);
+
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var echoed = await udpClient.ReceiveAsync(timeoutCts.Token);
+        var parsed = TestNetwork.ParseSocks5UdpDatagram(echoed.Buffer);
+        Assert.Equal(IPAddress.Loopback, parsed.SourceAddress);
+        Assert.Equal(udpEcho.Port, parsed.SourcePort);
+        Assert.Equal(payload, parsed.Payload);
+        Assert.Equal(acceptedBefore, tunnel.Server.AcceptedTunnelConnections);
+    }
+
+    [Fact]
+    public async Task UdpAssociate_WithoutMatchingRoutingRule_DropsDatagram()
+    {
+        var routingPolicy = new TrafficRoutingPolicy(
+        [
+            new TrafficRoutingRule
+            {
+                MatchType = TrafficRouteMatchType.Host,
+                Match = "*.example.com",
+                Decision = TrafficRouteDecision.Tunnel
+            }
+        ]);
+
+        await using var udpEcho = await TestNetwork.StartUdpEchoServerAsync();
+        await using var socks = await TestNetwork.StartStandaloneSocksServerAsync(routingPolicy);
+        using var tcpClient = await TestNetwork.ConnectAsync(socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        var greetingResponse = await TestNetwork.ReadExactAsync(stream, 2);
+        Assert.Equal(new byte[] { 0x05, 0x00 }, greetingResponse);
+
+        var udpAssociateRequest = TestNetwork.BuildUdpAssociateRequestIPv4(IPAddress.Any, 0);
+        await stream.WriteAsync(udpAssociateRequest);
+        var associateReply = await TestNetwork.ReadSocks5ReplyAsync(stream);
+        Assert.Equal((byte)0x00, associateReply.ReplyCode);
+        Assert.NotNull(associateReply.BoundEndPoint);
+
+        using var udpClient = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var payload = Encoding.ASCII.GetBytes("udp-no-match-should-drop");
+        var udpPacket = TestNetwork.BuildSocks5UdpDatagram(IPAddress.Loopback, udpEcho.Port, payload);
+        await udpClient.SendAsync(udpPacket, associateReply.BoundEndPoint!, CancellationToken.None);
+
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
+        await Assert.ThrowsAsync<OperationCanceledException>(async () => await udpClient.ReceiveAsync(timeoutCts.Token));
+    }
+
+    [Fact]
+    public async Task UdpAssociate_WithDropRoutingRule_DropsDatagram()
+    {
+        var routingPolicy = new TrafficRoutingPolicy(
+        [
+            new TrafficRoutingRule
+            {
+                MatchType = TrafficRouteMatchType.Subnet,
+                Match = "127.0.0.0/8",
+                Decision = TrafficRouteDecision.Drop
+            },
+            new TrafficRoutingRule
+            {
+                MatchType = TrafficRouteMatchType.Any,
+                Match = "*",
+                Decision = TrafficRouteDecision.Tunnel
+            }
+        ]);
+
+        await using var udpEcho = await TestNetwork.StartUdpEchoServerAsync();
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var socks = await TestNetwork.StartSocksServerAsync(tunnel.Port, routingPolicy: routingPolicy);
+        var acceptedBefore = tunnel.Server.AcceptedTunnelConnections;
+        using var tcpClient = await TestNetwork.ConnectAsync(socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        var greetingResponse = await TestNetwork.ReadExactAsync(stream, 2);
+        Assert.Equal(new byte[] { 0x05, 0x00 }, greetingResponse);
+
+        var udpAssociateRequest = TestNetwork.BuildUdpAssociateRequestIPv4(IPAddress.Any, 0);
+        await stream.WriteAsync(udpAssociateRequest);
+        var associateReply = await TestNetwork.ReadSocks5ReplyAsync(stream);
+        Assert.Equal((byte)0x00, associateReply.ReplyCode);
+        Assert.NotNull(associateReply.BoundEndPoint);
+
+        using var udpClient = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var payload = Encoding.ASCII.GetBytes("udp-drop-routing-rule");
+        var udpPacket = TestNetwork.BuildSocks5UdpDatagram(IPAddress.Loopback, udpEcho.Port, payload);
+        await udpClient.SendAsync(udpPacket, associateReply.BoundEndPoint!, CancellationToken.None);
+
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
+        await Assert.ThrowsAsync<OperationCanceledException>(async () => await udpClient.ReceiveAsync(timeoutCts.Token));
+        Assert.Equal(acceptedBefore, tunnel.Server.AcceptedTunnelConnections);
     }
 }

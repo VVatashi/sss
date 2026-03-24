@@ -19,6 +19,7 @@ var protocolVersion = config.ProtocolVersion;
 var enableCompression = config.EnableCompression;
 var compressionAlgorithm = config.GetCompressionAlgorithm();
 var tunnelCipherAlgorithm = config.GetTunnelCipherAlgorithm();
+var routingPolicy = config.GetTrafficRoutingPolicy();
 var cryptoPolicy = new TunnelCryptoPolicy
 {
     HandshakeMaxClockSkewSeconds = config.HandshakeMaxClockSkewSeconds,
@@ -80,6 +81,10 @@ StructuredLog.Info(
     "client-host",
     "TUNNEL/TCP",
     $"configured_tunnel_protocol=v{protocolVersion}, compression={(enableCompression ? "on" : "off")}({compressionAlgorithm}), aead={tunnelCipherAlgorithm}");
+StructuredLog.Info(
+    "client-host",
+    "SOCKS5",
+    $"routing_rules={string.Join("; ", routingPolicy.Rules.Select((rule, index) => $"#{index + 1}:{rule.MatchType}:{rule.Match}->{rule.Decision}"))}");
 StructuredLog.Info("client-host", "CONTROL", "press Ctrl+C to stop");
 
 var server = remoteServers.Count > 0
@@ -92,7 +97,8 @@ var server = remoteServers.Count > 0
         connectionPolicy,
         protocolVersion,
         enableCompression,
-        compressionAlgorithm)
+        compressionAlgorithm,
+        routingPolicy)
     : new Socks5Server(
         listenAddress,
         listenPort,
@@ -103,7 +109,8 @@ var server = remoteServers.Count > 0
         connectionPolicy,
         protocolVersion,
         enableCompression,
-        compressionAlgorithm);
+        compressionAlgorithm,
+        routingPolicy);
 await server.RunAsync(cts.Token);
 
 internal sealed class ClientConfig
@@ -127,6 +134,7 @@ internal sealed class ClientConfig
     public string CompressionAlgorithm { get; init; } = nameof(SimpleShadowsocks.Protocol.PayloadCompressionAlgorithm.Deflate);
     public string TunnelCipherAlgorithm { get; init; } = nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.ChaCha20Poly1305);
     public List<RemoteServerConfig>? RemoteServers { get; init; }
+    public List<TrafficRoutingRuleConfig>? TrafficRoutingRules { get; init; }
 
     public SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm GetTunnelCipherAlgorithm()
     {
@@ -181,9 +189,88 @@ internal sealed class ClientConfig
         return JsonSerializer.Deserialize<ClientConfig>(json) ?? new ClientConfig();
     }
 
+    public TrafficRoutingPolicy GetTrafficRoutingPolicy()
+    {
+        var rules = TrafficRoutingRules;
+        if (rules is null || rules.Count == 0)
+        {
+            return new TrafficRoutingPolicy(
+            [
+                new TrafficRoutingRule
+                {
+                    MatchType = TrafficRouteMatchType.Any,
+                    Match = "*",
+                    Decision = TrafficRouteDecision.Tunnel
+                }
+            ]);
+        }
+
+        return new TrafficRoutingPolicy(rules.Select((rule, index) => rule.ToRuntimeRule(index)));
+    }
+
     public sealed class RemoteServerConfig
     {
         public string Host { get; init; } = string.Empty;
         public int Port { get; init; }
+    }
+
+    public sealed class TrafficRoutingRuleConfig
+    {
+        public string? Type { get; init; }
+        public string Match { get; init; } = "*";
+        public string Decision { get; init; } = nameof(TrafficRouteDecision.Tunnel);
+
+        public TrafficRoutingRule ToRuntimeRule(int index)
+        {
+            var normalizedMatch = Match?.Trim();
+            if (string.IsNullOrWhiteSpace(normalizedMatch))
+            {
+                throw new InvalidDataException($"TrafficRoutingRules[{index}].Match must not be empty.");
+            }
+
+            var matchType = ResolveMatchType(Type, normalizedMatch, index);
+            return new TrafficRoutingRule
+            {
+                MatchType = matchType,
+                Match = normalizedMatch,
+                Decision = ParseDecision(index)
+            };
+        }
+
+        private TrafficRouteDecision ParseDecision(int index)
+        {
+            if (Enum.TryParse<TrafficRouteDecision>(Decision, ignoreCase: true, out var parsed))
+            {
+                return parsed;
+            }
+
+            throw new InvalidDataException(
+                $"Unsupported TrafficRoutingRules[{index}].Decision: '{Decision}'. " +
+                $"Supported: {nameof(TrafficRouteDecision.Tunnel)}, {nameof(TrafficRouteDecision.Direct)}, {nameof(TrafficRouteDecision.Drop)}");
+        }
+
+        private static TrafficRouteMatchType ResolveMatchType(string? configuredType, string match, int index)
+        {
+            if (!string.IsNullOrWhiteSpace(configuredType))
+            {
+                if (Enum.TryParse<TrafficRouteMatchType>(configuredType, ignoreCase: true, out var parsed))
+                {
+                    return parsed;
+                }
+
+                throw new InvalidDataException(
+                    $"Unsupported TrafficRoutingRules[{index}].Type: '{configuredType}'. " +
+                    $"Supported: {nameof(TrafficRouteMatchType.Any)}, {nameof(TrafficRouteMatchType.Host)}, {nameof(TrafficRouteMatchType.Subnet)}");
+            }
+
+            if (string.Equals(match, "*", StringComparison.Ordinal))
+            {
+                return TrafficRouteMatchType.Any;
+            }
+
+            return match.Contains('/', StringComparison.Ordinal)
+                ? TrafficRouteMatchType.Subnet
+                : TrafficRouteMatchType.Host;
+        }
     }
 }
