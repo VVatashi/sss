@@ -11,7 +11,9 @@ public sealed partial class Socks5Server
 {
     private const byte SocksVersion = 0x05;
     private const byte AuthNone = 0x00;
+    private const byte AuthUsernamePassword = 0x02;
     private const byte AuthNoAcceptableMethods = 0xFF;
+    private const byte UsernamePasswordAuthVersion = 0x01;
     private const byte CommandConnect = 0x01;
     private const byte CommandUdpAssociate = 0x03;
     private const byte AddressTypeIPv4 = 0x01;
@@ -31,6 +33,7 @@ public sealed partial class Socks5Server
     private readonly PayloadCompressionAlgorithm _compressionAlgorithm;
     private readonly TrafficRoutingPolicy? _routingPolicy;
     private readonly Action<Socket>? _configureTunnelSocket;
+    private readonly Socks5AuthenticationOptions _authenticationOptions;
     private List<TunnelClientMultiplexer>? _multiplexers;
     private int _nextMultiplexerIndex = -1;
     private long _udpAssociateRejectedNoTunnelBackendCount;
@@ -46,6 +49,7 @@ public sealed partial class Socks5Server
         _protocolVersion = ProtocolConstants.Version;
         _enableCompression = false;
         _compressionAlgorithm = PayloadCompressionAlgorithm.Deflate;
+        _authenticationOptions = Socks5AuthenticationOptions.Disabled;
     }
 
     public Socks5Server(
@@ -60,7 +64,8 @@ public sealed partial class Socks5Server
         bool enableCompression = false,
         PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate,
         TrafficRoutingPolicy? routingPolicy = null,
-        Action<Socket>? configureTunnelSocket = null)
+        Action<Socket>? configureTunnelSocket = null,
+        Socks5AuthenticationOptions? authenticationOptions = null)
     {
         _listener = new TcpListener(listenAddress, port);
         _remoteServers.Add((remoteServerHost, remoteServerPort));
@@ -72,6 +77,7 @@ public sealed partial class Socks5Server
         _compressionAlgorithm = compressionAlgorithm;
         _routingPolicy = routingPolicy;
         _configureTunnelSocket = configureTunnelSocket;
+        _authenticationOptions = authenticationOptions ?? Socks5AuthenticationOptions.Disabled;
     }
 
     public Socks5Server(
@@ -85,7 +91,8 @@ public sealed partial class Socks5Server
         bool enableCompression = false,
         PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate,
         TrafficRoutingPolicy? routingPolicy = null,
-        Action<Socket>? configureTunnelSocket = null)
+        Action<Socket>? configureTunnelSocket = null,
+        Socks5AuthenticationOptions? authenticationOptions = null)
     {
         _listener = new TcpListener(listenAddress, port);
         foreach (var (host, serverPort) in remoteServers)
@@ -106,6 +113,7 @@ public sealed partial class Socks5Server
         _compressionAlgorithm = compressionAlgorithm;
         _routingPolicy = routingPolicy;
         _configureTunnelSocket = configureTunnelSocket;
+        _authenticationOptions = authenticationOptions ?? Socks5AuthenticationOptions.Disabled;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)

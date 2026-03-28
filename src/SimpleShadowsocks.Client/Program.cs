@@ -20,6 +20,7 @@ var enableCompression = config.EnableCompression;
 var compressionAlgorithm = config.GetCompressionAlgorithm();
 var tunnelCipherAlgorithm = config.GetTunnelCipherAlgorithm();
 var routingPolicy = config.GetTrafficRoutingPolicy();
+var socks5Authentication = config.GetSocks5AuthenticationOptions();
 var cryptoPolicy = new TunnelCryptoPolicy
 {
     HandshakeMaxClockSkewSeconds = config.HandshakeMaxClockSkewSeconds,
@@ -85,6 +86,12 @@ StructuredLog.Info(
     "client-host",
     "SOCKS5",
     $"routing_rules={string.Join("; ", routingPolicy.Rules.Select((rule, index) => $"#{index + 1}:{rule.MatchType}:{rule.Match}->{rule.Decision}"))}");
+StructuredLog.Info(
+    "client-host",
+    "SOCKS5/AUTH",
+    socks5Authentication.Enabled
+        ? $"incoming_auth=username-password(username={socks5Authentication.Username})"
+        : "incoming_auth=disabled");
 StructuredLog.Info("client-host", "CONTROL", "press Ctrl+C to stop");
 
 var server = remoteServers.Count > 0
@@ -98,7 +105,8 @@ var server = remoteServers.Count > 0
         protocolVersion,
         enableCompression,
         compressionAlgorithm,
-        routingPolicy)
+        routingPolicy,
+        authenticationOptions: socks5Authentication)
     : new Socks5Server(
         listenAddress,
         listenPort,
@@ -110,7 +118,8 @@ var server = remoteServers.Count > 0
         protocolVersion,
         enableCompression,
         compressionAlgorithm,
-        routingPolicy);
+        routingPolicy,
+        authenticationOptions: socks5Authentication);
 await server.RunAsync(cts.Token);
 
 internal sealed class ClientConfig
@@ -135,6 +144,7 @@ internal sealed class ClientConfig
     public string TunnelCipherAlgorithm { get; init; } = nameof(SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm.ChaCha20Poly1305);
     public List<RemoteServerConfig>? RemoteServers { get; init; }
     public List<TrafficRoutingRuleConfig>? TrafficRoutingRules { get; init; }
+    public Socks5AuthenticationConfig? Socks5Authentication { get; init; }
 
     public SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm GetTunnelCipherAlgorithm()
     {
@@ -208,6 +218,17 @@ internal sealed class ClientConfig
         return new TrafficRoutingPolicy(rules.Select((rule, index) => rule.ToRuntimeRule(index)));
     }
 
+    public Socks5AuthenticationOptions GetSocks5AuthenticationOptions()
+    {
+        var auth = Socks5Authentication;
+        if (auth is null || !auth.Enabled)
+        {
+            return Socks5AuthenticationOptions.Disabled;
+        }
+
+        return new Socks5AuthenticationOptions(auth.Username, auth.Password);
+    }
+
     public sealed class RemoteServerConfig
     {
         public string Host { get; init; } = string.Empty;
@@ -229,12 +250,10 @@ internal sealed class ClientConfig
             }
 
             var matchType = ResolveMatchType(Type, normalizedMatch, index);
-            return new TrafficRoutingRule
-            {
-                MatchType = matchType,
-                Match = normalizedMatch,
-                Decision = ParseDecision(index)
-            };
+            return TrafficRoutingRuleFactory.Create(
+                normalizedMatch,
+                ParseDecision(index),
+                matchType);
         }
 
         private TrafficRouteDecision ParseDecision(int index)
@@ -249,7 +268,7 @@ internal sealed class ClientConfig
                 $"Supported: {nameof(TrafficRouteDecision.Tunnel)}, {nameof(TrafficRouteDecision.Direct)}, {nameof(TrafficRouteDecision.Drop)}");
         }
 
-        private static TrafficRouteMatchType ResolveMatchType(string? configuredType, string match, int index)
+        private static TrafficRouteMatchType? ResolveMatchType(string? configuredType, string match, int index)
         {
             if (!string.IsNullOrWhiteSpace(configuredType))
             {
@@ -263,14 +282,14 @@ internal sealed class ClientConfig
                     $"Supported: {nameof(TrafficRouteMatchType.Any)}, {nameof(TrafficRouteMatchType.Host)}, {nameof(TrafficRouteMatchType.Subnet)}");
             }
 
-            if (string.Equals(match, "*", StringComparison.Ordinal))
-            {
-                return TrafficRouteMatchType.Any;
-            }
-
-            return match.Contains('/', StringComparison.Ordinal)
-                ? TrafficRouteMatchType.Subnet
-                : TrafficRouteMatchType.Host;
+            return null;
         }
+    }
+
+    public sealed class Socks5AuthenticationConfig
+    {
+        public bool Enabled { get; init; }
+        public string Username { get; init; } = string.Empty;
+        public string Password { get; init; } = string.Empty;
     }
 }

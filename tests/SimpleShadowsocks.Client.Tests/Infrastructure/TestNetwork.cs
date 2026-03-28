@@ -14,7 +14,8 @@ internal static class TestNetwork
         int tunnelPort,
         TunnelConnectionPolicy? connectionPolicy = null,
         TunnelCryptoPolicy? cryptoPolicy = null,
-        TrafficRoutingPolicy? routingPolicy = null)
+        TrafficRoutingPolicy? routingPolicy = null,
+        Socks5AuthenticationOptions? authenticationOptions = null)
     {
         var port = AllocateUnusedPort();
         var server = new Socks5Server(
@@ -25,7 +26,8 @@ internal static class TestNetwork
             "dev-shared-key",
             cryptoPolicy ?? TunnelCryptoPolicy.Default,
             connectionPolicy ?? TunnelConnectionPolicy.Default,
-            routingPolicy: routingPolicy);
+            routingPolicy: routingPolicy,
+            authenticationOptions: authenticationOptions);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
@@ -37,7 +39,8 @@ internal static class TestNetwork
         IReadOnlyList<(string Host, int Port)> tunnelServers,
         TunnelConnectionPolicy? connectionPolicy = null,
         TunnelCryptoPolicy? cryptoPolicy = null,
-        TrafficRoutingPolicy? routingPolicy = null)
+        TrafficRoutingPolicy? routingPolicy = null,
+        Socks5AuthenticationOptions? authenticationOptions = null)
     {
         var port = AllocateUnusedPort();
         var server = new Socks5Server(
@@ -47,7 +50,8 @@ internal static class TestNetwork
             "dev-shared-key",
             cryptoPolicy ?? TunnelCryptoPolicy.Default,
             connectionPolicy ?? TunnelConnectionPolicy.Default,
-            routingPolicy: routingPolicy);
+            routingPolicy: routingPolicy,
+            authenticationOptions: authenticationOptions);
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
@@ -55,7 +59,9 @@ internal static class TestNetwork
         return new RunningSocksServer(port, cts, runTask);
     }
 
-    public static async Task<RunningSocksServer> StartStandaloneSocksServerAsync(TrafficRoutingPolicy? routingPolicy = null)
+    public static async Task<RunningSocksServer> StartStandaloneSocksServerAsync(
+        TrafficRoutingPolicy? routingPolicy = null,
+        Socks5AuthenticationOptions? authenticationOptions = null)
     {
         var port = AllocateUnusedPort();
         var server = routingPolicy is null
@@ -67,7 +73,21 @@ internal static class TestNetwork
                 "dev-shared-key",
                 TunnelCryptoPolicy.Default,
                 TunnelConnectionPolicy.Default,
-                routingPolicy: routingPolicy);
+                routingPolicy: routingPolicy,
+                authenticationOptions: authenticationOptions);
+
+        if (routingPolicy is null && authenticationOptions is not null)
+        {
+            server = new Socks5Server(
+                IPAddress.Loopback,
+                port,
+                Array.Empty<(string Host, int Port)>(),
+                "dev-shared-key",
+                TunnelCryptoPolicy.Default,
+                TunnelConnectionPolicy.Default,
+                routingPolicy: null,
+                authenticationOptions: authenticationOptions);
+        }
         var cts = new CancellationTokenSource();
         var runTask = server.RunAsync(cts.Token);
 
@@ -277,6 +297,45 @@ internal static class TestNetwork
         }
 
         return buffer;
+    }
+
+    public static async Task<byte[]> SendSocks5GreetingAsync(NetworkStream stream, params byte[] methods)
+    {
+        if (methods.Length == 0)
+        {
+            throw new ArgumentException("At least one authentication method must be provided.", nameof(methods));
+        }
+
+        var request = new byte[2 + methods.Length];
+        request[0] = 0x05;
+        request[1] = (byte)methods.Length;
+        Buffer.BlockCopy(methods, 0, request, 2, methods.Length);
+        await stream.WriteAsync(request);
+        return await ReadExactAsync(stream, 2);
+    }
+
+    public static async Task<byte[]> SendUsernamePasswordAuthAsync(NetworkStream stream, string username, string password)
+    {
+        var usernameBytes = System.Text.Encoding.UTF8.GetBytes(username);
+        var passwordBytes = System.Text.Encoding.UTF8.GetBytes(password);
+        if (usernameBytes.Length is < 1 or > 255)
+        {
+            throw new ArgumentOutOfRangeException(nameof(username), "Username must be 1..255 bytes in UTF-8.");
+        }
+
+        if (passwordBytes.Length is < 1 or > 255)
+        {
+            throw new ArgumentOutOfRangeException(nameof(password), "Password must be 1..255 bytes in UTF-8.");
+        }
+
+        var request = new byte[3 + usernameBytes.Length + passwordBytes.Length];
+        request[0] = 0x01;
+        request[1] = (byte)usernameBytes.Length;
+        Buffer.BlockCopy(usernameBytes, 0, request, 2, usernameBytes.Length);
+        request[2 + usernameBytes.Length] = (byte)passwordBytes.Length;
+        Buffer.BlockCopy(passwordBytes, 0, request, 3 + usernameBytes.Length, passwordBytes.Length);
+        await stream.WriteAsync(request);
+        return await ReadExactAsync(stream, 2);
     }
 
     public static async Task<Socks5Reply> ReadSocks5ReplyAsync(NetworkStream stream)

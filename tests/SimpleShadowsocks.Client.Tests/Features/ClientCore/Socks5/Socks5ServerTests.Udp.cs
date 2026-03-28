@@ -260,4 +260,72 @@ public sealed partial class Socks5ServerTests
         await Assert.ThrowsAsync<OperationCanceledException>(async () => await udpClient.ReceiveAsync(timeoutCts.Token));
         Assert.Equal(acceptedBefore, tunnel.Server.AcceptedTunnelConnections);
     }
+
+    [Fact]
+    public async Task UdpAssociate_WithUsernamePasswordAuthentication_RelaysDatagramsAfterSuccessfulAuthentication()
+    {
+        await using var udpEcho = await TestNetwork.StartUdpEchoServerAsync();
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var socks = await TestNetwork.StartSocksServerAsync(
+            tunnel.Port,
+            authenticationOptions: new Socks5AuthenticationOptions("local-user", "local-pass"));
+        using var tcpClient = await TestNetwork.ConnectAsync(socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        var greetingResponse = await TestNetwork.SendSocks5GreetingAsync(stream, 0x00, 0x02);
+        Assert.Equal(new byte[] { 0x05, 0x02 }, greetingResponse);
+
+        var authResponse = await TestNetwork.SendUsernamePasswordAuthAsync(stream, "local-user", "local-pass");
+        Assert.Equal(new byte[] { 0x01, 0x00 }, authResponse);
+
+        var udpAssociateRequest = TestNetwork.BuildUdpAssociateRequestIPv4(IPAddress.Any, 0);
+        await stream.WriteAsync(udpAssociateRequest);
+        var associateReply = await TestNetwork.ReadSocks5ReplyAsync(stream);
+        Assert.Equal((byte)0x00, associateReply.ReplyCode);
+        Assert.NotNull(associateReply.BoundEndPoint);
+
+        using var udpClient = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var payload = Encoding.ASCII.GetBytes("udp-through-authenticated-socks");
+        var udpPacket = TestNetwork.BuildSocks5UdpDatagram(IPAddress.Loopback, udpEcho.Port, payload);
+        await udpClient.SendAsync(udpPacket, associateReply.BoundEndPoint!, CancellationToken.None);
+
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var echoed = await udpClient.ReceiveAsync(timeoutCts.Token);
+        var parsed = TestNetwork.ParseSocks5UdpDatagram(echoed.Buffer);
+        Assert.Equal(IPAddress.Loopback, parsed.SourceAddress);
+        Assert.Equal(udpEcho.Port, parsed.SourcePort);
+        Assert.Equal(payload, parsed.Payload);
+    }
+
+    [Fact]
+    public async Task UdpAssociate_WithUsernamePasswordAuthentication_ClosesSessionAfterFailedAuthentication()
+    {
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var socks = await TestNetwork.StartSocksServerAsync(
+            tunnel.Port,
+            authenticationOptions: new Socks5AuthenticationOptions("local-user", "local-pass"));
+        using var tcpClient = await TestNetwork.ConnectAsync(socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        var greetingResponse = await TestNetwork.SendSocks5GreetingAsync(stream, 0x02);
+        Assert.Equal(new byte[] { 0x05, 0x02 }, greetingResponse);
+
+        var authResponse = await TestNetwork.SendUsernamePasswordAuthAsync(stream, "local-user", "wrong-pass");
+        Assert.Equal(new byte[] { 0x01, 0x01 }, authResponse);
+
+        var udpAssociateRequest = TestNetwork.BuildUdpAssociateRequestIPv4(IPAddress.Any, 0);
+        await stream.WriteAsync(udpAssociateRequest);
+
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var nextByte = new byte[1];
+        try
+        {
+            var read = await stream.ReadAsync(nextByte, timeoutCts.Token);
+            Assert.Equal(0, read);
+        }
+        catch (IOException)
+        {
+            // A hard socket close is also an acceptable outcome after failed auth.
+        }
+    }
 }

@@ -10,7 +10,13 @@ public sealed class HevSocks5TunnelProcess : IDisposable
     private Task<int>? _runTask;
     private bool _started;
 
-    public void Start(int tunFileDescriptor, int socksPort, int dnsPort)
+    public void Start(
+        int tunFileDescriptor,
+        int socksPort,
+        int dnsPort,
+        bool enableSocks5Authentication = false,
+        string? socks5Username = null,
+        string? socks5Password = null)
     {
         lock (_sync)
         {
@@ -20,7 +26,12 @@ public sealed class HevSocks5TunnelProcess : IDisposable
             }
 
             HevSocks5TunnelNative.EnsureLoaded();
-            var config = BuildConfig(socksPort, dnsPort);
+            var config = BuildConfig(
+                socksPort,
+                dnsPort,
+                enableSocks5Authentication,
+                socks5Username,
+                socks5Password);
             var configBytes = Encoding.UTF8.GetBytes(config);
 
             _runTask = Task.Run(() =>
@@ -79,28 +90,52 @@ public sealed class HevSocks5TunnelProcess : IDisposable
         }
     }
 
-    private static string BuildConfig(int socksPort, int dnsPort)
+    private static string BuildConfig(
+        int socksPort,
+        int dnsPort,
+        bool enableSocks5Authentication,
+        string? socks5Username,
+        string? socks5Password)
     {
-        return
-            """
-            tunnel:
-              mtu: 1500
-              ipv4: 198.18.0.2
-            socks5:
-              address: 127.0.0.1
-              port: __SOCKS_PORT__
-            mapdns:
-              address: 198.18.0.1
-              port: __DNS_PORT__
-              network: 100.64.0.0
-              netmask: 255.192.0.0
-              cache-size: 10000
-            misc:
-              log-file: stderr
-              log-level: warn
-            """
-            .Replace("__SOCKS_PORT__", socksPort.ToString(), StringComparison.Ordinal)
-            .Replace("__DNS_PORT__", dnsPort.ToString(), StringComparison.Ordinal);
+        var builder = new StringBuilder();
+        builder.AppendLine("tunnel:");
+        builder.AppendLine("  mtu: 1500");
+        builder.AppendLine("  ipv4: 198.18.0.2");
+        builder.AppendLine("socks5:");
+        builder.AppendLine("  address: 127.0.0.1");
+        builder.AppendLine($"  port: {socksPort}");
+
+        if (enableSocks5Authentication)
+        {
+            if (string.IsNullOrWhiteSpace(socks5Username))
+            {
+                throw new InvalidOperationException("SOCKS5 authentication is enabled, but username is empty.");
+            }
+
+            if (string.IsNullOrEmpty(socks5Password))
+            {
+                throw new InvalidOperationException("SOCKS5 authentication is enabled, but password is empty.");
+            }
+
+            builder.AppendLine($"  username: '{EscapeYamlSingleQuotedScalar(socks5Username)}'");
+            builder.AppendLine($"  password: '{EscapeYamlSingleQuotedScalar(socks5Password)}'");
+        }
+
+        builder.AppendLine("mapdns:");
+        builder.AppendLine("  address: 198.18.0.1");
+        builder.AppendLine($"  port: {dnsPort}");
+        builder.AppendLine("  network: 100.64.0.0");
+        builder.AppendLine("  netmask: 255.192.0.0");
+        builder.AppendLine("  cache-size: 10000");
+        builder.AppendLine("misc:");
+        builder.AppendLine("  log-file: stderr");
+        builder.AppendLine("  log-level: warn");
+        return builder.ToString();
+    }
+
+    private static string EscapeYamlSingleQuotedScalar(string value)
+    {
+        return value.Replace("'", "''", StringComparison.Ordinal);
     }
 
     private static class HevSocks5TunnelNative

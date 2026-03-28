@@ -9,6 +9,7 @@ socks5:
   address: __SOCKS_ADDRESS__
   port: __SOCKS_PORT__
   udp: 'udp'
+__SOCKS5_AUTH_BLOCK__
 
 misc:
   log-file: stderr

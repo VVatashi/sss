@@ -98,7 +98,13 @@ public sealed class SocksVpnService : VpnService
             AppLog.Write($"TUN interface established. Detached fd={_tunFd}.");
 
             _hevSocks5Tunnel = new HevSocks5TunnelProcess();
-            _hevSocks5Tunnel.Start(_tunFd, options.ListenPort, 53);
+            _hevSocks5Tunnel.Start(
+                _tunFd,
+                options.ListenPort,
+                53,
+                options.EnableSocks5Authentication,
+                options.Socks5Username,
+                options.Socks5Password);
             AppLog.Write("hev-socks5-tunnel started.");
 
             _running = true;

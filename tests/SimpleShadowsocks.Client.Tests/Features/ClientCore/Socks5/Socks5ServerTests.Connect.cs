@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using SimpleShadowsocks.Client.Socks5;
 
@@ -166,5 +167,62 @@ public sealed partial class Socks5ServerTests
         await stream.WriteAsync(connectRequest);
         var connectResponse = await TestNetwork.ReadSocks5ReplyAsync(stream);
         Assert.Equal((byte)0x02, connectResponse.ReplyCode);
+    }
+
+    [Fact]
+    public async Task ConnectCommand_WithUsernamePasswordAuthentication_AllowsRelayAfterSuccessfulAuthentication()
+    {
+        await using var echo = await TestNetwork.StartEchoServerAsync();
+        await using var socks = await TestNetwork.StartStandaloneSocksServerAsync(
+            authenticationOptions: new Socks5AuthenticationOptions("local-user", "local-pass"));
+        using var tcpClient = await TestNetwork.ConnectAsync(socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        var greetingResponse = await TestNetwork.SendSocks5GreetingAsync(stream, 0x00, 0x02);
+        Assert.Equal(new byte[] { 0x05, 0x02 }, greetingResponse);
+
+        var authResponse = await TestNetwork.SendUsernamePasswordAuthAsync(stream, "local-user", "local-pass");
+        Assert.Equal(new byte[] { 0x01, 0x00 }, authResponse);
+
+        var connectRequest = TestNetwork.BuildConnectRequestIPv4(IPAddress.Loopback, echo.Port);
+        await stream.WriteAsync(connectRequest);
+        var connectResponse = await TestNetwork.ReadSocks5ReplyAsync(stream);
+        Assert.Equal((byte)0x00, connectResponse.ReplyCode);
+
+        var payload = Encoding.ASCII.GetBytes("ping-through-authenticated-socks");
+        await stream.WriteAsync(payload);
+        var echoed = await TestNetwork.ReadExactAsync(stream, payload.Length);
+        Assert.Equal(payload, echoed);
+    }
+
+    [Fact]
+    public async Task ConnectCommand_WithUsernamePasswordAuthentication_ClosesSessionAfterFailedAuthentication()
+    {
+        await using var echo = await TestNetwork.StartEchoServerAsync();
+        await using var socks = await TestNetwork.StartStandaloneSocksServerAsync(
+            authenticationOptions: new Socks5AuthenticationOptions("local-user", "local-pass"));
+        using var tcpClient = await TestNetwork.ConnectAsync(socks.Port);
+        using var stream = tcpClient.GetStream();
+
+        var greetingResponse = await TestNetwork.SendSocks5GreetingAsync(stream, 0x02);
+        Assert.Equal(new byte[] { 0x05, 0x02 }, greetingResponse);
+
+        var authResponse = await TestNetwork.SendUsernamePasswordAuthAsync(stream, "local-user", "wrong-pass");
+        Assert.Equal(new byte[] { 0x01, 0x01 }, authResponse);
+
+        var connectRequest = TestNetwork.BuildConnectRequestIPv4(IPAddress.Loopback, echo.Port);
+        await stream.WriteAsync(connectRequest);
+
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var nextByte = new byte[1];
+        try
+        {
+            var read = await stream.ReadAsync(nextByte, timeoutCts.Token);
+            Assert.Equal(0, read);
+        }
+        catch (IOException)
+        {
+            // A hard socket close is also an acceptable outcome after failed auth.
+        }
     }
 }

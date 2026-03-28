@@ -26,6 +26,8 @@ public sealed class ProxyRunner
         CancellationToken cancellationToken,
         Action<Socket>? configureTunnelSocket = null)
     {
+        var routingPolicy = options.GetTrafficRoutingPolicy();
+
         lock (_sync)
         {
             if (IsRunning)
@@ -39,6 +41,9 @@ public sealed class ProxyRunner
             };
 
             var connectionPolicy = TunnelConnectionPolicy.Default;
+            var socks5Authentication = options.EnableSocks5Authentication
+                ? new Socks5AuthenticationOptions(options.Socks5Username, options.Socks5Password)
+                : Socks5AuthenticationOptions.Disabled;
             _server = new Socks5Server(
                 IPAddress.Loopback,
                 options.ListenPort,
@@ -50,7 +55,9 @@ public sealed class ProxyRunner
                 options.ProtocolVersion,
                 options.EnableCompression,
                 options.CompressionAlgorithm,
-                configureTunnelSocket: configureTunnelSocket);
+                routingPolicy: routingPolicy,
+                configureTunnelSocket: configureTunnelSocket,
+                authenticationOptions: socks5Authentication);
 
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             var linkedToken = _cts.Token;
@@ -58,7 +65,10 @@ public sealed class ProxyRunner
             IsRunning = true;
         }
 
-        RaiseStatus($"SOCKS5 started: 127.0.0.1:{options.ListenPort} -> {options.RemoteHost}:{options.RemotePort}");
+        RaiseStatus(
+            $"SOCKS5 started: 127.0.0.1:{options.ListenPort} -> {options.RemoteHost}:{options.RemotePort}, " +
+            $"auth={(options.EnableSocks5Authentication ? "username-password" : "disabled")}, " +
+            $"routing_rules={routingPolicy.Rules.Count}");
         return Task.CompletedTask;
     }
 

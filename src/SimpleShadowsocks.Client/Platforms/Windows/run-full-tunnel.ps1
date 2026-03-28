@@ -155,6 +155,45 @@ function Get-ArrayValue {
     return @($property.Value)
 }
 
+function Get-Socks5AuthenticationBlock {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Config
+    )
+
+    $authProperty = $Config.PSObject.Properties["Socks5Authentication"]
+    if ($null -eq $authProperty -or $null -eq $authProperty.Value) {
+        return ""
+    }
+
+    $authConfig = $authProperty.Value
+    $enabled = $false
+    $enabledProperty = $authConfig.PSObject.Properties["Enabled"]
+    if ($null -ne $enabledProperty -and $null -ne $enabledProperty.Value) {
+        $enabled = [bool]$enabledProperty.Value
+    }
+
+    if (-not $enabled) {
+        return ""
+    }
+
+    $username = [string](Get-ConfigValue -Config $authConfig -Name "Username" -DefaultValue "")
+    $password = [string](Get-ConfigValue -Config $authConfig -Name "Password" -DefaultValue "")
+
+    if ([string]::IsNullOrWhiteSpace($username)) {
+        throw "Socks5Authentication.Enabled is true, but Username is empty."
+    }
+
+    if ([string]::IsNullOrEmpty($password)) {
+        throw "Socks5Authentication.Enabled is true, but Password is empty."
+    }
+
+    return @"
+  username: '$($username.Replace("'", "''"))'
+  password: '$($password.Replace("'", "''"))'
+"@
+}
+
 function Get-PreferredDefaultRoute {
     param(
         [Parameter(Mandatory)]
@@ -359,6 +398,7 @@ $generatedConfig = $template.Replace("__SOCKS_ADDRESS__", $listenAddress)
 $generatedConfig = $generatedConfig.Replace(
     "__SOCKS_PORT__",
     $listenPort.ToString([System.Globalization.CultureInfo]::InvariantCulture))
+$generatedConfig = $generatedConfig.Replace("__SOCKS5_AUTH_BLOCK__", (Get-Socks5AuthenticationBlock -Config $config))
 
 [System.IO.File]::WriteAllText(
     $ConfigPath,

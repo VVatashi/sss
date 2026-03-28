@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using SimpleShadowsocks.Protocol;
 
@@ -7,7 +8,7 @@ namespace SimpleShadowsocks.Client.Socks5;
 
 public sealed partial class Socks5Server
 {
-    private static async Task<bool> HandleGreetingAsync(NetworkStream stream, CancellationToken cancellationToken)
+    private async Task<bool> HandleGreetingAsync(NetworkStream stream, CancellationToken cancellationToken)
     {
         var header = new byte[2];
         if (!await TryReadExactAsync(stream, header, cancellationToken))
@@ -32,11 +33,102 @@ public sealed partial class Socks5Server
             return false;
         }
 
-        var supportsNoAuth = methods.Contains(AuthNone);
-        var response = new[] { SocksVersion, supportsNoAuth ? AuthNone : AuthNoAcceptableMethods };
+        var selectedMethod = SelectAuthenticationMethod(methods);
+        var response = new[] { SocksVersion, selectedMethod };
         await stream.WriteAsync(response, cancellationToken);
 
-        return supportsNoAuth;
+        if (selectedMethod == AuthNoAcceptableMethods)
+        {
+            return false;
+        }
+
+        if (selectedMethod == AuthUsernamePassword)
+        {
+            return await HandleUsernamePasswordAuthenticationAsync(stream, cancellationToken);
+        }
+
+        return true;
+    }
+
+    private byte SelectAuthenticationMethod(byte[] methods)
+    {
+        if (_authenticationOptions.Enabled)
+        {
+            return methods.Contains(AuthUsernamePassword)
+                ? AuthUsernamePassword
+                : AuthNoAcceptableMethods;
+        }
+
+        return methods.Contains(AuthNone)
+            ? AuthNone
+            : AuthNoAcceptableMethods;
+    }
+
+    private async Task<bool> HandleUsernamePasswordAuthenticationAsync(NetworkStream stream, CancellationToken cancellationToken)
+    {
+        var versionBuffer = new byte[1];
+        if (!await TryReadExactAsync(stream, versionBuffer, cancellationToken))
+        {
+            return false;
+        }
+
+        if (versionBuffer[0] != UsernamePasswordAuthVersion)
+        {
+            await stream.WriteAsync(new byte[] { UsernamePasswordAuthVersion, 0x01 }, cancellationToken);
+            return false;
+        }
+
+        var username = await ReadLengthPrefixedStringAsync(stream, cancellationToken);
+        var password = await ReadLengthPrefixedStringAsync(stream, cancellationToken);
+        if (username is null || password is null)
+        {
+            await stream.WriteAsync(new byte[] { UsernamePasswordAuthVersion, 0x01 }, cancellationToken);
+            return false;
+        }
+
+        var authenticated = AreEqual(username, _authenticationOptions.Username)
+            && AreEqual(password, _authenticationOptions.Password);
+
+        await stream.WriteAsync(
+            new byte[] { UsernamePasswordAuthVersion, authenticated ? (byte)0x00 : (byte)0x01 },
+            cancellationToken);
+
+        if (!authenticated)
+        {
+            StructuredLog.Warn("socks5-server", "SOCKS5/AUTH", "client authentication failed");
+        }
+
+        return authenticated;
+    }
+
+    private static async Task<string?> ReadLengthPrefixedStringAsync(NetworkStream stream, CancellationToken cancellationToken)
+    {
+        var lengthBuffer = new byte[1];
+        if (!await TryReadExactAsync(stream, lengthBuffer, cancellationToken))
+        {
+            return null;
+        }
+
+        var length = lengthBuffer[0];
+        if (length == 0)
+        {
+            return null;
+        }
+
+        var valueBytes = new byte[length];
+        if (!await TryReadExactAsync(stream, valueBytes, cancellationToken))
+        {
+            return null;
+        }
+
+        return Encoding.UTF8.GetString(valueBytes);
+    }
+
+    private static bool AreEqual(string left, string right)
+    {
+        var leftBytes = Encoding.UTF8.GetBytes(left);
+        var rightBytes = Encoding.UTF8.GetBytes(right);
+        return CryptographicOperations.FixedTimeEquals(leftBytes, rightBytes);
     }
 
     private static async Task<Socks5ConnectRequest?> ReadConnectRequestAsync(NetworkStream stream, CancellationToken cancellationToken)
