@@ -30,3 +30,4 @@ coverage.*
 *.snupkg
 
 .env
+/artifacts/
