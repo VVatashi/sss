@@ -1,9 +1,12 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
+using SimpleShadowsocks.Client.Http;
 using SimpleShadowsocks.Client.Socks5;
 using SimpleShadowsocks.Client.Tunnel;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
+using SimpleShadowsocks.Server.Http;
 using SimpleShadowsocks.Server.Tunnel;
 
 namespace SimpleShadowsocks.Client.Tests;
@@ -57,6 +60,76 @@ internal static class TestNetwork
 
         await WaitUntilReachableAsync(port, cts.Token);
         return new RunningSocksServer(port, cts, runTask);
+    }
+
+    public static async Task<RunningHttpProxyServer> StartHttpProxyServerAsync(
+        int tunnelPort,
+        TunnelConnectionPolicy? connectionPolicy = null,
+        TunnelCryptoPolicy? cryptoPolicy = null,
+        TrafficRoutingPolicy? routingPolicy = null)
+    {
+        var port = AllocateUnusedPort();
+        var server = new HttpProxyServer(
+            IPAddress.Loopback,
+            port,
+            "127.0.0.1",
+            tunnelPort,
+            "dev-shared-key",
+            cryptoPolicy ?? TunnelCryptoPolicy.Default,
+            connectionPolicy ?? TunnelConnectionPolicy.Default,
+            routingPolicy: routingPolicy);
+        var cts = new CancellationTokenSource();
+        var runTask = server.RunAsync(cts.Token);
+
+        await WaitUntilReachableAsync(port, cts.Token);
+        return new RunningHttpProxyServer(port, cts, runTask);
+    }
+
+    public static async Task<RunningHttpProxyServer> StartStandaloneHttpProxyServerAsync(
+        TrafficRoutingPolicy? routingPolicy = null)
+    {
+        var port = AllocateUnusedPort();
+        var server = new HttpProxyServer(
+            IPAddress.Loopback,
+            port,
+            Array.Empty<(string Host, int Port)>(),
+            "dev-shared-key",
+            TunnelCryptoPolicy.Default,
+            TunnelConnectionPolicy.Default,
+            routingPolicy: routingPolicy);
+        var cts = new CancellationTokenSource();
+        var runTask = server.RunAsync(cts.Token);
+
+        await WaitUntilReachableAsync(port, cts.Token);
+        return new RunningHttpProxyServer(port, cts, runTask);
+    }
+
+    public static async Task<RunningHttpReverseProxyServer> StartHttpReverseProxyServerAsync(TunnelServer tunnelServer)
+    {
+        var port = AllocateUnusedPort();
+        var server = new HttpReverseProxyServer(IPAddress.Loopback, port, tunnelServer);
+        var cts = new CancellationTokenSource();
+        var runTask = server.RunAsync(cts.Token);
+
+        await WaitUntilReachableAsync(port, cts.Token);
+        return new RunningHttpReverseProxyServer(port, cts, runTask);
+    }
+
+    public static async Task<RunningHttpReverseProxyClient> StartHttpReverseProxyClientAsync(
+        RunningTunnelServer tunnel,
+        IReadOnlyList<HttpReverseProxyTunnelHandler.Route> routes)
+    {
+        var client = new HttpReverseProxyClient(
+            "127.0.0.1",
+            tunnel.Port,
+            "dev-shared-key",
+            routes,
+            TunnelCryptoPolicy.Default,
+            TunnelConnectionPolicy.Default);
+        var cts = new CancellationTokenSource();
+        var runTask = client.RunAsync(cts.Token);
+        await WaitForTunnelConnectionsAsync(() => tunnel.Server.AcceptedTunnelConnections >= 1, cts.Token);
+        return new RunningHttpReverseProxyClient(client, cts, runTask);
     }
 
     public static async Task<RunningSocksServer> StartStandaloneSocksServerAsync(
@@ -164,6 +237,65 @@ internal static class TestNetwork
         return new RunningEchoServer(port, cts, runTask);
     }
 
+    public static async Task<RunningHttpOriginServer> StartHttpOriginServerAsync(
+        Func<HttpOriginRequest, HttpOriginResponse>? responder = null)
+    {
+        var port = AllocateUnusedPort();
+        var listener = new TcpListener(IPAddress.Loopback, port);
+        listener.Start();
+        var capturedRequests = new List<HttpOriginRequest>();
+        var cts = new CancellationTokenSource();
+        var runTask = Task.Run(async () =>
+        {
+            try
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    var client = await listener.AcceptTcpClientAsync(cts.Token);
+                    _ = Task.Run(async () =>
+                    {
+                        using (client)
+                        {
+                            using var stream = client.GetStream();
+                            var reader = new BufferedTestStreamReader(stream);
+                            while (!cts.IsCancellationRequested)
+                            {
+                                var request = await HttpOriginRequest.ReadAsync(reader, cts.Token);
+                                if (request is null)
+                                {
+                                    return;
+                                }
+
+                                lock (capturedRequests)
+                                {
+                                    capturedRequests.Add(request);
+                                }
+
+                                var response = responder?.Invoke(request)
+                                    ?? new HttpOriginResponse(200, "OK", [new HttpHeader("Content-Type", "text/plain")], Encoding.ASCII.GetBytes("ok"));
+                                await WriteOriginResponseAsync(stream, response, cts.Token);
+                                if (!request.ShouldKeepAlive)
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }, cts.Token);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                listener.Stop();
+            }
+        }, cts.Token);
+
+        await WaitUntilReachableAsync(port, cts.Token);
+        return new RunningHttpOriginServer(port, cts, runTask, capturedRequests);
+    }
+
     public static Task<RunningUdpEchoServer> StartUdpEchoServerAsync()
     {
         var port = AllocateUnusedUdpPort();
@@ -216,6 +348,22 @@ internal static class TestNetwork
         }
 
         throw new TimeoutException($"Port {port} did not become reachable in time.");
+    }
+
+    public static async Task WaitForTunnelConnectionsAsync(Func<bool> predicate, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (predicate())
+            {
+                return;
+            }
+
+            await Task.Delay(20, cancellationToken);
+        }
+
+        throw new TimeoutException("Condition was not satisfied in time.");
     }
 
     public static int AllocateUnusedPort()
@@ -418,6 +566,96 @@ internal static class TestNetwork
     }
 
     internal readonly record struct Socks5Reply(byte ReplyCode, IPEndPoint? BoundEndPoint);
+    internal sealed record HttpOriginResponse(int StatusCode, string ReasonPhrase, IReadOnlyList<HttpHeader> Headers, byte[] Body);
+
+    public static async Task<(string Head, string BodyText)> SendRawHttpRequestAsync(int port, string requestText)
+    {
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        using var stream = client.GetStream();
+
+        var requestBytes = Encoding.ASCII.GetBytes(requestText.ReplaceLineEndings("\r\n"));
+        await stream.WriteAsync(requestBytes);
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var responseBytes = await ReadHttpResponseAsync(stream, timeoutCts.Token);
+        var responseText = Encoding.ASCII.GetString(responseBytes);
+        var separator = responseText.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+        if (separator < 0)
+        {
+            throw new InvalidDataException("HTTP response separator not found.");
+        }
+
+        return (responseText[..separator], responseText[(separator + 4)..]);
+    }
+
+    internal sealed class HttpOriginRequest
+    {
+        private HttpOriginRequest(
+            string method,
+            string pathAndQuery,
+            Version version,
+            IReadOnlyList<HttpHeader> headers,
+            byte[] body,
+            bool shouldKeepAlive)
+        {
+            Method = method;
+            PathAndQuery = pathAndQuery;
+            Version = version;
+            Headers = headers;
+            Body = body;
+            ShouldKeepAlive = shouldKeepAlive;
+        }
+
+        public string Method { get; }
+        public string PathAndQuery { get; }
+        public Version Version { get; }
+        public IReadOnlyList<HttpHeader> Headers { get; }
+        public byte[] Body { get; }
+        public bool ShouldKeepAlive { get; }
+
+        public string? GetHeader(string name)
+        {
+            return Headers.FirstOrDefault(header => header.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).Value;
+        }
+
+        public static async Task<HttpOriginRequest?> ReadAsync(BufferedTestStreamReader reader, CancellationToken cancellationToken)
+        {
+            var headerBytes = await reader.ReadHeaderBlockAsync(cancellationToken);
+            if (headerBytes is null)
+            {
+                return null;
+            }
+
+            var headerText = Encoding.Latin1.GetString(headerBytes);
+            var lines = headerText.Split("\r\n", StringSplitOptions.None);
+            var requestLine = lines[0].Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+            if (requestLine.Length != 3)
+            {
+                throw new InvalidDataException("Invalid origin request line.");
+            }
+
+            var version = Version.Parse(requestLine[2][5..]);
+            var headers = lines
+                .Skip(1)
+                .TakeWhile(line => !string.IsNullOrEmpty(line))
+                .Select(static line =>
+                {
+                    var separatorIndex = line.IndexOf(':');
+                    return new HttpHeader(line[..separatorIndex].Trim(), line[(separatorIndex + 1)..].Trim());
+                })
+                .ToArray();
+            var contentLengthHeader = headers.FirstOrDefault(static h => h.Name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase)).Value;
+            var body = string.IsNullOrWhiteSpace(contentLengthHeader)
+                ? []
+                : await reader.ReadBytesAsync(int.Parse(contentLengthHeader), cancellationToken);
+            var keepAlive = version <= HttpVersion.Version10
+                ? headers.Any(static h => h.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase)
+                    && h.Value.Contains("keep-alive", StringComparison.OrdinalIgnoreCase))
+                : !headers.Any(static h => h.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase)
+                    && h.Value.Contains("close", StringComparison.OrdinalIgnoreCase));
+            return new HttpOriginRequest(requestLine[0], requestLine[1], version, headers, body, keepAlive);
+        }
+    }
 
     internal sealed class RunningSocksServer : IAsyncDisposable
     {
@@ -538,6 +776,289 @@ internal static class TestNetwork
             {
                 _cts.Dispose();
             }
+        }
+    }
+
+    internal sealed class RunningHttpProxyServer : IAsyncDisposable
+    {
+        public RunningHttpProxyServer(int port, CancellationTokenSource cts, Task runTask)
+        {
+            Port = port;
+            _cts = cts;
+            _runTask = runTask;
+        }
+
+        public int Port { get; }
+        private readonly CancellationTokenSource _cts;
+        private readonly Task _runTask;
+
+        public async ValueTask DisposeAsync()
+        {
+            _cts.Cancel();
+            try
+            {
+                await _runTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                _cts.Dispose();
+            }
+        }
+    }
+
+    internal sealed class RunningHttpReverseProxyServer : IAsyncDisposable
+    {
+        public RunningHttpReverseProxyServer(int port, CancellationTokenSource cts, Task runTask)
+        {
+            Port = port;
+            _cts = cts;
+            _runTask = runTask;
+        }
+
+        public int Port { get; }
+        private readonly CancellationTokenSource _cts;
+        private readonly Task _runTask;
+
+        public async ValueTask DisposeAsync()
+        {
+            _cts.Cancel();
+            try
+            {
+                await _runTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                _cts.Dispose();
+            }
+        }
+    }
+
+    internal sealed class RunningHttpReverseProxyClient : IAsyncDisposable
+    {
+        public RunningHttpReverseProxyClient(HttpReverseProxyClient client, CancellationTokenSource cts, Task runTask)
+        {
+            Client = client;
+            _cts = cts;
+            _runTask = runTask;
+        }
+
+        public HttpReverseProxyClient Client { get; }
+        private readonly CancellationTokenSource _cts;
+        private readonly Task _runTask;
+
+        public async ValueTask DisposeAsync()
+        {
+            _cts.Cancel();
+            try
+            {
+                await _runTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                _cts.Dispose();
+            }
+        }
+    }
+
+    internal sealed class RunningHttpOriginServer : IAsyncDisposable
+    {
+        public RunningHttpOriginServer(int port, CancellationTokenSource cts, Task runTask, List<HttpOriginRequest> requests)
+        {
+            Port = port;
+            Requests = requests;
+            _cts = cts;
+            _runTask = runTask;
+        }
+
+        public int Port { get; }
+        public List<HttpOriginRequest> Requests { get; }
+        private readonly CancellationTokenSource _cts;
+        private readonly Task _runTask;
+
+        public async ValueTask DisposeAsync()
+        {
+            _cts.Cancel();
+            try
+            {
+                await _runTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                _cts.Dispose();
+            }
+        }
+    }
+
+    private static async Task WriteOriginResponseAsync(NetworkStream stream, HttpOriginResponse response, CancellationToken cancellationToken)
+    {
+        var builder = new StringBuilder();
+        builder.Append("HTTP/1.1 ")
+            .Append(response.StatusCode)
+            .Append(' ')
+            .Append(response.ReasonPhrase)
+            .Append("\r\n");
+        foreach (var header in response.Headers)
+        {
+            builder.Append(header.Name).Append(": ").Append(header.Value).Append("\r\n");
+        }
+
+        builder.Append("Content-Length: ").Append(response.Body.Length).Append("\r\n\r\n");
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(builder.ToString()), cancellationToken);
+        if (response.Body.Length > 0)
+        {
+            await stream.WriteAsync(response.Body, cancellationToken);
+        }
+    }
+
+    private static async Task<byte[]> ReadHttpResponseAsync(NetworkStream stream, CancellationToken cancellationToken)
+    {
+        using var buffer = new MemoryStream();
+        var readBuffer = new byte[4096];
+        while (true)
+        {
+            var snapshot = buffer.ToArray();
+            var text = Encoding.ASCII.GetString(snapshot);
+            var separator = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            if (separator >= 0)
+            {
+                var head = text[..separator];
+                var contentLength = head.Split("\r\n", StringSplitOptions.None)
+                    .Select(line => line.Split(':', 2))
+                    .Where(parts => parts.Length == 2 && parts[0].Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                    .Select(parts => int.Parse(parts[1].Trim()))
+                    .Cast<int?>()
+                    .FirstOrDefault();
+                if (contentLength.HasValue)
+                {
+                    var totalBytes = separator + 4 + contentLength.Value;
+                    while (buffer.Length < totalBytes)
+                    {
+                        var read = await stream.ReadAsync(readBuffer, cancellationToken);
+                        if (read == 0)
+                        {
+                            break;
+                        }
+
+                        await buffer.WriteAsync(readBuffer.AsMemory(0, read), cancellationToken);
+                    }
+
+                    return buffer.ToArray();
+                }
+
+                if (head.Contains("Transfer-Encoding: chunked", StringComparison.OrdinalIgnoreCase)
+                    && text.Contains("\r\n0\r\n\r\n", StringComparison.Ordinal))
+                {
+                    return buffer.ToArray();
+                }
+            }
+
+            var bytesRead = await stream.ReadAsync(readBuffer, cancellationToken);
+            if (bytesRead == 0)
+            {
+                return buffer.ToArray();
+            }
+
+            await buffer.WriteAsync(readBuffer.AsMemory(0, bytesRead), cancellationToken);
+        }
+    }
+
+    internal sealed class BufferedTestStreamReader
+    {
+        private readonly Stream _stream;
+        private byte[] _buffer = new byte[4096];
+        private int _offset;
+        private int _count;
+
+        public BufferedTestStreamReader(Stream stream)
+        {
+            _stream = stream;
+        }
+
+        public async Task<byte[]?> ReadHeaderBlockAsync(CancellationToken cancellationToken)
+        {
+            while (true)
+            {
+                var markerIndex = _buffer.AsSpan(_offset, _count - _offset).IndexOf("\r\n\r\n"u8);
+                if (markerIndex >= 0)
+                {
+                    var bytes = new byte[markerIndex + 4];
+                    Buffer.BlockCopy(_buffer, _offset, bytes, 0, bytes.Length);
+                    _offset += bytes.Length;
+                    return bytes;
+                }
+
+                Compact();
+                if (_count == _buffer.Length)
+                {
+                    Array.Resize(ref _buffer, _buffer.Length * 2);
+                }
+
+                var read = await _stream.ReadAsync(_buffer.AsMemory(_count), cancellationToken);
+                if (read == 0)
+                {
+                    return _count == _offset ? null : throw new IOException("Unexpected EOF while reading origin request.");
+                }
+
+                _count += read;
+            }
+        }
+
+        public async Task<byte[]> ReadBytesAsync(int count, CancellationToken cancellationToken)
+        {
+            var buffer = new byte[count];
+            var written = 0;
+            while (written < count)
+            {
+                if (_count > _offset)
+                {
+                    var available = Math.Min(count - written, _count - _offset);
+                    Buffer.BlockCopy(_buffer, _offset, buffer, written, available);
+                    _offset += available;
+                    written += available;
+                    continue;
+                }
+
+                var read = await _stream.ReadAsync(buffer.AsMemory(written, count - written), cancellationToken);
+                if (read == 0)
+                {
+                    throw new IOException("Unexpected EOF while reading origin body.");
+                }
+
+                written += read;
+            }
+
+            return buffer;
+        }
+
+        private void Compact()
+        {
+            if (_offset == 0)
+            {
+                return;
+            }
+
+            if (_offset == _count)
+            {
+                _offset = 0;
+                _count = 0;
+                return;
+            }
+
+            Buffer.BlockCopy(_buffer, _offset, _buffer, 0, _count - _offset);
+            _count -= _offset;
+            _offset = 0;
         }
     }
 }

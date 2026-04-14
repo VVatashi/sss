@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Threading.Channels;
 using SimpleShadowsocks.Protocol;
@@ -16,9 +17,11 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
     private readonly TunnelConnectionPolicy _connectionPolicy;
     private readonly byte _protocolVersion;
     private readonly ProtocolWriteOptions _writeOptions;
+    private readonly ITunnelReverseHttpHandler? _reverseHttpHandler;
 
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private readonly ConcurrentDictionary<uint, SessionState> _sessions = new();
+    private readonly ConcurrentDictionary<uint, IncomingReverseHttpSession> _incomingReverseHttpSessions = new();
 
     private TcpClient? _tcpClient;
     private Stream? _secureStream;
@@ -43,7 +46,8 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         byte protocolVersion = ProtocolConstants.Version,
         bool enableCompression = false,
         PayloadCompressionAlgorithm compressionAlgorithm = PayloadCompressionAlgorithm.Deflate,
-        Action<Socket>? configureTcpSocket = null)
+        Action<Socket>? configureTcpSocket = null,
+        ITunnelReverseHttpHandler? reverseHttpHandler = null)
     {
         _configureTcpSocket = configureTcpSocket;
         _remoteHost = remoteHost;
@@ -52,6 +56,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         _cryptoPolicy = cryptoPolicy;
         _connectionPolicy = connectionPolicy;
         _protocolVersion = protocolVersion;
+        _reverseHttpHandler = reverseHttpHandler;
         _writeOptions = new ProtocolWriteOptions
         {
             Version = protocolVersion,
@@ -156,6 +161,79 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         }
     }
 
+    public async Task<(uint SessionId, HttpResponseStart Response, ChannelReader<byte[]> Reader)> ExecuteHttpRequestAsync(
+        HttpRequestStart requestStart,
+        ReadOnlyMemory<byte> body,
+        CancellationToken cancellationToken)
+    {
+        if (!ProtocolConstants.SupportsHttpRelay(_protocolVersion))
+        {
+            throw new InvalidOperationException($"HTTP relay requires protocol v{ProtocolConstants.Version}.");
+        }
+
+        await EnsureConnectedAsync(cancellationToken);
+        if (_sessions.Count >= _connectionPolicy.MaxConcurrentSessions)
+        {
+            throw new InvalidOperationException(
+                $"Max concurrent sessions limit reached: {_connectionPolicy.MaxConcurrentSessions}.");
+        }
+
+        var sessionId = (uint)Interlocked.Increment(ref _nextSessionId);
+        var state = new SessionState(requestStart, _connectionPolicy.SessionReceiveChannelCapacity);
+        if (!_sessions.TryAdd(sessionId, state))
+        {
+            throw new InvalidOperationException("Failed to register tunnel HTTP session.");
+        }
+
+        try
+        {
+            state.BeginConnectAttempt();
+            await SendFrameAsync(
+                new ProtocolFrame(
+                    FrameType.HttpRequest,
+                    sessionId,
+                    0,
+                    ProtocolPayloadSerializer.SerializeHttpRequestStart(requestStart)),
+                cancellationToken);
+
+            const int chunkSize = 16 * 1024;
+            var offset = 0;
+            while (offset < body.Length)
+            {
+                var length = Math.Min(chunkSize, body.Length - offset);
+                await SendPendingSessionFrameAsync(
+                    sessionId,
+                    state,
+                    FrameType.Data,
+                    body.Slice(offset, length),
+                    cancellationToken);
+                offset += length;
+            }
+
+            await SendPendingSessionFrameAsync(
+                sessionId,
+                state,
+                FrameType.HttpRequestEnd,
+                ReadOnlyMemory<byte>.Empty,
+                cancellationToken);
+
+            var response = await state.WaitForHttpResponseAsync(cancellationToken);
+            if (state.ReaderWriter is null)
+            {
+                throw new InvalidOperationException("HTTP session is not initialized.");
+            }
+
+            StructuredLog.Info("tunnel-client", "TUNNEL/HTTP", $"{requestStart.Method} {requestStart.Authority}{requestStart.PathAndQuery}", sessionId);
+            return (sessionId, response, state.ReaderWriter.Reader);
+        }
+        catch
+        {
+            _sessions.TryRemove(sessionId, out _);
+            state.ReaderWriter?.Writer.TryComplete();
+            throw;
+        }
+    }
+
     public Task SendDataAsync(uint sessionId, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
         return SendSessionFrameAsync(sessionId, FrameType.Data, payload, cancellationToken);
@@ -186,7 +264,11 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
 
             state.ReaderWriter?.Writer.TryComplete();
             state.UdpReaderWriter?.Writer.TryComplete();
-            StructuredLog.Info("tunnel-client", state.IsUdp ? "TUNNEL/UDP" : "TUNNEL/TCP", "session closed", sessionId);
+            StructuredLog.Info(
+                "tunnel-client",
+                state.IsUdp ? "TUNNEL/UDP" : state.IsHttp ? "TUNNEL/HTTP" : "TUNNEL/TCP",
+                "session closed",
+                sessionId);
         }
     }
 

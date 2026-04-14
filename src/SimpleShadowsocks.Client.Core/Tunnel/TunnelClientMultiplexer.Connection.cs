@@ -162,8 +162,18 @@ public sealed partial class TunnelClientMultiplexer
         {
             var error = _connectionError ?? new IOException("Tunnel connection fault.");
             StructuredLog.Error("tunnel-client", "TUNNEL/TCP", "connection fault; preserving sessions", error);
-            foreach (var (_, state) in _sessions)
+            DisposeAllIncomingReverseHttpSessions(error);
+            foreach (var (sessionId, state) in _sessions.ToArray())
             {
+                if (!state.IsResumable)
+                {
+                    state.MarkClosed();
+                    state.FailConnect(error);
+                    state.ReaderWriter?.Writer.TryComplete(error);
+                    _sessions.TryRemove(sessionId, out _);
+                    continue;
+                }
+
                 state.NotifyConnectionFault(error);
             }
             return;
@@ -178,6 +188,7 @@ public sealed partial class TunnelClientMultiplexer
             StructuredLog.Warn("tunnel-client", "TUNNEL/TCP", "connection closed; dropping all sessions");
         }
 
+        DisposeAllIncomingReverseHttpSessions(_connectionError);
         foreach (var (sessionId, state) in _sessions.ToArray())
         {
             state.MarkClosed();

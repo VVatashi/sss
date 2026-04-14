@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Collections.Concurrent;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
 
@@ -22,8 +23,10 @@ public sealed partial class TunnelServer
     private readonly TunnelCryptoPolicy _cryptoPolicy;
     private readonly TunnelServerPolicy _serverPolicy;
     private readonly TaskCompletionSource<bool> _startedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly ConcurrentDictionary<long, ActiveTunnelConnection> _activeTunnelConnections = new();
     private int _acceptedTunnelConnections;
-    private int _activeTunnelConnections;
+    private int _activeTunnelConnectionCount;
+    private long _nextTunnelConnectionId;
 
     public int AcceptedTunnelConnections => Volatile.Read(ref _acceptedTunnelConnections);
 
@@ -113,7 +116,7 @@ public sealed partial class TunnelServer
             }
             finally
             {
-                Interlocked.Decrement(ref _activeTunnelConnections);
+                Interlocked.Decrement(ref _activeTunnelConnectionCount);
             }
         }
     }
@@ -140,13 +143,13 @@ public sealed partial class TunnelServer
     {
         while (true)
         {
-            var current = Volatile.Read(ref _activeTunnelConnections);
+            var current = Volatile.Read(ref _activeTunnelConnectionCount);
             if (current >= _serverPolicy.MaxConcurrentTunnels)
             {
                 return false;
             }
 
-            if (Interlocked.CompareExchange(ref _activeTunnelConnections, current + 1, current) == current)
+            if (Interlocked.CompareExchange(ref _activeTunnelConnectionCount, current + 1, current) == current)
             {
                 return true;
             }

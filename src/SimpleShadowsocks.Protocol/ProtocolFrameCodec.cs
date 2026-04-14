@@ -26,14 +26,14 @@ public static class ProtocolFrameCodec
         }
 
         var effectiveVersion = options.Version;
-        if (effectiveVersion is not (ProtocolConstants.LegacyVersion or ProtocolConstants.Version))
+        if (!ProtocolConstants.IsSupported(effectiveVersion))
         {
             throw new InvalidOperationException($"Unsupported write protocol version: {effectiveVersion}.");
         }
 
         var flags = ProtocolFlags.None;
         EncodedPayload encodedPayload;
-        if (effectiveVersion == ProtocolConstants.Version)
+        if (ProtocolConstants.SupportsCompression(effectiveVersion))
         {
             encodedPayload = EncodePayload(
                 frame.Payload,
@@ -63,7 +63,7 @@ public static class ProtocolFrameCodec
             else
             {
                 var headerV2 = writer.GetSpan(ProtocolConstants.HeaderSizeV2);
-                headerV2[0] = ProtocolConstants.Version;
+                headerV2[0] = effectiveVersion;
                 headerV2[1] = (byte)frame.Type;
                 headerV2[2] = flags;
                 BinaryPrimitives.WriteUInt32BigEndian(headerV2.Slice(3, 4), frame.SessionId);
@@ -101,13 +101,13 @@ public static class ProtocolFrameCodec
         {
             options ??= ProtocolWriteOptions.V2NoCompression;
             var effectiveVersion = options.Version;
-            if (effectiveVersion is not (ProtocolConstants.LegacyVersion or ProtocolConstants.Version))
+            if (!ProtocolConstants.IsSupported(effectiveVersion))
             {
                 throw new InvalidOperationException($"Unsupported write protocol version: {effectiveVersion}.");
             }
 
             EncodedPayload encodedPayload;
-            if (effectiveVersion == ProtocolConstants.Version)
+            if (ProtocolConstants.SupportsCompression(effectiveVersion))
             {
                 encodedPayload = EncodePayload(
                     frame.Payload,
@@ -136,7 +136,7 @@ public static class ProtocolFrameCodec
                 else
                 {
                     var headerSpan = header.AsSpan(0, ProtocolConstants.HeaderSizeV2);
-                    headerSpan[0] = ProtocolConstants.Version;
+                    headerSpan[0] = effectiveVersion;
                     headerSpan[1] = (byte)frame.Type;
                     headerSpan[2] = encodedPayload.Flags;
                     BinaryPrimitives.WriteUInt32BigEndian(headerSpan.Slice(3, 4), frame.SessionId);
@@ -191,7 +191,7 @@ public static class ProtocolFrameCodec
             {
                 expectedHeaderLength = ProtocolConstants.HeaderSizeV1;
             }
-            else if (version == ProtocolConstants.Version)
+            else if (ProtocolConstants.UsesExtendedHeader(version))
             {
                 expectedHeaderLength = ProtocolConstants.HeaderSizeV2;
             }

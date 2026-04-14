@@ -90,7 +90,7 @@ public sealed class ProtocolFrameCodecTests
         await using var stream = new MemoryStream();
         await ProtocolFrameCodec.WriteAsync(stream, frame, default, new ProtocolWriteOptions
         {
-            Version = ProtocolConstants.Version,
+            Version = ProtocolConstants.Version2,
             EnableCompression = true,
             CompressionMinBytes = 64,
             CompressionMinSavingsBytes = 1
@@ -99,7 +99,7 @@ public sealed class ProtocolFrameCodecTests
         stream.Position = 0;
         var decoded = await ProtocolFrameCodec.ReadDetailedAsync(stream);
         Assert.True(decoded.HasValue);
-        Assert.Equal(ProtocolConstants.Version, decoded.Value.Version);
+        Assert.Equal(ProtocolConstants.Version2, decoded.Value.Version);
         Assert.True((decoded.Value.Flags & ProtocolFlags.CompressionEnabled) != 0);
         Assert.Equal(payload, decoded.Value.Frame.Payload.ToArray());
     }
@@ -116,7 +116,7 @@ public sealed class ProtocolFrameCodecTests
         await using var stream = new MemoryStream();
         await ProtocolFrameCodec.WriteAsync(stream, frame, default, new ProtocolWriteOptions
         {
-            Version = ProtocolConstants.Version,
+            Version = ProtocolConstants.Version2,
             EnableCompression = true,
             CompressionAlgorithm = algorithm,
             CompressionMinBytes = 64,
@@ -126,10 +126,93 @@ public sealed class ProtocolFrameCodecTests
         stream.Position = 0;
         var decoded = await ProtocolFrameCodec.ReadDetailedAsync(stream);
         Assert.True(decoded.HasValue);
-        Assert.Equal(ProtocolConstants.Version, decoded.Value.Version);
+        Assert.Equal(ProtocolConstants.Version2, decoded.Value.Version);
         Assert.True((decoded.Value.Flags & ProtocolFlags.CompressionEnabled) != 0);
         Assert.Equal(algorithm, ProtocolFrameCodec.GetCompressionAlgorithm(decoded.Value.Flags));
         Assert.Equal(payload, decoded.Value.Frame.Payload.ToArray());
+    }
+
+    [Fact]
+    public void HttpRequestPayload_RoundTrip()
+    {
+        var request = new HttpRequestStart(
+            "POST",
+            "http",
+            "example.org:8080",
+            "/api/items?id=42",
+            1,
+            1,
+            [new HttpHeader("Host", "example.org:8080"), new HttpHeader("User-Agent", "tests")]);
+
+        var payload = ProtocolPayloadSerializer.SerializeHttpRequestStart(request);
+        var decoded = ProtocolPayloadSerializer.DeserializeHttpRequestStart(payload);
+
+        Assert.Equal(request.Method, decoded.Method);
+        Assert.Equal(request.Scheme, decoded.Scheme);
+        Assert.Equal(request.Authority, decoded.Authority);
+        Assert.Equal(request.PathAndQuery, decoded.PathAndQuery);
+        Assert.Equal(request.VersionMajor, decoded.VersionMajor);
+        Assert.Equal(request.VersionMinor, decoded.VersionMinor);
+        Assert.Equal(request.Headers, decoded.Headers);
+    }
+
+    [Fact]
+    public void HttpResponsePayload_RoundTrip()
+    {
+        var response = new HttpResponseStart(
+            201,
+            "Created",
+            1,
+            1,
+            [new HttpHeader("Content-Type", "application/json"), new HttpHeader("ETag", "\"abc\"")]);
+
+        var payload = ProtocolPayloadSerializer.SerializeHttpResponseStart(response);
+        var decoded = ProtocolPayloadSerializer.DeserializeHttpResponseStart(payload);
+
+        Assert.Equal(response.StatusCode, decoded.StatusCode);
+        Assert.Equal(response.ReasonPhrase, decoded.ReasonPhrase);
+        Assert.Equal(response.VersionMajor, decoded.VersionMajor);
+        Assert.Equal(response.VersionMinor, decoded.VersionMinor);
+        Assert.Equal(response.Headers, decoded.Headers);
+    }
+
+    [Fact]
+    public async Task FrameCodec_ReverseHttpRequest_RoundTrip()
+    {
+        var request = new HttpRequestStart(
+            "GET",
+            "http",
+            "app.local",
+            "/hello",
+            1,
+            1,
+            [new HttpHeader("Host", "app.local")]);
+        var frame = new ProtocolFrame(
+            FrameType.ReverseHttpRequest,
+            SessionId: 0x80000001,
+            Sequence: 0,
+            Payload: ProtocolPayloadSerializer.SerializeHttpRequestStart(request));
+
+        await using var stream = new MemoryStream();
+        await ProtocolFrameCodec.WriteAsync(stream, frame, default, new ProtocolWriteOptions
+        {
+            Version = ProtocolConstants.Version,
+            EnableCompression = false
+        });
+
+        stream.Position = 0;
+        var decoded = await ProtocolFrameCodec.ReadDetailedAsync(stream);
+
+        Assert.True(decoded.HasValue);
+        Assert.Equal(FrameType.ReverseHttpRequest, decoded.Value.Frame.Type);
+        var decodedRequest = ProtocolPayloadSerializer.DeserializeHttpRequestStart(decoded.Value.Frame.Payload.Span);
+        Assert.Equal(request.Method, decodedRequest.Method);
+        Assert.Equal(request.Scheme, decodedRequest.Scheme);
+        Assert.Equal(request.Authority, decodedRequest.Authority);
+        Assert.Equal(request.PathAndQuery, decodedRequest.PathAndQuery);
+        Assert.Equal(request.VersionMajor, decodedRequest.VersionMajor);
+        Assert.Equal(request.VersionMinor, decodedRequest.VersionMinor);
+        Assert.Equal(request.Headers, decodedRequest.Headers);
     }
 
     [Fact]

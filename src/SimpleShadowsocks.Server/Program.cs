@@ -2,11 +2,13 @@ using System.Net;
 using System.Text.Json;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
+using SimpleShadowsocks.Server.Http;
 using SimpleShadowsocks.Server.Tunnel;
 
 var config = ServerConfig.Load();
 var listenPort = config.ListenPort;
 var sharedKey = config.SharedKey;
+var httpReverseProxy = config.HttpReverseProxy ?? new ServerConfig.HttpReverseProxyConfig();
 var cryptoPolicy = new TunnelCryptoPolicy
 {
     HandshakeMaxClockSkewSeconds = config.HandshakeMaxClockSkewSeconds,
@@ -38,11 +40,28 @@ Console.CancelKeyPress += (_, eventArgs) =>
 
 StructuredLog.Info("server-host", "CONTROL", "SimpleShadowsocks.Server started");
 StructuredLog.Info("server-host", "TUNNEL/TCP", $"listen=0.0.0.0:{listenPort}");
-StructuredLog.Info("server-host", "CONTROL", $"protocol_versions=v{ProtocolConstants.LegacyVersion},v{ProtocolConstants.Version}");
+StructuredLog.Info(
+    "server-host",
+    "CONTROL",
+    $"protocol_versions=v{ProtocolConstants.LegacyVersion},v{ProtocolConstants.Version2},v{ProtocolConstants.Version}");
+if (httpReverseProxy.Enabled)
+{
+    StructuredLog.Info("server-host", "HTTP", $"reverse_listen={config.GetHttpReverseProxyListenIPAddress()}:{httpReverseProxy.ListenPort}");
+}
 StructuredLog.Info("server-host", "CONTROL", "press Ctrl+C to stop");
 
 var server = new TunnelServer(IPAddress.Any, listenPort, sharedKey, cryptoPolicy, serverPolicy);
-await server.RunAsync(cts.Token);
+var runTasks = new List<Task> { server.RunAsync(cts.Token) };
+if (httpReverseProxy.Enabled)
+{
+    var reverseProxyServer = new HttpReverseProxyServer(
+        config.GetHttpReverseProxyListenIPAddress(),
+        httpReverseProxy.ListenPort,
+        server);
+    runTasks.Add(reverseProxyServer.RunAsync(cts.Token));
+}
+
+await Task.WhenAll(runTasks);
 
 internal sealed class ServerConfig
 {
@@ -53,6 +72,19 @@ internal sealed class ServerConfig
     public int MaxConcurrentTunnels { get; init; } = 1024;
     public int MaxSessionsPerTunnel { get; init; } = 1024;
     public int ConnectTimeoutMs { get; init; } = 10000;
+    public HttpReverseProxyConfig? HttpReverseProxy { get; init; }
+
+    public IPAddress GetHttpReverseProxyListenIPAddress()
+    {
+        var configuredAddress = HttpReverseProxy?.ListenAddress;
+        if (!string.IsNullOrWhiteSpace(configuredAddress) && IPAddress.TryParse(configuredAddress, out var parsed))
+        {
+            return parsed;
+        }
+
+        throw new InvalidDataException(
+            $"Unsupported HttpReverseProxy.ListenAddress: '{configuredAddress}'. Expected a valid IPv4 or IPv6 literal.");
+    }
 
     public static ServerConfig Load()
     {
@@ -64,5 +96,12 @@ internal sealed class ServerConfig
 
         var json = File.ReadAllText(path);
         return JsonSerializer.Deserialize<ServerConfig>(json) ?? new ServerConfig();
+    }
+
+    public sealed class HttpReverseProxyConfig
+    {
+        public bool Enabled { get; init; }
+        public int ListenPort { get; init; } = 8081;
+        public string ListenAddress { get; init; } = IPAddress.Loopback.ToString();
     }
 }

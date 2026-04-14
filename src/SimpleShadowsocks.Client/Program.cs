@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using SimpleShadowsocks.Client.Http;
 using SimpleShadowsocks.Client.Socks5;
 using SimpleShadowsocks.Client.Tunnel;
 using SimpleShadowsocks.Protocol;
@@ -21,6 +22,8 @@ var compressionAlgorithm = config.GetCompressionAlgorithm();
 var tunnelCipherAlgorithm = config.GetTunnelCipherAlgorithm();
 var routingPolicy = config.GetTrafficRoutingPolicy();
 var socks5Authentication = config.GetSocks5AuthenticationOptions();
+var httpProxy = config.HttpProxy ?? new ClientConfig.HttpProxyConfig();
+var httpReverseProxy = config.HttpReverseProxy ?? new ClientConfig.HttpReverseProxyConfig();
 var cryptoPolicy = new TunnelCryptoPolicy
 {
     HandshakeMaxClockSkewSeconds = config.HandshakeMaxClockSkewSeconds,
@@ -92,9 +95,21 @@ StructuredLog.Info(
     socks5Authentication.Enabled
         ? $"incoming_auth=username-password(username={socks5Authentication.Username})"
         : "incoming_auth=disabled");
+if (httpProxy.Enabled)
+{
+    var httpListenAddress = config.GetHttpProxyListenIPAddress();
+    StructuredLog.Info("client-host", "HTTP", $"listen={httpListenAddress}:{httpProxy.ListenPort}");
+}
+if (httpReverseProxy.Enabled)
+{
+    StructuredLog.Info(
+        "client-host",
+        "HTTP",
+        $"reverse_routes={string.Join("; ", config.GetHttpReverseProxyRoutes().Select((route, index) => $"#{index + 1}:{route.Host ?? "*"}:{route.PathPrefix ?? "*"}->{route.TargetBaseUri}"))}");
+}
 StructuredLog.Info("client-host", "CONTROL", "press Ctrl+C to stop");
 
-var server = remoteServers.Count > 0
+var socksServer = remoteServers.Count > 0
     ? new Socks5Server(
         listenAddress,
         listenPort,
@@ -120,7 +135,64 @@ var server = remoteServers.Count > 0
         compressionAlgorithm,
         routingPolicy,
         authenticationOptions: socks5Authentication);
-await server.RunAsync(cts.Token);
+
+var runTasks = new List<Task> { socksServer.RunAsync(cts.Token) };
+if (httpProxy.Enabled)
+{
+    var httpListenAddress = config.GetHttpProxyListenIPAddress();
+    var httpServer = remoteServers.Count > 0
+        ? new HttpProxyServer(
+            httpListenAddress,
+            httpProxy.ListenPort,
+            remoteServers,
+            sharedKey,
+            cryptoPolicy,
+            connectionPolicy,
+            protocolVersion,
+            enableCompression,
+            compressionAlgorithm,
+            routingPolicy)
+        : new HttpProxyServer(
+            httpListenAddress,
+            httpProxy.ListenPort,
+            remoteHost,
+            remotePort,
+            sharedKey,
+            cryptoPolicy,
+            connectionPolicy,
+            protocolVersion,
+            enableCompression,
+            compressionAlgorithm,
+            routingPolicy);
+    runTasks.Add(httpServer.RunAsync(cts.Token));
+}
+if (httpReverseProxy.Enabled)
+{
+    var reverseRoutes = config.GetHttpReverseProxyRoutes();
+    var reverseProxyClient = remoteServers.Count > 0
+        ? new HttpReverseProxyClient(
+            remoteServers,
+            sharedKey,
+            reverseRoutes,
+            cryptoPolicy,
+            connectionPolicy,
+            protocolVersion,
+            enableCompression,
+            compressionAlgorithm)
+        : new HttpReverseProxyClient(
+            remoteHost,
+            remotePort,
+            sharedKey,
+            reverseRoutes,
+            cryptoPolicy,
+            connectionPolicy,
+            protocolVersion,
+            enableCompression,
+            compressionAlgorithm);
+    runTasks.Add(reverseProxyClient.RunAsync(cts.Token));
+}
+
+await Task.WhenAll(runTasks);
 
 internal sealed class ClientConfig
 {
@@ -145,6 +217,8 @@ internal sealed class ClientConfig
     public List<RemoteServerConfig>? RemoteServers { get; init; }
     public List<TrafficRoutingRuleConfig>? TrafficRoutingRules { get; init; }
     public Socks5AuthenticationConfig? Socks5Authentication { get; init; }
+    public HttpProxyConfig? HttpProxy { get; init; }
+    public HttpReverseProxyConfig? HttpReverseProxy { get; init; }
 
     public SimpleShadowsocks.Protocol.Crypto.TunnelCipherAlgorithm GetTunnelCipherAlgorithm()
     {
@@ -177,14 +251,15 @@ internal sealed class ClientConfig
 
     public IPAddress GetListenIPAddress()
     {
-        if (IPAddress.TryParse(ListenAddress, out var parsed))
-        {
-            return parsed;
-        }
+        return ParseListenIPAddress(ListenAddress, nameof(ListenAddress));
+    }
 
-        throw new InvalidDataException(
-            $"Unsupported ListenAddress: '{ListenAddress}'. " +
-            "Expected a valid IPv4 or IPv6 literal.");
+    public IPAddress GetHttpProxyListenIPAddress()
+    {
+        var configuredAddress = HttpProxy?.ListenAddress;
+        return string.IsNullOrWhiteSpace(configuredAddress)
+            ? GetListenIPAddress()
+            : ParseListenIPAddress(configuredAddress, "HttpProxy.ListenAddress");
     }
 
     public static ClientConfig Load()
@@ -227,6 +302,22 @@ internal sealed class ClientConfig
         }
 
         return new Socks5AuthenticationOptions(auth.Username, auth.Password);
+    }
+
+    public IReadOnlyList<HttpReverseProxyTunnelHandler.Route> GetHttpReverseProxyRoutes()
+    {
+        var config = HttpReverseProxy;
+        if (config is null || !config.Enabled)
+        {
+            return [];
+        }
+
+        if (config.Routes is null || config.Routes.Count == 0)
+        {
+            throw new InvalidDataException("HttpReverseProxy.Routes must contain at least one route when reverse proxy is enabled.");
+        }
+
+        return config.Routes.Select((route, index) => route.ToRuntimeRoute(index)).ToArray();
     }
 
     public sealed class RemoteServerConfig
@@ -291,5 +382,75 @@ internal sealed class ClientConfig
         public bool Enabled { get; init; }
         public string Username { get; init; } = string.Empty;
         public string Password { get; init; } = string.Empty;
+    }
+
+    public sealed class HttpProxyConfig
+    {
+        public bool Enabled { get; init; }
+        public int ListenPort { get; init; } = 8080;
+        public string? ListenAddress { get; init; }
+    }
+
+    public sealed class HttpReverseProxyConfig
+    {
+        public bool Enabled { get; init; }
+        public List<HttpReverseProxyRouteConfig>? Routes { get; init; }
+    }
+
+    public sealed class HttpReverseProxyRouteConfig
+    {
+        public string? Host { get; init; }
+        public string? PathPrefix { get; init; }
+        public string TargetBaseUrl { get; init; } = string.Empty;
+        public bool StripPathPrefix { get; init; }
+
+        public HttpReverseProxyTunnelHandler.Route ToRuntimeRoute(int index)
+        {
+            var normalizedHost = string.IsNullOrWhiteSpace(Host) ? null : Host.Trim();
+            var normalizedPathPrefix = string.IsNullOrWhiteSpace(PathPrefix) ? null : NormalizePathPrefix(PathPrefix.Trim(), index);
+            if (normalizedHost is null && normalizedPathPrefix is null)
+            {
+                throw new InvalidDataException(
+                    $"HttpReverseProxy.Routes[{index}] must specify at least Host or PathPrefix.");
+            }
+
+            if (!Uri.TryCreate(TargetBaseUrl, UriKind.Absolute, out var targetBaseUri)
+                || !string.Equals(targetBaseUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException(
+                    $"HttpReverseProxy.Routes[{index}].TargetBaseUrl must be an absolute http:// URL.");
+            }
+
+            return new HttpReverseProxyTunnelHandler.Route(
+                normalizedHost,
+                normalizedPathPrefix,
+                targetBaseUri,
+                StripPathPrefix);
+        }
+
+        private static string NormalizePathPrefix(string prefix, int index)
+        {
+            if (!prefix.StartsWith("/", StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    $"HttpReverseProxy.Routes[{index}].PathPrefix must start with '/'.");
+            }
+
+            return prefix.Length > 1 && prefix.EndsWith("/", StringComparison.Ordinal)
+                ? prefix.TrimEnd('/')
+                : prefix;
+        }
+    }
+
+    private static IPAddress ParseListenIPAddress(string? value, string configKey)
+    {
+        if (!string.IsNullOrWhiteSpace(value) && IPAddress.TryParse(value, out var parsed))
+        {
+            return parsed;
+        }
+
+        throw new InvalidDataException(
+            $"Unsupported {configKey}: '{value}'. " +
+            "Expected a valid IPv4 or IPv6 literal.");
     }
 }

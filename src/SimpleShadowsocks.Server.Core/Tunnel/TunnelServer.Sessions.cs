@@ -39,6 +39,26 @@ public sealed partial class TunnelServer
             cancellationToken);
     }
 
+    private static Task SendHttpResponseStartAsync(
+        Stream stream,
+        uint sessionId,
+        HttpResponseStart response,
+        SemaphoreSlim writeLock,
+        ProtocolWriteOptions writeOptions,
+        CancellationToken cancellationToken)
+    {
+        return SendFrameLockedAsync(
+            stream,
+            new ProtocolFrame(
+                FrameType.HttpResponse,
+                sessionId,
+                0,
+                ProtocolPayloadSerializer.SerializeHttpResponseStart(response)),
+            writeLock,
+            writeOptions,
+            cancellationToken);
+    }
+
     private static async Task CloseSessionAsync(
         ConcurrentDictionary<uint, SessionContext> sessions,
         uint sessionId,
@@ -57,7 +77,7 @@ public sealed partial class TunnelServer
         context.Dispose();
         StructuredLog.Info(
             "tunnel-server",
-            context is UdpSessionContext ? "TUNNEL/UDP" : "TUNNEL/TCP",
+            context is UdpSessionContext ? "TUNNEL/UDP" : context is HttpSessionContext ? "TUNNEL/HTTP" : "TUNNEL/TCP",
             "session disposed",
             sessionId);
 
@@ -181,6 +201,43 @@ public sealed partial class TunnelServer
         public override void Dispose()
         {
             try { UpstreamClient.Dispose(); } catch { }
+            try { Cancellation.Dispose(); } catch { }
+        }
+    }
+
+    private sealed class HttpSessionContext : SessionContext
+    {
+        private int _requestCompleted;
+        private int _responseStarted;
+
+        public HttpSessionContext(
+            uint sessionId,
+            HttpRequestStart requestStart,
+            CancellationTokenSource cancellation)
+            : base(sessionId, cancellation)
+        {
+            RequestStart = requestStart;
+            RequestBody = new MemoryStream();
+        }
+
+        public HttpRequestStart RequestStart { get; }
+        public MemoryStream RequestBody { get; }
+
+        public bool TryMarkRequestCompleted()
+        {
+            return Interlocked.CompareExchange(ref _requestCompleted, 1, 0) == 0;
+        }
+
+        public bool HasCompletedRequest => Volatile.Read(ref _requestCompleted) == 1;
+
+        public bool TryStartResponse()
+        {
+            return Interlocked.CompareExchange(ref _responseStarted, 1, 0) == 0;
+        }
+
+        public override void Dispose()
+        {
+            try { RequestBody.Dispose(); } catch { }
             try { Cancellation.Dispose(); } catch { }
         }
     }

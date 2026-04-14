@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Channels;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
 
@@ -8,7 +10,35 @@ namespace SimpleShadowsocks.Server.Tunnel;
 
 public sealed partial class TunnelServer
 {
-    private static async Task HandleTunnelAsync(
+    public async Task<(uint SessionId, HttpResponseStart Response, ChannelReader<byte[]> Reader, Func<Task> CloseAsync)> ExecuteReverseHttpRequestAsync(
+        HttpRequestStart requestStart,
+        ReadOnlyMemory<byte> body,
+        CancellationToken cancellationToken)
+    {
+        var connections = _activeTunnelConnections.Values.ToArray();
+        if (connections.Length == 0)
+        {
+            throw new InvalidOperationException("No active client tunnels are available for HTTP reverse proxy.");
+        }
+
+        Exception? lastError = null;
+        foreach (var connection in connections)
+        {
+            try
+            {
+                var (sessionId, response, reader) = await connection.ExecuteReverseHttpRequestAsync(requestStart, body, cancellationToken);
+                return (sessionId, response, reader, () => connection.CloseReverseHttpSessionAsync(sessionId, 0x00, CancellationToken.None));
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+        }
+
+        throw new IOException("Unable to execute reverse HTTP request over any active tunnel.", lastError);
+    }
+
+    private async Task HandleTunnelAsync(
         TcpClient tunnelClient,
         byte[] sharedKey,
         TunnelCryptoPolicy cryptoPolicy,
@@ -28,6 +58,9 @@ public sealed partial class TunnelServer
         byte? connectionVersion = null;
         var connectionCompressionEnabled = false;
         var connectionCompressionAlgorithm = PayloadCompressionAlgorithm.Deflate;
+        var connectionId = Interlocked.Increment(ref _nextTunnelConnectionId);
+        var activeConnection = new ActiveTunnelConnection(connectionId, secureStream, writeLock);
+        _activeTunnelConnections[connectionId] = activeConnection;
 
         try
         {
@@ -59,9 +92,15 @@ public sealed partial class TunnelServer
                 var writeOptions = new ProtocolWriteOptions
                 {
                     Version = connectionVersion.Value,
-                    EnableCompression = connectionVersion.Value == ProtocolConstants.Version && connectionCompressionEnabled,
+                    EnableCompression = ProtocolConstants.SupportsCompression(connectionVersion.Value) && connectionCompressionEnabled,
                     CompressionAlgorithm = connectionCompressionAlgorithm
                 };
+                activeConnection.SetWriteOptions(writeOptions);
+
+                if (await TryHandleReverseHttpFrameAsync(activeConnection, frame, cancellationToken))
+                {
+                    continue;
+                }
 
                 await HandleFrameAsync(
                     secureStream,
@@ -76,10 +115,15 @@ public sealed partial class TunnelServer
         }
         finally
         {
+            _activeTunnelConnections.TryRemove(connectionId, out _);
+            activeConnection.FailAllReverseHttpSessions(_connectionClosedException);
+
             var closeWriteOptions = new ProtocolWriteOptions
             {
                 Version = connectionVersion ?? ProtocolConstants.LegacyVersion,
-                EnableCompression = connectionVersion == ProtocolConstants.Version && connectionCompressionEnabled,
+                EnableCompression = connectionVersion.HasValue
+                    && ProtocolConstants.SupportsCompression(connectionVersion.Value)
+                    && connectionCompressionEnabled,
                 CompressionAlgorithm = connectionCompressionAlgorithm
             };
 
@@ -94,6 +138,70 @@ public sealed partial class TunnelServer
                     closeWriteOptions,
                     CancellationToken.None);
             }
+        }
+    }
+
+    private static readonly IOException _connectionClosedException = new("Tunnel connection closed.");
+
+    private async Task<bool> TryHandleReverseHttpFrameAsync(
+        ActiveTunnelConnection connection,
+        ProtocolFrame frame,
+        CancellationToken cancellationToken)
+    {
+        if (!connection.TryGetReverseHttpSession(frame.SessionId, out var session))
+        {
+            return false;
+        }
+
+        switch (frame.Type)
+        {
+            case FrameType.ReverseHttpResponse:
+                if (!session.TryAcceptIncomingFrame(frame.Type, frame.Sequence))
+                {
+                    connection.FailReverseHttpSession(frame.SessionId, new IOException("Invalid reverse HTTP response sequence."));
+                    return true;
+                }
+
+                try
+                {
+                    session.CompleteResponse(ProtocolPayloadSerializer.DeserializeHttpResponseStart(frame.Payload.Span));
+                }
+                catch (Exception ex)
+                {
+                    connection.FailReverseHttpSession(frame.SessionId, ex);
+                }
+
+                return true;
+
+            case FrameType.Data:
+                if (!session.TryAcceptIncomingFrame(frame.Type, frame.Sequence))
+                {
+                    connection.FailReverseHttpSession(frame.SessionId, new IOException("Invalid reverse HTTP data sequence."));
+                    return true;
+                }
+
+                if (!frame.Payload.IsEmpty)
+                {
+                    await session.ReaderWriter.Writer.WriteAsync(frame.Payload.ToArray(), cancellationToken);
+                }
+
+                return true;
+
+            case FrameType.Close:
+                if (!session.TryAcceptIncomingFrame(frame.Type, frame.Sequence))
+                {
+                    connection.FailReverseHttpSession(frame.SessionId, new IOException("Invalid reverse HTTP close sequence."));
+                    return true;
+                }
+
+                session.MarkClosed();
+                session.ReaderWriter.Writer.TryComplete();
+                connection.RemoveReverseHttpSession(frame.SessionId);
+                StructuredLog.Info("tunnel-server", "TUNNEL/HTTP", "reverse session closed by client", frame.SessionId);
+                return true;
+
+            default:
+                return false;
         }
     }
 
@@ -126,6 +234,21 @@ public sealed partial class TunnelServer
                 frame,
                 writeOptions,
                 serverPolicy,
+                cancellationToken),
+            FrameType.HttpRequest => HandleHttpRequestFrameAsync(
+                secureStream,
+                writeLock,
+                sessions,
+                pendingConnectSessions,
+                frame,
+                writeOptions,
+                cancellationToken),
+            FrameType.HttpRequestEnd => HandleHttpRequestEndFrameAsync(
+                secureStream,
+                writeLock,
+                sessions,
+                frame,
+                writeOptions,
                 cancellationToken),
             FrameType.Data => HandleDataFrameAsync(
                 secureStream,
@@ -224,6 +347,29 @@ public sealed partial class TunnelServer
 
         if (session is not TcpSessionContext tcpSession)
         {
+            if (session is HttpSessionContext httpSession)
+            {
+                if (!session.TryAcceptIncomingSequence(frame.Sequence) || httpSession.HasCompletedRequest)
+                {
+                    await CloseSessionAsync(
+                        sessions,
+                        frame.SessionId,
+                        sendCloseToClient: true,
+                        secureStream,
+                        writeLock,
+                        writeOptions,
+                        CancellationToken.None);
+                    return;
+                }
+
+                if (!frame.Payload.IsEmpty)
+                {
+                    await httpSession.RequestBody.WriteAsync(frame.Payload, cancellationToken);
+                }
+
+                return;
+            }
+
             await CloseSessionAsync(
                 sessions,
                 frame.SessionId,
@@ -427,5 +573,250 @@ public sealed partial class TunnelServer
         }
 
         return new IPEndPoint(selected, datagram.Port);
+    }
+
+    private sealed class ActiveTunnelConnection
+    {
+        private readonly Stream _secureStream;
+        private readonly SemaphoreSlim _writeLock;
+        private readonly ConcurrentDictionary<uint, ReverseHttpSessionState> _reverseHttpSessions = new();
+        private readonly TaskCompletionSource<ProtocolWriteOptions> _writeOptionsReady =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _nextReverseSessionId = int.MinValue;
+        private ProtocolWriteOptions? _writeOptions;
+
+        public ActiveTunnelConnection(long connectionId, Stream secureStream, SemaphoreSlim writeLock)
+        {
+            ConnectionId = connectionId;
+            _secureStream = secureStream;
+            _writeLock = writeLock;
+        }
+
+        public long ConnectionId { get; }
+
+        public void SetWriteOptions(ProtocolWriteOptions writeOptions)
+        {
+            _writeOptions = writeOptions;
+            _writeOptionsReady.TrySetResult(writeOptions);
+        }
+
+        public async Task<(uint SessionId, HttpResponseStart Response, ChannelReader<byte[]> Reader)> ExecuteReverseHttpRequestAsync(
+            HttpRequestStart requestStart,
+            ReadOnlyMemory<byte> body,
+            CancellationToken cancellationToken)
+        {
+            var writeOptions = await _writeOptionsReady.Task.WaitAsync(cancellationToken);
+            if (!ProtocolConstants.SupportsHttpRelay(writeOptions.Version))
+            {
+                throw new InvalidOperationException($"HTTP reverse proxy requires protocol v{ProtocolConstants.Version}.");
+            }
+
+            var sessionId = unchecked((uint)Interlocked.Increment(ref _nextReverseSessionId));
+            var state = new ReverseHttpSessionState();
+            if (!_reverseHttpSessions.TryAdd(sessionId, state))
+            {
+                throw new InvalidOperationException("Failed to register reverse HTTP session.");
+            }
+
+            try
+            {
+                await SendFrameLockedAsync(
+                    _secureStream,
+                    new ProtocolFrame(
+                        FrameType.ReverseHttpRequest,
+                        sessionId,
+                        0,
+                        ProtocolPayloadSerializer.SerializeHttpRequestStart(requestStart)),
+                    _writeLock,
+                    writeOptions,
+                    cancellationToken);
+
+                const int chunkSize = 16 * 1024;
+                var offset = 0;
+                while (offset < body.Length)
+                {
+                    var length = Math.Min(chunkSize, body.Length - offset);
+                    await SendFrameLockedAsync(
+                        _secureStream,
+                        new ProtocolFrame(
+                            FrameType.Data,
+                            sessionId,
+                            state.TakeNextSendSequence(),
+                            body.Slice(offset, length).ToArray()),
+                        _writeLock,
+                        writeOptions,
+                        cancellationToken);
+                    offset += length;
+                }
+
+                await SendFrameLockedAsync(
+                    _secureStream,
+                    new ProtocolFrame(
+                        FrameType.ReverseHttpRequestEnd,
+                        sessionId,
+                        state.TakeNextSendSequence(),
+                        Array.Empty<byte>()),
+                    _writeLock,
+                    writeOptions,
+                    cancellationToken);
+
+                var response = await state.WaitForResponseAsync(cancellationToken);
+                return (sessionId, response, state.ReaderWriter.Reader);
+            }
+            catch
+            {
+                FailReverseHttpSession(sessionId, new IOException("Reverse HTTP session aborted."));
+                throw;
+            }
+        }
+
+        public async Task CloseReverseHttpSessionAsync(uint sessionId, byte reasonCode, CancellationToken cancellationToken)
+        {
+            if (!_reverseHttpSessions.TryRemove(sessionId, out var state))
+            {
+                return;
+            }
+
+            state.MarkClosed();
+            state.ReaderWriter.Writer.TryComplete();
+            state.Fail(new IOException("Reverse HTTP session closed."));
+
+            if (_writeOptions is null)
+            {
+                return;
+            }
+
+            try
+            {
+                await SendFrameLockedAsync(
+                    _secureStream,
+                    new ProtocolFrame(
+                        FrameType.Close,
+                        sessionId,
+                        state.TakeNextSendSequence(),
+                        ProtocolPayloadSerializer.SerializeClose(reasonCode)),
+                    _writeLock,
+                    _writeOptions,
+                    cancellationToken);
+            }
+            catch
+            {
+            }
+        }
+
+        public bool TryGetReverseHttpSession(uint sessionId, out ReverseHttpSessionState state)
+        {
+            return _reverseHttpSessions.TryGetValue(sessionId, out state!);
+        }
+
+        public void RemoveReverseHttpSession(uint sessionId)
+        {
+            _reverseHttpSessions.TryRemove(sessionId, out _);
+        }
+
+        public void FailReverseHttpSession(uint sessionId, Exception error)
+        {
+            if (!_reverseHttpSessions.TryRemove(sessionId, out var state))
+            {
+                return;
+            }
+
+            state.MarkClosed();
+            state.Fail(error);
+            state.ReaderWriter.Writer.TryComplete(error);
+        }
+
+        public void FailAllReverseHttpSessions(Exception error)
+        {
+            foreach (var sessionId in _reverseHttpSessions.Keys.ToArray())
+            {
+                FailReverseHttpSession(sessionId, error);
+            }
+        }
+    }
+
+    private sealed class ReverseHttpSessionState
+    {
+        private readonly object _sequenceLock = new();
+        private readonly TaskCompletionSource<HttpResponseStart> _pendingResponse =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private ulong _nextSendSequence = 1;
+        private ulong _nextExpectedIncomingSequence;
+        private bool _awaitingResponse = true;
+        private bool _closed;
+
+        public ReverseHttpSessionState()
+        {
+            ReaderWriter = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(256)
+            {
+                SingleReader = true,
+                SingleWriter = true,
+                FullMode = BoundedChannelFullMode.Wait
+            });
+        }
+
+        public Channel<byte[]> ReaderWriter { get; }
+
+        public ulong TakeNextSendSequence()
+        {
+            lock (_sequenceLock)
+            {
+                return _nextSendSequence++;
+            }
+        }
+
+        public bool TryAcceptIncomingFrame(FrameType frameType, ulong sequence)
+        {
+            lock (_sequenceLock)
+            {
+                if (_closed)
+                {
+                    return false;
+                }
+
+                if (_awaitingResponse)
+                {
+                    if (frameType != FrameType.ReverseHttpResponse || sequence != 0)
+                    {
+                        return false;
+                    }
+
+                    _awaitingResponse = false;
+                    _nextExpectedIncomingSequence = 1;
+                    return true;
+                }
+
+                if (sequence != _nextExpectedIncomingSequence)
+                {
+                    return false;
+                }
+
+                _nextExpectedIncomingSequence++;
+                return true;
+            }
+        }
+
+        public Task<HttpResponseStart> WaitForResponseAsync(CancellationToken cancellationToken)
+        {
+            return _pendingResponse.Task.WaitAsync(cancellationToken);
+        }
+
+        public void CompleteResponse(HttpResponseStart response)
+        {
+            _pendingResponse.TrySetResult(response);
+        }
+
+        public void Fail(Exception error)
+        {
+            _pendingResponse.TrySetException(error);
+        }
+
+        public void MarkClosed()
+        {
+            lock (_sequenceLock)
+            {
+                _closed = true;
+            }
+        }
     }
 }

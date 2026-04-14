@@ -22,11 +22,20 @@ public sealed partial class TunnelClientMultiplexer
     private async Task<byte> ConnectSessionAsync(uint sessionId, SessionState state, CancellationToken cancellationToken)
     {
         state.BeginConnectAttempt();
-        var frameType = state.IsUdp ? FrameType.UdpAssociate : FrameType.Connect;
-        var payload = state.IsUdp
-            ? Array.Empty<byte>()
-            : ProtocolPayloadSerializer.SerializeConnectRequest(
-                state.ConnectRequest ?? throw new InvalidOperationException("TCP session does not have CONNECT payload."));
+        var frameType = state.Kind switch
+        {
+            SessionKind.Udp => FrameType.UdpAssociate,
+            SessionKind.Http => FrameType.HttpRequest,
+            _ => FrameType.Connect
+        };
+        var payload = state.Kind switch
+        {
+            SessionKind.Udp => Array.Empty<byte>(),
+            SessionKind.Http => ProtocolPayloadSerializer.SerializeHttpRequestStart(
+                state.HttpRequestStart ?? throw new InvalidOperationException("HTTP session does not have request metadata.")),
+            _ => ProtocolPayloadSerializer.SerializeConnectRequest(
+                state.ConnectRequest ?? throw new InvalidOperationException("TCP session does not have CONNECT payload."))
+        };
         try
         {
             await SendFrameAsync(new ProtocolFrame(frameType, sessionId, 0, payload), cancellationToken);
@@ -51,6 +60,15 @@ public sealed partial class TunnelClientMultiplexer
         {
             if (state.IsClosed || !_sessions.ContainsKey(sessionId))
             {
+                continue;
+            }
+
+            if (!state.IsResumable)
+            {
+                state.MarkClosed();
+                state.FailConnect(new IOException("HTTP session cannot be resumed after reconnect."));
+                state.ReaderWriter?.Writer.TryComplete(new IOException("HTTP session cannot be resumed after reconnect."));
+                _sessions.TryRemove(sessionId, out _);
                 continue;
             }
 
@@ -124,5 +142,23 @@ public sealed partial class TunnelClientMultiplexer
                 continue;
             }
         }
+    }
+
+    private async Task SendPendingSessionFrameAsync(
+        uint sessionId,
+        SessionState state,
+        FrameType frameType,
+        ReadOnlyMemory<byte> payload,
+        CancellationToken cancellationToken)
+    {
+        await EnsureConnectedAsync(cancellationToken);
+
+        if (!_sessions.ContainsKey(sessionId) || state.IsClosed)
+        {
+            throw new InvalidOperationException($"Session {sessionId} is not active.");
+        }
+
+        var sequence = state.TakeNextSendSequence();
+        await SendFrameAsync(new ProtocolFrame(frameType, sessionId, sequence, payload), cancellationToken);
     }
 }

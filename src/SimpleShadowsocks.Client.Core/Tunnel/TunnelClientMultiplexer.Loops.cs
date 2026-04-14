@@ -45,6 +45,11 @@ public sealed partial class TunnelClientMultiplexer
 
                 if (!_sessions.TryGetValue(frame.SessionId, out var state))
                 {
+                    if (await TryHandleIncomingReverseHttpFrameAsync(frame, cancellationToken))
+                    {
+                        continue;
+                    }
+
                     continue;
                 }
 
@@ -59,6 +64,23 @@ public sealed partial class TunnelClientMultiplexer
                     case FrameType.Connect:
                     case FrameType.UdpAssociate:
                         state.CompleteConnectReply(frame.Payload.Length >= 1 ? frame.Payload.Span[0] : (byte)0x01);
+                        break;
+
+                    case FrameType.HttpResponse:
+                        try
+                        {
+                            state.CompleteHttpResponse(ProtocolPayloadSerializer.DeserializeHttpResponseStart(frame.Payload.Span));
+                        }
+                        catch (Exception ex)
+                        {
+                            StructuredLog.Error(
+                                "tunnel-client",
+                                "TUNNEL/HTTP",
+                                "invalid HTTP response metadata",
+                                ex,
+                                frame.SessionId);
+                            await CloseSessionAsync(frame.SessionId, 0x08, CancellationToken.None);
+                        }
                         break;
 
                     case FrameType.Data:
@@ -107,7 +129,7 @@ public sealed partial class TunnelClientMultiplexer
                         _sessions.TryRemove(frame.SessionId, out _);
                         StructuredLog.Info(
                             "tunnel-client",
-                            state.IsUdp ? "TUNNEL/UDP" : "TUNNEL/TCP",
+                            state.IsUdp ? "TUNNEL/UDP" : state.IsHttp ? "TUNNEL/HTTP" : "TUNNEL/TCP",
                             "session closed by remote",
                             frame.SessionId);
                         break;

@@ -7,6 +7,8 @@ namespace SimpleShadowsocks.Protocol;
 
 public static class ProtocolPayloadSerializer
 {
+    private const int MaxStringBytes = ushort.MaxValue;
+
     public static byte[] SerializeConnectRequest(ConnectRequest request)
     {
         return request.AddressType switch
@@ -106,6 +108,56 @@ public static class ProtocolPayloadSerializer
             payload.Slice(endpointLength).ToArray());
     }
 
+    public static byte[] SerializeHttpRequestStart(HttpRequestStart request)
+    {
+        using var stream = new MemoryStream();
+        WriteString(stream, request.Method);
+        WriteString(stream, request.Scheme);
+        WriteString(stream, request.Authority);
+        WriteString(stream, request.PathAndQuery);
+        stream.WriteByte(request.VersionMajor);
+        stream.WriteByte(request.VersionMinor);
+        WriteHeaders(stream, request.Headers);
+        return stream.ToArray();
+    }
+
+    public static HttpRequestStart DeserializeHttpRequestStart(ReadOnlySpan<byte> payload)
+    {
+        var reader = new SpanReader(payload);
+        var method = reader.ReadString();
+        var scheme = reader.ReadString();
+        var authority = reader.ReadString();
+        var pathAndQuery = reader.ReadString();
+        var versionMajor = reader.ReadByte();
+        var versionMinor = reader.ReadByte();
+        var headers = reader.ReadHeaders();
+        reader.EnsureFullyConsumed("HTTP request");
+        return new HttpRequestStart(method, scheme, authority, pathAndQuery, versionMajor, versionMinor, headers);
+    }
+
+    public static byte[] SerializeHttpResponseStart(HttpResponseStart response)
+    {
+        using var stream = new MemoryStream();
+        WriteUInt16(stream, response.StatusCode);
+        WriteString(stream, response.ReasonPhrase);
+        stream.WriteByte(response.VersionMajor);
+        stream.WriteByte(response.VersionMinor);
+        WriteHeaders(stream, response.Headers);
+        return stream.ToArray();
+    }
+
+    public static HttpResponseStart DeserializeHttpResponseStart(ReadOnlySpan<byte> payload)
+    {
+        var reader = new SpanReader(payload);
+        var statusCode = reader.ReadUInt16();
+        var reasonPhrase = reader.ReadString();
+        var versionMajor = reader.ReadByte();
+        var versionMinor = reader.ReadByte();
+        var headers = reader.ReadHeaders();
+        reader.EnsureFullyConsumed("HTTP response");
+        return new HttpResponseStart(statusCode, reasonPhrase, versionMajor, versionMinor, headers);
+    }
+
     private static byte[] SerializeIpConnectRequest(ConnectRequest request, AddressFamily expectedFamily, int ipLength)
     {
         if (!IPAddress.TryParse(request.Address, out var ipAddress))
@@ -186,5 +238,120 @@ public static class ProtocolPayloadSerializer
 
         var domain = Encoding.ASCII.GetString(body.Slice(1, length));
         return (domain, 1 + length);
+    }
+
+    private static void WriteHeaders(Stream stream, IReadOnlyList<HttpHeader> headers)
+    {
+        if (headers.Count > ushort.MaxValue)
+        {
+            throw new InvalidDataException("Too many HTTP headers.");
+        }
+
+        WriteUInt16(stream, (ushort)headers.Count);
+        foreach (var header in headers)
+        {
+            WriteString(stream, header.Name);
+            WriteString(stream, header.Value);
+        }
+    }
+
+    private static void WriteString(Stream stream, string value)
+    {
+        value ??= string.Empty;
+        var byteCount = Encoding.UTF8.GetByteCount(value);
+        if (byteCount > MaxStringBytes)
+        {
+            throw new InvalidDataException("String payload is too long.");
+        }
+
+        WriteUInt16(stream, (ushort)byteCount);
+        if (byteCount == 0)
+        {
+            return;
+        }
+
+        var buffer = new byte[byteCount];
+        var written = Encoding.UTF8.GetBytes(value, buffer);
+        if (written != byteCount)
+        {
+            throw new InvalidDataException("Failed to serialize string payload.");
+        }
+
+        stream.Write(buffer, 0, buffer.Length);
+    }
+
+    private static void WriteUInt16(Stream stream, ushort value)
+    {
+        Span<byte> buffer = stackalloc byte[2];
+        BinaryPrimitives.WriteUInt16BigEndian(buffer, value);
+        stream.Write(buffer);
+    }
+
+    private ref struct SpanReader
+    {
+        private ReadOnlySpan<byte> _payload;
+        private int _offset;
+
+        public SpanReader(ReadOnlySpan<byte> payload)
+        {
+            _payload = payload;
+            _offset = 0;
+        }
+
+        public byte ReadByte()
+        {
+            EnsureAvailable(1);
+            return _payload[_offset++];
+        }
+
+        public ushort ReadUInt16()
+        {
+            EnsureAvailable(2);
+            var value = BinaryPrimitives.ReadUInt16BigEndian(_payload.Slice(_offset, 2));
+            _offset += 2;
+            return value;
+        }
+
+        public string ReadString()
+        {
+            var length = ReadUInt16();
+            if (length == 0)
+            {
+                return string.Empty;
+            }
+
+            EnsureAvailable(length);
+            var value = Encoding.UTF8.GetString(_payload.Slice(_offset, length));
+            _offset += length;
+            return value;
+        }
+
+        public HttpHeader[] ReadHeaders()
+        {
+            var count = ReadUInt16();
+            var headers = new HttpHeader[count];
+            for (var i = 0; i < count; i++)
+            {
+                headers[i] = new HttpHeader(ReadString(), ReadString());
+            }
+
+            return headers;
+        }
+
+        public void EnsureFullyConsumed(string payloadName)
+        {
+            if (_offset != _payload.Length)
+            {
+                throw new InvalidDataException($"{payloadName} payload has trailing bytes.");
+            }
+        }
+
+        private void EnsureAvailable(int count)
+        {
+            if (_payload.Length - _offset < count)
+            {
+                throw new InvalidDataException("Payload is truncated.");
+            }
+        }
     }
 }
