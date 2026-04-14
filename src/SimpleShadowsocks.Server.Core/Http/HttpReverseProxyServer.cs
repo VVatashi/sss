@@ -32,6 +32,8 @@ public sealed class HttpReverseProxyServer
     private readonly TcpListener _listener;
     private readonly TunnelServer _tunnelServer;
 
+    internal int ActiveReverseHttpSessionCount => _tunnelServer.ActiveReverseHttpSessionCount;
+
     public HttpReverseProxyServer(IPAddress listenAddress, int port, TunnelServer tunnelServer)
     {
         _listener = new TcpListener(listenAddress, port);
@@ -70,6 +72,12 @@ public sealed class HttpReverseProxyServer
                 await HandleClientAsync(client, cancellationToken);
             }
             catch (OperationCanceledException)
+            {
+            }
+            catch (IOException) when (!cancellationToken.IsCancellationRequested)
+            {
+            }
+            catch (ObjectDisposedException) when (!cancellationToken.IsCancellationRequested)
             {
             }
             catch (Exception ex)
@@ -111,6 +119,13 @@ public sealed class HttpReverseProxyServer
             if (request.IsConnect || string.Equals(request.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
             {
                 await WriteSimpleResponseAsync(stream, 501, "Not Implemented", closeConnection: true, cancellationToken);
+                return;
+            }
+
+            if (request.IsWebSocketUpgrade)
+            {
+                await WriteSimpleResponseAsync(stream, 501, "WebSocket Not Supported", closeConnection: true, cancellationToken);
+                StructuredLog.Warn("http-reverse-proxy", "HTTP", "websocket upgrade is not supported");
                 return;
             }
 
@@ -378,7 +393,8 @@ public sealed class HttpReverseProxyServer
             IReadOnlyList<HttpHeader> sanitizedHeaders,
             byte[] body,
             bool shouldKeepAlive,
-            bool isConnect)
+            bool isConnect,
+            bool isWebSocketUpgrade)
         {
             Method = method;
             Scheme = scheme;
@@ -390,6 +406,7 @@ public sealed class HttpReverseProxyServer
             Body = body;
             ShouldKeepAlive = shouldKeepAlive;
             IsConnect = isConnect;
+            IsWebSocketUpgrade = isWebSocketUpgrade;
         }
 
         public string Method { get; }
@@ -402,6 +419,7 @@ public sealed class HttpReverseProxyServer
         public byte[] Body { get; }
         public bool ShouldKeepAlive { get; }
         public bool IsConnect { get; }
+        public bool IsWebSocketUpgrade { get; }
 
         public HttpRequestStart ToTunnelRequestStart()
         {
@@ -473,6 +491,7 @@ public sealed class HttpReverseProxyServer
             }
 
             var sanitizedHeaders = SanitizeHeaders(headers, authority);
+            var isWebSocketUpgrade = IsWebSocketUpgradeRequest(headers);
             var expectContinue = headers.Any(static h => h.Name.Equals("Expect", StringComparison.OrdinalIgnoreCase)
                 && h.Value.Contains("100-continue", StringComparison.OrdinalIgnoreCase));
             if (expectContinue)
@@ -491,7 +510,21 @@ public sealed class HttpReverseProxyServer
                 sanitizedHeaders,
                 body,
                 DetermineKeepAlive(version, headers),
-                isConnect);
+                isConnect,
+                isWebSocketUpgrade);
+        }
+
+        private static bool IsWebSocketUpgradeRequest(IReadOnlyList<HttpHeader> headers)
+        {
+            var hasUpgradeConnectionToken = headers
+                .Where(static h => h.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                .SelectMany(static h => h.Value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+                .Any(static token => token.Equals("Upgrade", StringComparison.OrdinalIgnoreCase));
+            var hasWebSocketUpgradeHeader = headers
+                .Where(static h => h.Name.Equals("Upgrade", StringComparison.OrdinalIgnoreCase))
+                .Any(static h => h.Value.Equals("websocket", StringComparison.OrdinalIgnoreCase));
+
+            return hasUpgradeConnectionToken && hasWebSocketUpgradeHeader;
         }
 
         private static async Task<byte[]> ReadBodyAsync(

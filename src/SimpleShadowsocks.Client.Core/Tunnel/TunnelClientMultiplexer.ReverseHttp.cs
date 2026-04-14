@@ -176,7 +176,7 @@ public sealed partial class TunnelClientMultiplexer
             if (response.Content is not null)
             {
                 await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-                var buffer = new byte[16 * 1024];
+                var buffer = new byte[RelayChunkSize];
                 while (!cancellationToken.IsCancellationRequested)
                 {
                     var read = await stream.ReadAsync(buffer, cancellationToken);
@@ -185,12 +185,11 @@ public sealed partial class TunnelClientMultiplexer
                         break;
                     }
 
-                    await SendFrameAsync(
-                        new ProtocolFrame(
-                            FrameType.Data,
-                            session.SessionId,
-                            session.TakeNextSendSequence(),
-                            buffer.AsMemory(0, read).ToArray()),
+                    await SendOwnedFrameAsync(
+                        FrameType.Data,
+                        session.SessionId,
+                        session.TakeNextSendSequence(),
+                        buffer.AsMemory(0, read),
                         cancellationToken);
                 }
             }

@@ -274,6 +274,127 @@ public static class ProtocolFrameCodec
         }
     }
 
+    internal static async ValueTask<ProtocolReadLease?> ReadDetailedLeasedAsync(
+        Stream stream,
+        CancellationToken cancellationToken = default)
+    {
+        if (stream is null)
+        {
+            throw new ArgumentNullException(nameof(stream));
+        }
+
+        var header = ArrayPool<byte>.Shared.Rent(ProtocolConstants.HeaderSize);
+        try
+        {
+            var versionRead = await ReadExactlyOrToEndAsync(stream, header, 1, cancellationToken);
+            if (versionRead == 0)
+            {
+                return null;
+            }
+
+            var version = header[0];
+            int expectedHeaderLength;
+            if (version == ProtocolConstants.LegacyVersion)
+            {
+                expectedHeaderLength = ProtocolConstants.HeaderSizeV1;
+            }
+            else if (ProtocolConstants.UsesExtendedHeader(version))
+            {
+                expectedHeaderLength = ProtocolConstants.HeaderSizeV2;
+            }
+            else
+            {
+                throw new InvalidDataException($"Unsupported frame version: {version}.");
+            }
+
+            var headerRead = await ReadExactlyOrToEndAsync(
+                stream,
+                header,
+                offset: 1,
+                length: expectedHeaderLength - 1,
+                cancellationToken);
+            if (headerRead != expectedHeaderLength - 1)
+            {
+                throw new EndOfStreamException("Unexpected end of stream while reading frame header.");
+            }
+
+            var headerSpan = header.AsSpan(0, expectedHeaderLength);
+            var frameType = (FrameType)headerSpan[1];
+            if (!Enum.IsDefined(frameType))
+            {
+                throw new InvalidDataException($"Unsupported frame type: {(byte)frameType}.");
+            }
+
+            byte flags;
+            uint sessionId;
+            ulong sequence;
+            uint payloadLength;
+            if (version == ProtocolConstants.LegacyVersion)
+            {
+                flags = ProtocolFlags.None;
+                sessionId = BinaryPrimitives.ReadUInt32BigEndian(headerSpan.Slice(2, 4));
+                sequence = BinaryPrimitives.ReadUInt64BigEndian(headerSpan.Slice(6, 8));
+                payloadLength = BinaryPrimitives.ReadUInt32BigEndian(headerSpan.Slice(14, 4));
+            }
+            else
+            {
+                flags = headerSpan[2];
+                sessionId = BinaryPrimitives.ReadUInt32BigEndian(headerSpan.Slice(3, 4));
+                sequence = BinaryPrimitives.ReadUInt64BigEndian(headerSpan.Slice(7, 8));
+                payloadLength = BinaryPrimitives.ReadUInt32BigEndian(headerSpan.Slice(15, 4));
+            }
+
+            if (payloadLength > ProtocolConstants.MaxPayloadLength)
+            {
+                throw new InvalidDataException($"Frame payload too large: {payloadLength}.");
+            }
+
+            byte[]? pooledPayload = null;
+            ReadOnlyMemory<byte> payload;
+            if (payloadLength == 0)
+            {
+                payload = ReadOnlyMemory<byte>.Empty;
+            }
+            else if ((flags & ProtocolFlags.PayloadCompressed) != 0)
+            {
+                var compressed = ArrayPool<byte>.Shared.Rent((int)payloadLength);
+                try
+                {
+                    await ReadExactlyAsync(stream, compressed, (int)payloadLength, cancellationToken);
+                    payload = DecompressPayload(compressed, (int)payloadLength, flags);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(compressed);
+                }
+            }
+            else
+            {
+                pooledPayload = ArrayPool<byte>.Shared.Rent((int)payloadLength);
+                try
+                {
+                    await ReadExactlyAsync(stream, pooledPayload, (int)payloadLength, cancellationToken);
+                    payload = pooledPayload.AsMemory(0, (int)payloadLength);
+                }
+                catch
+                {
+                    ArrayPool<byte>.Shared.Return(pooledPayload);
+                    throw;
+                }
+            }
+
+            return new ProtocolReadLease(
+                new ProtocolFrame(frameType, sessionId, sequence, payload),
+                version,
+                flags,
+                pooledPayload);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(header);
+        }
+    }
+
     private static async ValueTask<int> ReadExactlyOrToEndAsync(
         Stream stream,
         byte[] buffer,

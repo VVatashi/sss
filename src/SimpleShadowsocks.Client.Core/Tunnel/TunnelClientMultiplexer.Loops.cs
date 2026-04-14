@@ -8,6 +8,7 @@ public sealed partial class TunnelClientMultiplexer
     private async Task ReadLoopAsync(int generation, CancellationToken cancellationToken)
     {
         var preserveSessionsOnFault = true;
+        var supportsSelectiveRecovery = ProtocolConstants.SupportsSelectiveRecovery(_protocolVersion);
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -53,11 +54,60 @@ public sealed partial class TunnelClientMultiplexer
                     continue;
                 }
 
-                if (!state.TryAcceptIncomingFrame(frame.Type, frame.Sequence))
+                if (supportsSelectiveRecovery)
                 {
-                    await CloseSessionAsync(frame.SessionId, 0x21, CancellationToken.None);
+                    switch (frame.Type)
+                    {
+                        case FrameType.Ack:
+                            state.AcknowledgeOutgoingThrough(frame.Sequence);
+                            continue;
+
+                        case FrameType.Recover:
+                            await ReplayPendingSessionFramesFromAsync(frame.SessionId, state, frame.Sequence, cancellationToken);
+                            continue;
+                    }
+                }
+
+                var incomingFrameResult = state.EvaluateIncomingFrame(frame.Type, frame.Sequence);
+                if (incomingFrameResult != IncomingFrameResult.Accepted)
+                {
+                    if (!supportsSelectiveRecovery || incomingFrameResult == IncomingFrameResult.Invalid)
+                    {
+                        await CloseSessionAsync(frame.SessionId, 0x21, CancellationToken.None);
+                        continue;
+                    }
+
+                    if (incomingFrameResult == IncomingFrameResult.Duplicate)
+                    {
+                        var acknowledgedSequence = state.LastAcceptedIncomingSequence;
+                        if (acknowledgedSequence > 0)
+                        {
+                            try
+                            {
+                                await SendAckFrameAsync(frame.SessionId, acknowledgedSequence, cancellationToken);
+                            }
+                            catch when (!_disposing)
+                            {
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    try
+                    {
+                        await SendRecoverFrameAsync(frame.SessionId, state.LastAcceptedIncomingSequence + 1, cancellationToken);
+                    }
+                    catch when (!_disposing)
+                    {
+                    }
+
                     continue;
                 }
+
+                var shouldAcknowledgeFrame = supportsSelectiveRecovery
+                    && frame.Sequence > 0
+                    && frame.Type is not FrameType.Close;
 
                 switch (frame.Type)
                 {
@@ -95,7 +145,7 @@ public sealed partial class TunnelClientMultiplexer
                         {
                             try
                             {
-                                var datagram = ProtocolPayloadSerializer.DeserializeUdpDatagram(frame.Payload.Span);
+                                var datagram = ProtocolPayloadSerializer.DeserializeUdpDatagram(frame.Payload);
                                 await state.UdpReaderWriter.Writer.WriteAsync(datagram, cancellationToken);
                             }
                             catch (OperationCanceledException)
@@ -137,6 +187,11 @@ public sealed partial class TunnelClientMultiplexer
                     case FrameType.Ping:
                         await SendSessionFrameAsync(frame.SessionId, FrameType.Pong, frame.Payload, cancellationToken);
                         break;
+                }
+
+                if (shouldAcknowledgeFrame)
+                {
+                    await SendAckFrameAsync(frame.SessionId, frame.Sequence, cancellationToken);
                 }
             }
         }
@@ -206,6 +261,7 @@ public sealed partial class TunnelClientMultiplexer
                     catch (Exception ex)
                     {
                         outbound.Completion.TrySetException(ex);
+                        outbound.Dispose();
                         throw;
                     }
                 }
@@ -224,6 +280,7 @@ public sealed partial class TunnelClientMultiplexer
                 foreach (var sent in batch)
                 {
                     sent.Completion.TrySetResult(true);
+                    sent.Dispose();
                 }
             }
         }
@@ -242,6 +299,7 @@ public sealed partial class TunnelClientMultiplexer
             while (outboundFrames.Reader.TryRead(out var outbound))
             {
                 outbound.Completion.TrySetException(terminalError ?? new IOException("Tunnel writer stopped."));
+                outbound.Dispose();
             }
 
             await HandleConnectionFaultAsync(preserveSessions: true, expectedGeneration: generation);

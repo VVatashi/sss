@@ -8,20 +8,31 @@ public sealed partial class TunnelClientMultiplexer
 {
     private static byte[] DetachPayload(ReadOnlyMemory<byte> payload)
     {
+        return TryGetWholeArray(payload, out var array) ? array : payload.ToArray();
+    }
+
+    private static bool TryGetWholeArray(ReadOnlyMemory<byte> payload, out byte[] array)
+    {
         if (MemoryMarshal.TryGetArray(payload, out var segment)
             && segment.Array is not null
             && segment.Offset == 0
             && segment.Count == segment.Array.Length)
         {
-            return segment.Array;
+            array = segment.Array;
+            return true;
         }
 
-        return payload.ToArray();
+        array = Array.Empty<byte>();
+        return false;
     }
 
-    private async Task<byte> ConnectSessionAsync(uint sessionId, SessionState state, CancellationToken cancellationToken)
+    private async Task<byte> ConnectSessionAsync(
+        uint sessionId,
+        SessionState state,
+        CancellationToken cancellationToken,
+        bool preservePendingFrames = false)
     {
-        state.BeginConnectAttempt();
+        state.BeginConnectAttempt(sessionId, preservePendingFrames);
         var frameType = state.Kind switch
         {
             SessionKind.Udp => FrameType.UdpAssociate,
@@ -75,7 +86,7 @@ public sealed partial class TunnelClientMultiplexer
             byte replyCode;
             try
             {
-                replyCode = await ConnectSessionAsync(sessionId, state, cancellationToken);
+                replyCode = await ConnectSessionAsync(sessionId, state, cancellationToken, preservePendingFrames: true);
             }
             catch (Exception ex)
             {
@@ -94,7 +105,10 @@ public sealed partial class TunnelClientMultiplexer
                 state.UdpReaderWriter?.Writer.TryComplete(
                     new IOException($"Session resume failed with remote reply code {replyCode}."));
                 _sessions.TryRemove(sessionId, out _);
+                continue;
             }
+
+            await ReplayPendingSessionFramesAsync(sessionId, state, cancellationToken);
         }
     }
 
@@ -115,6 +129,7 @@ public sealed partial class TunnelClientMultiplexer
         ReadOnlyMemory<byte> payload,
         CancellationToken cancellationToken)
     {
+        var pendingFrame = state.CreateTrackedOutboundFrame(sessionId, frameType, payload);
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -127,10 +142,9 @@ public sealed partial class TunnelClientMultiplexer
                 throw new InvalidOperationException($"Session {sessionId} is not active.");
             }
 
-            var sequence = state.TakeNextSendSequence();
             try
             {
-                await SendFrameAsync(new ProtocolFrame(frameType, sessionId, sequence, payload), cancellationToken);
+                await SendFrameAsync(pendingFrame.ToProtocolFrame(sessionId), cancellationToken);
                 return;
             }
             catch (OperationCanceledException)
@@ -158,7 +172,47 @@ public sealed partial class TunnelClientMultiplexer
             throw new InvalidOperationException($"Session {sessionId} is not active.");
         }
 
-        var sequence = state.TakeNextSendSequence();
-        await SendFrameAsync(new ProtocolFrame(frameType, sessionId, sequence, payload), cancellationToken);
+        var pendingFrame = state.CreateTrackedOutboundFrame(sessionId, frameType, payload);
+        await SendFrameAsync(pendingFrame.ToProtocolFrame(sessionId), cancellationToken);
+    }
+
+    private async Task ReplayPendingSessionFramesAsync(uint sessionId, SessionState state, CancellationToken cancellationToken)
+    {
+        foreach (var frame in state.SnapshotPendingOutgoingFrames())
+        {
+            if (!_sessions.ContainsKey(sessionId) || state.IsClosed)
+            {
+                return;
+            }
+
+            await SendFrameAsync(frame.ToProtocolFrame(sessionId), cancellationToken);
+        }
+    }
+
+    private async Task ReplayPendingSessionFramesFromAsync(
+        uint sessionId,
+        SessionState state,
+        ulong fromSequence,
+        CancellationToken cancellationToken)
+    {
+        foreach (var frame in state.SnapshotPendingOutgoingFramesFrom(fromSequence))
+        {
+            if (!_sessions.ContainsKey(sessionId) || state.IsClosed)
+            {
+                return;
+            }
+
+            await SendFrameAsync(frame.ToProtocolFrame(sessionId), cancellationToken);
+        }
+    }
+
+    private Task SendAckFrameAsync(uint sessionId, ulong sequence, CancellationToken cancellationToken)
+    {
+        return SendFrameAsync(new ProtocolFrame(FrameType.Ack, sessionId, sequence, Array.Empty<byte>()), cancellationToken);
+    }
+
+    private Task SendRecoverFrameAsync(uint sessionId, ulong sequence, CancellationToken cancellationToken)
+    {
+        return SendFrameAsync(new ProtocolFrame(FrameType.Recover, sessionId, sequence, Array.Empty<byte>()), cancellationToken);
     }
 }

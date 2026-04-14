@@ -8,6 +8,8 @@ namespace SimpleShadowsocks.Client.Socks5;
 
 public sealed partial class Socks5Server
 {
+    private const int RelayBufferSize = 64 * 1024;
+
     private static async Task HandleDirectAsync(
         NetworkStream clientStream,
         Socks5ConnectRequest request,
@@ -127,7 +129,7 @@ public sealed partial class Socks5Server
 
         var clientToTunnel = Task.Run(async () =>
         {
-            var buffer = new byte[16 * 1024];
+            var buffer = new byte[RelayBufferSize];
             while (!relayToken.IsCancellationRequested)
             {
                 var read = await clientStream.ReadAsync(buffer, relayToken);
@@ -215,7 +217,7 @@ public sealed partial class Socks5Server
                     try
                     {
                         var destinationEndPoint = await ResolveUdpRemoteEndPointAsync(assembledDatagram, relayToken);
-                        await udpRelay.SendAsync(assembledDatagram.Payload.ToArray(), destinationEndPoint, relayToken);
+                        await udpRelay.SendAsync(assembledDatagram.Payload, destinationEndPoint, relayToken);
                     }
                     catch (OperationCanceledException)
                     {
@@ -324,7 +326,7 @@ public sealed partial class Socks5Server
                         try
                         {
                             var destinationEndPoint = await ResolveUdpRemoteEndPointAsync(assembledDatagram, relayToken);
-                            await udpRelay.SendAsync(assembledDatagram.Payload.ToArray(), destinationEndPoint, relayToken);
+                            await udpRelay.SendAsync(assembledDatagram.Payload, destinationEndPoint, relayToken);
                         }
                         catch (OperationCanceledException)
                         {
@@ -725,7 +727,7 @@ public sealed partial class Socks5Server
 
     private static async Task PumpRawAsync(Stream source, Stream destination, CancellationToken cancellationToken)
     {
-        var buffer = new byte[16 * 1024];
+        var buffer = new byte[RelayBufferSize];
         while (!cancellationToken.IsCancellationRequested)
         {
             var read = await source.ReadAsync(buffer, cancellationToken);

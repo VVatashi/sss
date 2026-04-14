@@ -10,6 +10,20 @@ public sealed class HttpReverseProxyClient : IAsyncDisposable
 {
     private readonly List<TunnelClientMultiplexer> _multiplexers = new();
 
+    internal int ActiveReverseHttpSessionCount
+    {
+        get
+        {
+            var total = 0;
+            foreach (var multiplexer in _multiplexers)
+            {
+                total += multiplexer.ActiveReverseHttpSessionCount;
+            }
+
+            return total;
+        }
+    }
+
     public HttpReverseProxyClient(
         IReadOnlyList<(string Host, int Port)> remoteServers,
         string sharedKey,

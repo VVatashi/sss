@@ -30,6 +30,20 @@ public sealed partial class TunnelServer
 
     public int AcceptedTunnelConnections => Volatile.Read(ref _acceptedTunnelConnections);
 
+    internal int ActiveReverseHttpSessionCount
+    {
+        get
+        {
+            var total = 0;
+            foreach (var connection in _activeTunnelConnections.Values)
+            {
+                total += connection.ReverseHttpSessionCount;
+            }
+
+            return total;
+        }
+    }
+
     public TunnelServer(IPAddress listenAddress, int port)
     {
         _listener = new TcpListener(listenAddress, port);

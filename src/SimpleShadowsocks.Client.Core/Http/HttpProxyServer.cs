@@ -13,6 +13,7 @@ namespace SimpleShadowsocks.Client.Http;
 
 public sealed class HttpProxyServer
 {
+    private static readonly TimeSpan UpstreamConnectTimeout = TimeSpan.FromSeconds(10);
     private static readonly HttpClient SharedDirectHttpClient = CreateHttpClient();
     private static readonly HashSet<string> HopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -40,6 +41,26 @@ public sealed class HttpProxyServer
     private readonly Action<Socket>? _configureTunnelSocket;
     private List<TunnelClientMultiplexer>? _multiplexers;
     private int _nextMultiplexerIndex = -1;
+
+    internal int ActiveTunnelHttpSessionCount
+    {
+        get
+        {
+            var multiplexers = _multiplexers;
+            if (multiplexers is null)
+            {
+                return 0;
+            }
+
+            var total = 0;
+            foreach (var multiplexer in multiplexers)
+            {
+                total += multiplexer.ActiveHttpSessionCount;
+            }
+
+            return total;
+        }
+    }
 
     public HttpProxyServer(
         IPAddress listenAddress,
@@ -158,6 +179,12 @@ public sealed class HttpProxyServer
             catch (OperationCanceledException)
             {
             }
+            catch (IOException) when (!cancellationToken.IsCancellationRequested)
+            {
+            }
+            catch (ObjectDisposedException) when (!cancellationToken.IsCancellationRequested)
+            {
+            }
             catch (Exception ex)
             {
                 StructuredLog.Error("http-proxy", "HTTP", "client handling failed", ex);
@@ -198,6 +225,13 @@ public sealed class HttpProxyServer
             if (request.IsConnect || string.Equals(request.TargetUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
             {
                 await WriteSimpleResponseAsync(stream, 501, "Not Implemented", closeConnection: true, cancellationToken);
+                return;
+            }
+
+            if (request.IsWebSocketUpgrade)
+            {
+                await WriteSimpleResponseAsync(stream, 501, "WebSocket Not Supported", closeConnection: true, cancellationToken);
+                StructuredLog.Warn("http-proxy", "HTTP", "websocket upgrade is not supported");
                 return;
             }
 
@@ -467,10 +501,14 @@ public sealed class HttpProxyServer
             UseProxy = false,
             UseCookies = false,
             AllowAutoRedirect = false,
-            AutomaticDecompression = DecompressionMethods.None
+            AutomaticDecompression = DecompressionMethods.None,
+            ConnectTimeout = UpstreamConnectTimeout
         };
 
-        return new HttpClient(handler, disposeHandler: false);
+        return new HttpClient(handler, disposeHandler: false)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
     }
 
     private sealed class ProxyExecutionResponse : IAsyncDisposable
@@ -652,7 +690,8 @@ public sealed class HttpProxyServer
             IReadOnlyList<HttpHeader> sanitizedHeaders,
             byte[] body,
             bool shouldKeepAlive,
-            bool isConnect)
+            bool isConnect,
+            bool isWebSocketUpgrade)
         {
             Method = method;
             TargetUri = targetUri;
@@ -662,6 +701,7 @@ public sealed class HttpProxyServer
             Body = body;
             ShouldKeepAlive = shouldKeepAlive;
             IsConnect = isConnect;
+            IsWebSocketUpgrade = isWebSocketUpgrade;
         }
 
         public string Method { get; }
@@ -672,6 +712,7 @@ public sealed class HttpProxyServer
         public byte[] Body { get; }
         public bool ShouldKeepAlive { get; }
         public bool IsConnect { get; }
+        public bool IsWebSocketUpgrade { get; }
 
         public HttpRequestStart ToTunnelRequestStart()
         {
@@ -752,6 +793,7 @@ public sealed class HttpProxyServer
 
             var headers = ParseHeaders(lines.Skip(1).TakeWhile(static line => line.Length > 0));
             var sanitizedHeaders = SanitizeHeaders(headers, targetUri);
+            var isWebSocketUpgrade = IsWebSocketUpgradeRequest(headers);
             var expectContinue = headers.Any(static h => h.Name.Equals("Expect", StringComparison.OrdinalIgnoreCase)
                 && h.Value.Contains("100-continue", StringComparison.OrdinalIgnoreCase));
             if (expectContinue)
@@ -768,7 +810,21 @@ public sealed class HttpProxyServer
                 sanitizedHeaders,
                 body,
                 DetermineKeepAlive(version, headers),
-                isConnect);
+                isConnect,
+                isWebSocketUpgrade);
+        }
+
+        private static bool IsWebSocketUpgradeRequest(IReadOnlyList<HttpHeader> headers)
+        {
+            var hasUpgradeConnectionToken = headers
+                .Where(static h => h.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                .SelectMany(static h => h.Value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+                .Any(static token => token.Equals("Upgrade", StringComparison.OrdinalIgnoreCase));
+            var hasWebSocketUpgradeHeader = headers
+                .Where(static h => h.Name.Equals("Upgrade", StringComparison.OrdinalIgnoreCase))
+                .Any(static h => h.Value.Equals("websocket", StringComparison.OrdinalIgnoreCase));
+
+            return hasUpgradeConnectionToken && hasWebSocketUpgradeHeader;
         }
 
         private static async Task<byte[]> ReadBodyAsync(

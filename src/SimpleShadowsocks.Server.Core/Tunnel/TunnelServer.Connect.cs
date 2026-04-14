@@ -103,7 +103,7 @@ public sealed partial class TunnelServer
 
             context.UpstreamToClientTask = Task.Run(async () =>
             {
-                var buffer = new byte[16 * 1024];
+                var buffer = new byte[RelayChunkSize];
                 try
                 {
                     while (!context.Cancellation.Token.IsCancellationRequested)
@@ -114,10 +114,9 @@ public sealed partial class TunnelServer
                             break;
                         }
 
-                        var sequence = context.TakeNextSendSequence();
                         await SendFrameLockedAsync(
                             secureStream,
-                            new ProtocolFrame(FrameType.Data, context.SessionId, sequence, buffer.AsMemory(0, read)),
+                            context.CreateTrackedOutboundFrame(FrameType.Data, buffer.AsMemory(0, read)),
                             writeLock,
                             writeOptions,
                             context.Cancellation.Token);
@@ -128,10 +127,11 @@ public sealed partial class TunnelServer
                 }
                 finally
                 {
+                    var sendCloseToClient = !context.Cancellation.IsCancellationRequested;
                     await CloseSessionAsync(
                         sessions,
                         context.SessionId,
-                        sendCloseToClient: true,
+                        sendCloseToClient: sendCloseToClient,
                         secureStream,
                         writeLock,
                         writeOptions,
@@ -250,10 +250,9 @@ public sealed partial class TunnelServer
                             (ushort)result.RemoteEndPoint.Port,
                             result.Buffer);
                         var payload = ProtocolPayloadSerializer.SerializeUdpDatagram(datagram);
-                        var sequence = context.TakeNextSendSequence();
                         await SendFrameLockedAsync(
                             secureStream,
-                            new ProtocolFrame(FrameType.UdpData, context.SessionId, sequence, payload),
+                            context.CreateTrackedOutboundFrame(FrameType.UdpData, payload),
                             writeLock,
                             writeOptions,
                             context.Cancellation.Token);
@@ -265,10 +264,11 @@ public sealed partial class TunnelServer
                 finally
                 {
                     StructuredLog.Info("tunnel-server", "TUNNEL/UDP", "session closed", context.SessionId);
+                    var sendCloseToClient = !context.Cancellation.IsCancellationRequested;
                     await CloseSessionAsync(
                         sessions,
                         context.SessionId,
-                        sendCloseToClient: true,
+                        sendCloseToClient: sendCloseToClient,
                         secureStream,
                         writeLock,
                         writeOptions,

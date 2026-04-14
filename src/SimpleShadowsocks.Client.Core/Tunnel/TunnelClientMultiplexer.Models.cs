@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Threading.Channels;
 using SimpleShadowsocks.Protocol;
 
@@ -12,10 +13,20 @@ public sealed partial class TunnelClientMultiplexer
         Http = 2
     }
 
+    private enum IncomingFrameResult
+    {
+        Accepted = 0,
+        Duplicate = 1,
+        Gap = 2,
+        Invalid = 3
+    }
+
     private sealed class SessionState
+        : IDisposable
     {
         private readonly object _sequenceLock = new();
         private readonly object _connectLock = new();
+        private readonly SortedDictionary<ulong, PendingOutboundFrame> _pendingOutgoingFrames = new();
         private ulong _nextSendSequence;
         private ulong _nextExpectedIncomingSequence;
         private bool _awaitingConnectReply;
@@ -85,7 +96,7 @@ public sealed partial class TunnelClientMultiplexer
             }
         }
 
-        public void BeginConnectAttempt()
+        public void BeginConnectAttempt(uint sessionId, bool preservePendingFrames)
         {
             lock (_connectLock)
             {
@@ -101,7 +112,16 @@ public sealed partial class TunnelClientMultiplexer
 
             lock (_sequenceLock)
             {
-                _nextSendSequence = 1;
+                if (preservePendingFrames)
+                {
+                    RebasePendingOutgoingFramesLocked(sessionId);
+                }
+                else
+                {
+                    DisposePendingOutgoingFramesLocked();
+                    _nextSendSequence = 1;
+                }
+
                 _nextExpectedIncomingSequence = 0;
                 _awaitingConnectReply = true;
             }
@@ -226,6 +246,39 @@ public sealed partial class TunnelClientMultiplexer
             }
         }
 
+        public PendingOutboundFrame CreateTrackedOutboundFrame(uint sessionId, FrameType frameType, ReadOnlyMemory<byte> payload)
+        {
+            lock (_sequenceLock)
+            {
+                var pendingFrame = new PendingOutboundFrame(frameType, _nextSendSequence++, OwnedPayload.Create(payload));
+                _pendingOutgoingFrames[pendingFrame.Sequence] = pendingFrame;
+                return pendingFrame;
+            }
+        }
+
+        public void AcknowledgeOutgoingThrough(ulong sequence)
+        {
+            lock (_sequenceLock)
+            {
+                if (sequence == 0 || _pendingOutgoingFrames.Count == 0)
+                {
+                    return;
+                }
+
+                while (_pendingOutgoingFrames.Count > 0)
+                {
+                    var first = _pendingOutgoingFrames.First();
+                    if (first.Key > sequence)
+                    {
+                        break;
+                    }
+
+                    first.Value.Dispose();
+                    _pendingOutgoingFrames.Remove(first.Key);
+                }
+            }
+        }
+
         public ulong TakeNextSendSequence()
         {
             lock (_sequenceLock)
@@ -234,7 +287,39 @@ public sealed partial class TunnelClientMultiplexer
             }
         }
 
-        public bool TryAcceptIncomingFrame(FrameType frameType, ulong sequence)
+        public IReadOnlyList<PendingOutboundFrame> SnapshotPendingOutgoingFrames()
+        {
+            lock (_sequenceLock)
+            {
+                return _pendingOutgoingFrames.Values.ToArray();
+            }
+        }
+
+        public IReadOnlyList<PendingOutboundFrame> SnapshotPendingOutgoingFramesFrom(ulong sequence)
+        {
+            lock (_sequenceLock)
+            {
+                return _pendingOutgoingFrames
+                    .Where(pair => pair.Key >= sequence)
+                    .Select(static pair => pair.Value)
+                    .ToArray();
+            }
+        }
+
+        public ulong LastAcceptedIncomingSequence
+        {
+            get
+            {
+                lock (_sequenceLock)
+                {
+                    return _awaitingConnectReply || _nextExpectedIncomingSequence == 0
+                        ? 0
+                        : _nextExpectedIncomingSequence - 1;
+                }
+            }
+        }
+
+        public IncomingFrameResult EvaluateIncomingFrame(FrameType frameType, ulong sequence)
         {
             lock (_sequenceLock)
             {
@@ -249,21 +334,67 @@ public sealed partial class TunnelClientMultiplexer
 
                     if (frameType != validConnectReply || sequence != 0)
                     {
-                        return false;
+                        return IncomingFrameResult.Invalid;
                     }
 
                     _awaitingConnectReply = false;
                     _nextExpectedIncomingSequence = 1;
-                    return true;
+                    return IncomingFrameResult.Accepted;
                 }
 
-                if (sequence != _nextExpectedIncomingSequence)
+                if (sequence == _nextExpectedIncomingSequence)
                 {
-                    return false;
+                    _nextExpectedIncomingSequence++;
+                    return IncomingFrameResult.Accepted;
                 }
 
-                _nextExpectedIncomingSequence++;
-                return true;
+                return sequence < _nextExpectedIncomingSequence
+                    ? IncomingFrameResult.Duplicate
+                    : IncomingFrameResult.Gap;
+            }
+        }
+
+        private void RebasePendingOutgoingFramesLocked(uint sessionId)
+        {
+            if (_pendingOutgoingFrames.Count == 0)
+            {
+                _nextSendSequence = 1;
+                return;
+            }
+
+            var rebasedFrames = new SortedDictionary<ulong, PendingOutboundFrame>();
+            ulong sequence = 1;
+            foreach (var frame in _pendingOutgoingFrames.Values)
+            {
+                frame.Sequence = sequence;
+                rebasedFrames[sequence] = frame;
+                sequence++;
+            }
+
+            _pendingOutgoingFrames.Clear();
+            foreach (var (rebasedSequence, frame) in rebasedFrames)
+            {
+                _pendingOutgoingFrames[rebasedSequence] = frame;
+            }
+
+            _nextSendSequence = sequence;
+        }
+
+        private void DisposePendingOutgoingFramesLocked()
+        {
+            foreach (var frame in _pendingOutgoingFrames.Values)
+            {
+                frame.Dispose();
+            }
+
+            _pendingOutgoingFrames.Clear();
+        }
+
+        public void Dispose()
+        {
+            lock (_sequenceLock)
+            {
+                DisposePendingOutgoingFramesLocked();
             }
         }
     }
@@ -326,5 +457,77 @@ public sealed partial class TunnelClientMultiplexer
         }
     }
 
-    private readonly record struct OutboundFrame(ProtocolFrame Frame, TaskCompletionSource<bool> Completion);
+    private sealed class PendingOutboundFrame : IDisposable
+    {
+        public PendingOutboundFrame(FrameType type, ulong sequence, OwnedPayload payload)
+        {
+            Type = type;
+            Sequence = sequence;
+            Payload = payload;
+        }
+
+        public FrameType Type { get; }
+        public ulong Sequence { get; set; }
+        public OwnedPayload Payload { get; }
+
+        public ProtocolFrame ToProtocolFrame(uint sessionId)
+        {
+            return new ProtocolFrame(Type, sessionId, Sequence, Payload.AsMemory());
+        }
+
+        public void Dispose()
+        {
+            Payload.Dispose();
+        }
+    }
+
+    private readonly record struct OutboundFrame(ProtocolFrame Frame, TaskCompletionSource<bool> Completion, OwnedPayload OwnedPayload)
+        : IDisposable
+    {
+        public void Dispose()
+        {
+            OwnedPayload.Dispose();
+        }
+    }
+
+    private readonly struct OwnedPayload : IDisposable
+    {
+        public static OwnedPayload Empty => new(Array.Empty<byte>(), 0, pooled: false);
+
+        private readonly byte[] _buffer;
+        private readonly int _length;
+        private readonly bool _pooled;
+
+        private OwnedPayload(byte[] buffer, int length, bool pooled)
+        {
+            _buffer = buffer;
+            _length = length;
+            _pooled = pooled;
+        }
+
+        public static OwnedPayload Create(ReadOnlyMemory<byte> payload)
+        {
+            if (payload.IsEmpty)
+            {
+                return Empty;
+            }
+
+            var rented = ArrayPool<byte>.Shared.Rent(payload.Length);
+            payload.Span.CopyTo(rented.AsSpan(0, payload.Length));
+            return new OwnedPayload(rented, payload.Length, pooled: true);
+        }
+
+        public ReadOnlyMemory<byte> AsMemory()
+        {
+            return _buffer.AsMemory(0, _length);
+        }
+
+        public void Dispose()
+        {
+            if (_pooled)
+            {
+                ArrayPool<byte>.Shared.Return(_buffer);
+            }
+        }
+    }
 }

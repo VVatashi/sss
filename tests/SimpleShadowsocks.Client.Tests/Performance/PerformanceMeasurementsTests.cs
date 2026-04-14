@@ -60,8 +60,6 @@ public sealed partial class PerformanceMeasurementsTests
         var results = new List<PerfResult>();
 
         await using var echo = await StartEchoServerAsync();
-        await using var tunnel = await StartTunnelServerAsync();
-
         for (var cipherIndex = 0; cipherIndex < CipherAlgorithms.Length; cipherIndex++)
         {
             var cipher = CipherAlgorithms[cipherIndex];
@@ -88,7 +86,6 @@ public sealed partial class PerformanceMeasurementsTests
 
                 var result = await MeasureModeAsync(
                     echo.Port,
-                    tunnel.Port,
                     chunkBytes,
                     totalBytes,
                     streams,
@@ -112,7 +109,6 @@ public sealed partial class PerformanceMeasurementsTests
 
     private async Task<PerfResult> MeasureModeAsync(
         int echoPort,
-        int tunnelPort,
         int chunkBytes,
         long totalBytes,
         int streams,
@@ -120,7 +116,8 @@ public sealed partial class PerformanceMeasurementsTests
         TunnelCipherAlgorithm algorithm,
         CompressionMode compression)
     {
-        await using var tunnelProxy = await StartTunnelTrafficProxyAsync(tunnelPort);
+        await using var tunnel = await StartTunnelServerAsync();
+        await using var tunnelProxy = await StartTunnelTrafficProxyAsync(tunnel.Port);
         _output.WriteLine(
             $"[perf] start socks server (cipher={algorithm}, compression={compression.DisplayName}, payload={payloadSet.Profile})");
         await using var socks = await StartSocksServerAsync(tunnelProxy.Port, algorithm, compression);

@@ -4,16 +4,18 @@ public static class ProtocolConstants
 {
     public const byte LegacyVersion = 1;
     public const byte Version2 = 2;
-    public const byte Version = 3;
+    public const byte Version3 = 3;
+    public const byte Version = 4;
     public const int HeaderSizeV1 = 18;
     public const int HeaderSizeV2 = 19;
     public const int HeaderSize = HeaderSizeV2;
     public const int MaxPayloadLength = 1024 * 1024;
 
-    public static bool IsSupported(byte version) => version is LegacyVersion or Version2 or Version;
-    public static bool UsesExtendedHeader(byte version) => version is Version2 or Version;
-    public static bool SupportsCompression(byte version) => version is Version2 or Version;
-    public static bool SupportsHttpRelay(byte version) => version == Version;
+    public static bool IsSupported(byte version) => version is LegacyVersion or Version2 or Version3 or Version;
+    public static bool UsesExtendedHeader(byte version) => version is Version2 or Version3 or Version;
+    public static bool SupportsCompression(byte version) => version is Version2 or Version3 or Version;
+    public static bool SupportsHttpRelay(byte version) => version is Version3 or Version;
+    public static bool SupportsSelectiveRecovery(byte version) => version == Version;
 }
 
 public static class ProtocolFlags
@@ -39,7 +41,9 @@ public enum FrameType : byte
     HttpResponse = 10,
     ReverseHttpRequest = 11,
     ReverseHttpRequestEnd = 12,
-    ReverseHttpResponse = 13
+    ReverseHttpResponse = 13,
+    Ack = 14,
+    Recover = 15
 }
 
 public enum AddressType : byte

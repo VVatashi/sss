@@ -8,16 +8,13 @@ namespace SimpleShadowsocks.Protocol;
 public static class ProtocolPayloadSerializer
 {
     private const int MaxStringBytes = ushort.MaxValue;
+    private static readonly byte[][] SingleBytePayloadCache = CreateSingleBytePayloadCache();
 
     public static byte[] SerializeConnectRequest(ConnectRequest request)
     {
-        return request.AddressType switch
-        {
-            AddressType.IPv4 => SerializeIpConnectRequest(request, AddressFamily.InterNetwork, 4),
-            AddressType.IPv6 => SerializeIpConnectRequest(request, AddressFamily.InterNetworkV6, 16),
-            AddressType.Domain => SerializeDomainConnectRequest(request.Address, request.Port),
-            _ => throw new InvalidDataException($"Unsupported address type: {request.AddressType}.")
-        };
+        var payload = new byte[GetConnectRequestLength(request)];
+        WriteConnectRequest(payload, request);
+        return payload;
     }
 
     public static ConnectRequest DeserializeConnectRequest(ReadOnlySpan<byte> payload)
@@ -47,7 +44,7 @@ public static class ProtocolPayloadSerializer
         return new ConnectRequest(addressType, address, port);
     }
 
-    public static byte[] SerializeClose(byte reasonCode) => new[] { reasonCode };
+    public static byte[] SerializeClose(byte reasonCode) => SingleBytePayloadCache[reasonCode];
 
     public static byte DeserializeClose(ReadOnlySpan<byte> payload)
     {
@@ -78,24 +75,15 @@ public static class ProtocolPayloadSerializer
 
     public static byte[] SerializeUdpDatagram(UdpDatagram datagram)
     {
-        var endpointPayload = SerializeConnectRequest(new ConnectRequest(datagram.AddressType, datagram.Address, datagram.Port));
-        var payload = new byte[endpointPayload.Length + datagram.Payload.Length];
-        Buffer.BlockCopy(endpointPayload, 0, payload, 0, endpointPayload.Length);
-        datagram.Payload.CopyTo(payload.AsMemory(endpointPayload.Length));
+        var payload = new byte[GetUdpDatagramLength(datagram)];
+        WriteUdpDatagram(payload, datagram);
         return payload;
     }
 
     public static UdpDatagram DeserializeUdpDatagram(ReadOnlySpan<byte> payload)
     {
         var request = DeserializeConnectRequest(payload);
-        var endpointLength = request.AddressType switch
-        {
-            AddressType.IPv4 => 1 + 4 + 2,
-            AddressType.IPv6 => 1 + 16 + 2,
-            AddressType.Domain => 1 + 1 + Encoding.ASCII.GetByteCount(request.Address) + 2,
-            _ => throw new InvalidDataException($"Unsupported UDP address type: {request.AddressType}.")
-        };
-
+        var endpointLength = GetUdpEndpointLength(request);
         if (payload.Length < endpointLength)
         {
             throw new InvalidDataException("UDP payload is too short.");
@@ -108,17 +96,16 @@ public static class ProtocolPayloadSerializer
             payload.Slice(endpointLength).ToArray());
     }
 
+    public static UdpDatagram DeserializeUdpDatagram(ReadOnlyMemory<byte> payload)
+    {
+        return ParseUdpDatagramCore(payload);
+    }
+
     public static byte[] SerializeHttpRequestStart(HttpRequestStart request)
     {
-        using var stream = new MemoryStream();
-        WriteString(stream, request.Method);
-        WriteString(stream, request.Scheme);
-        WriteString(stream, request.Authority);
-        WriteString(stream, request.PathAndQuery);
-        stream.WriteByte(request.VersionMajor);
-        stream.WriteByte(request.VersionMinor);
-        WriteHeaders(stream, request.Headers);
-        return stream.ToArray();
+        var payload = new byte[GetHttpRequestStartLength(request)];
+        WriteHttpRequestStart(payload, request);
+        return payload;
     }
 
     public static HttpRequestStart DeserializeHttpRequestStart(ReadOnlySpan<byte> payload)
@@ -137,13 +124,9 @@ public static class ProtocolPayloadSerializer
 
     public static byte[] SerializeHttpResponseStart(HttpResponseStart response)
     {
-        using var stream = new MemoryStream();
-        WriteUInt16(stream, response.StatusCode);
-        WriteString(stream, response.ReasonPhrase);
-        stream.WriteByte(response.VersionMajor);
-        stream.WriteByte(response.VersionMinor);
-        WriteHeaders(stream, response.Headers);
-        return stream.ToArray();
+        var payload = new byte[GetHttpResponseStartLength(response)];
+        WriteHttpResponseStart(payload, response);
+        return payload;
     }
 
     public static HttpResponseStart DeserializeHttpResponseStart(ReadOnlySpan<byte> payload)
@@ -158,54 +141,57 @@ public static class ProtocolPayloadSerializer
         return new HttpResponseStart(statusCode, reasonPhrase, versionMajor, versionMinor, headers);
     }
 
-    private static byte[] SerializeIpConnectRequest(ConnectRequest request, AddressFamily expectedFamily, int ipLength)
+    private static void WriteConnectRequest(Span<byte> destination, ConnectRequest request)
     {
-        if (!IPAddress.TryParse(request.Address, out var ipAddress))
+        if (destination.Length != GetConnectRequestLength(request))
         {
-            throw new InvalidDataException($"Invalid IP address: {request.Address}.");
+            throw new InvalidDataException("CONNECT payload destination length mismatch.");
         }
 
-        if (ipAddress.AddressFamily != expectedFamily)
+        destination[0] = (byte)request.AddressType;
+        switch (request.AddressType)
         {
-            throw new InvalidDataException($"IP address family mismatch for {request.Address}.");
+            case AddressType.IPv4:
+                WriteIpConnectRequest(destination, request, AddressFamily.InterNetwork, 4);
+                break;
+            case AddressType.IPv6:
+                WriteIpConnectRequest(destination, request, AddressFamily.InterNetworkV6, 16);
+                break;
+            case AddressType.Domain:
+                WriteDomainConnectRequest(destination, request.Address, request.Port);
+                break;
+            default:
+                throw new InvalidDataException($"Unsupported address type: {request.AddressType}.");
         }
-
-        var payload = new byte[1 + ipLength + 2];
-        payload[0] = (byte)request.AddressType;
-        if (!ipAddress.TryWriteBytes(payload.AsSpan(1, ipLength), out var bytesWritten) || bytesWritten != ipLength)
-        {
-            throw new InvalidDataException($"Failed to serialize IP address: {request.Address}.");
-        }
-
-        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1 + ipLength, 2), request.Port);
-        return payload;
     }
 
-    private static byte[] SerializeDomainConnectRequest(string domain, ushort port)
+    private static int GetConnectRequestLength(ConnectRequest request)
     {
-        if (string.IsNullOrWhiteSpace(domain))
+        return request.AddressType switch
         {
-            throw new InvalidDataException("Domain must not be empty.");
+            AddressType.IPv4 => 1 + 4 + 2,
+            AddressType.IPv6 => 1 + 16 + 2,
+            AddressType.Domain => 1 + 1 + GetValidatedDomainByteCount(request.Address) + 2,
+            _ => throw new InvalidDataException($"Unsupported address type: {request.AddressType}.")
+        };
+    }
+
+    private static int GetUdpDatagramLength(UdpDatagram datagram)
+    {
+        return GetConnectRequestLength(new ConnectRequest(datagram.AddressType, datagram.Address, datagram.Port))
+            + datagram.Payload.Length;
+    }
+
+    private static void WriteUdpDatagram(Span<byte> destination, UdpDatagram datagram)
+    {
+        var endpointLength = GetConnectRequestLength(new ConnectRequest(datagram.AddressType, datagram.Address, datagram.Port));
+        if (destination.Length != endpointLength + datagram.Payload.Length)
+        {
+            throw new InvalidDataException("UDP payload destination length mismatch.");
         }
 
-        var byteCount = Encoding.ASCII.GetByteCount(domain);
-        if (byteCount > 255)
-        {
-            throw new InvalidDataException("Domain is too long. Max length is 255 bytes.");
-        }
-
-        var payload = new byte[1 + 1 + byteCount + 2];
-        payload[0] = (byte)AddressType.Domain;
-
-        var written = Encoding.ASCII.GetBytes(domain.AsSpan(), payload.AsSpan(2, byteCount));
-        if (written != byteCount)
-        {
-            throw new InvalidDataException("Failed to serialize domain.");
-        }
-
-        payload[1] = (byte)byteCount;
-        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(2 + byteCount, 2), port);
-        return payload;
+        WriteConnectRequest(destination.Slice(0, endpointLength), new ConnectRequest(datagram.AddressType, datagram.Address, datagram.Port));
+        datagram.Payload.Span.CopyTo(destination.Slice(endpointLength));
     }
 
     private static (string Address, int Consumed) DeserializeIpAddress(ReadOnlySpan<byte> body, int expectedLength)
@@ -240,22 +226,76 @@ public static class ProtocolPayloadSerializer
         return (domain, 1 + length);
     }
 
-    private static void WriteHeaders(Stream stream, IReadOnlyList<HttpHeader> headers)
+    private static int GetHttpRequestStartLength(HttpRequestStart request)
+    {
+        return GetStringEncodedLength(request.Method)
+            + GetStringEncodedLength(request.Scheme)
+            + GetStringEncodedLength(request.Authority)
+            + GetStringEncodedLength(request.PathAndQuery)
+            + 1
+            + 1
+            + GetHeadersLength(request.Headers);
+    }
+
+    private static void WriteHttpRequestStart(Span<byte> destination, HttpRequestStart request)
+    {
+        var offset = 0;
+        WriteString(destination, ref offset, request.Method);
+        WriteString(destination, ref offset, request.Scheme);
+        WriteString(destination, ref offset, request.Authority);
+        WriteString(destination, ref offset, request.PathAndQuery);
+        destination[offset++] = request.VersionMajor;
+        destination[offset++] = request.VersionMinor;
+        WriteHeaders(destination, ref offset, request.Headers);
+    }
+
+    private static int GetHttpResponseStartLength(HttpResponseStart response)
+    {
+        return 2
+            + GetStringEncodedLength(response.ReasonPhrase)
+            + 1
+            + 1
+            + GetHeadersLength(response.Headers);
+    }
+
+    private static void WriteHttpResponseStart(Span<byte> destination, HttpResponseStart response)
+    {
+        var offset = 0;
+        WriteUInt16(destination, ref offset, response.StatusCode);
+        WriteString(destination, ref offset, response.ReasonPhrase);
+        destination[offset++] = response.VersionMajor;
+        destination[offset++] = response.VersionMinor;
+        WriteHeaders(destination, ref offset, response.Headers);
+    }
+
+    private static int GetHeadersLength(IReadOnlyList<HttpHeader> headers)
     {
         if (headers.Count > ushort.MaxValue)
         {
             throw new InvalidDataException("Too many HTTP headers.");
         }
 
-        WriteUInt16(stream, (ushort)headers.Count);
+        var total = 2;
         foreach (var header in headers)
         {
-            WriteString(stream, header.Name);
-            WriteString(stream, header.Value);
+            total += GetStringEncodedLength(header.Name);
+            total += GetStringEncodedLength(header.Value);
+        }
+
+        return total;
+    }
+
+    private static void WriteHeaders(Span<byte> destination, ref int offset, IReadOnlyList<HttpHeader> headers)
+    {
+        WriteUInt16(destination, ref offset, checked((ushort)headers.Count));
+        foreach (var header in headers)
+        {
+            WriteString(destination, ref offset, header.Name);
+            WriteString(destination, ref offset, header.Value);
         }
     }
 
-    private static void WriteString(Stream stream, string value)
+    private static int GetStringEncodedLength(string? value)
     {
         value ??= string.Empty;
         var byteCount = Encoding.UTF8.GetByteCount(value);
@@ -264,27 +304,126 @@ public static class ProtocolPayloadSerializer
             throw new InvalidDataException("String payload is too long.");
         }
 
-        WriteUInt16(stream, (ushort)byteCount);
+        return 2 + byteCount;
+    }
+
+    private static void WriteString(Span<byte> destination, ref int offset, string? value)
+    {
+        value ??= string.Empty;
+        var byteCount = Encoding.UTF8.GetByteCount(value);
+        if (byteCount > MaxStringBytes)
+        {
+            throw new InvalidDataException("String payload is too long.");
+        }
+
+        WriteUInt16(destination, ref offset, (ushort)byteCount);
         if (byteCount == 0)
         {
             return;
         }
 
-        var buffer = new byte[byteCount];
-        var written = Encoding.UTF8.GetBytes(value, buffer);
+        var written = Encoding.UTF8.GetBytes(value.AsSpan(), destination.Slice(offset, byteCount));
         if (written != byteCount)
         {
             throw new InvalidDataException("Failed to serialize string payload.");
         }
 
-        stream.Write(buffer, 0, buffer.Length);
+        offset += written;
     }
 
-    private static void WriteUInt16(Stream stream, ushort value)
+    private static void WriteUInt16(Span<byte> destination, ref int offset, ushort value)
     {
-        Span<byte> buffer = stackalloc byte[2];
-        BinaryPrimitives.WriteUInt16BigEndian(buffer, value);
-        stream.Write(buffer);
+        BinaryPrimitives.WriteUInt16BigEndian(destination.Slice(offset, 2), value);
+        offset += 2;
+    }
+
+    private static void WriteIpConnectRequest(Span<byte> destination, ConnectRequest request, AddressFamily expectedFamily, int ipLength)
+    {
+        if (!IPAddress.TryParse(request.Address, out var ipAddress))
+        {
+            throw new InvalidDataException($"Invalid IP address: {request.Address}.");
+        }
+
+        if (ipAddress.AddressFamily != expectedFamily)
+        {
+            throw new InvalidDataException($"IP address family mismatch for {request.Address}.");
+        }
+
+        if (!ipAddress.TryWriteBytes(destination.Slice(1, ipLength), out var bytesWritten) || bytesWritten != ipLength)
+        {
+            throw new InvalidDataException($"Failed to serialize IP address: {request.Address}.");
+        }
+
+        BinaryPrimitives.WriteUInt16BigEndian(destination.Slice(1 + ipLength, 2), request.Port);
+    }
+
+    private static void WriteDomainConnectRequest(Span<byte> destination, string domain, ushort port)
+    {
+        var byteCount = GetValidatedDomainByteCount(domain);
+        destination[1] = (byte)byteCount;
+
+        var written = Encoding.ASCII.GetBytes(domain.AsSpan(), destination.Slice(2, byteCount));
+        if (written != byteCount)
+        {
+            throw new InvalidDataException("Failed to serialize domain.");
+        }
+
+        BinaryPrimitives.WriteUInt16BigEndian(destination.Slice(2 + byteCount, 2), port);
+    }
+
+    private static int GetValidatedDomainByteCount(string domain)
+    {
+        if (string.IsNullOrWhiteSpace(domain))
+        {
+            throw new InvalidDataException("Domain must not be empty.");
+        }
+
+        var byteCount = Encoding.ASCII.GetByteCount(domain);
+        if (byteCount > byte.MaxValue)
+        {
+            throw new InvalidDataException("Domain is too long. Max length is 255 bytes.");
+        }
+
+        return byteCount;
+    }
+
+    private static UdpDatagram ParseUdpDatagramCore(ReadOnlyMemory<byte> payload)
+    {
+        var request = DeserializeConnectRequest(payload.Span);
+        var endpointLength = GetUdpEndpointLength(request);
+
+        if (payload.Length < endpointLength)
+        {
+            throw new InvalidDataException("UDP payload is too short.");
+        }
+
+        return new UdpDatagram(
+            request.AddressType,
+            request.Address,
+            request.Port,
+            payload.Slice(endpointLength));
+    }
+
+    private static int GetUdpEndpointLength(ConnectRequest request)
+    {
+        return request.AddressType switch
+        {
+            AddressType.IPv4 => 1 + 4 + 2,
+            AddressType.IPv6 => 1 + 16 + 2,
+            AddressType.Domain => 1 + 1 + GetValidatedDomainByteCount(request.Address) + 2,
+            _ => throw new InvalidDataException($"Unsupported UDP address type: {request.AddressType}.")
+        };
+    }
+
+    private static byte[][] CreateSingleBytePayloadCache()
+    {
+        var cache = new byte[byte.MaxValue + 1][];
+        for (var i = 0; i < cache.Length; i++)
+        {
+            cache[i] = [(byte)i];
+        }
+
+        return cache;
     }
 
     private ref struct SpanReader

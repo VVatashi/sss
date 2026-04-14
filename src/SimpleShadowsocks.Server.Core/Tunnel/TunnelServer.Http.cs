@@ -7,6 +7,7 @@ namespace SimpleShadowsocks.Server.Tunnel;
 
 public sealed partial class TunnelServer
 {
+    private static readonly TimeSpan UpstreamConnectTimeout = TimeSpan.FromSeconds(10);
     private static readonly HttpClient SharedHttpClient = CreateHttpClient();
     private static readonly HashSet<string> HopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -34,10 +35,14 @@ public sealed partial class TunnelServer
             UseProxy = false,
             UseCookies = false,
             AllowAutoRedirect = false,
-            AutomaticDecompression = DecompressionMethods.None
+            AutomaticDecompression = DecompressionMethods.None,
+            ConnectTimeout = UpstreamConnectTimeout
         };
 
-        return new HttpClient(handler, disposeHandler: false);
+        return new HttpClient(handler, disposeHandler: false)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
     }
 
     private static Task HandleHttpRequestFrameAsync(
@@ -125,17 +130,30 @@ public sealed partial class TunnelServer
             return;
         }
 
-        if (!session.TryAcceptIncomingSequence(frame.Sequence) || !httpSession.TryMarkRequestCompleted())
+        var incomingSequenceResult = session.EvaluateIncomingSequence(frame.Sequence);
+        if (incomingSequenceResult != IncomingSequenceResult.Accepted || !httpSession.TryMarkRequestCompleted())
         {
-            await CloseSessionAsync(
-                sessions,
-                frame.SessionId,
-                sendCloseToClient: true,
+            await HandleIncomingSequenceMismatchAsync(
                 secureStream,
                 writeLock,
+                sessions,
+                session,
+                frame.SessionId,
+                incomingSequenceResult,
                 writeOptions,
                 CancellationToken.None);
             return;
+        }
+
+        if (ProtocolConstants.SupportsSelectiveRecovery(writeOptions.Version))
+        {
+            await SendAckAsync(
+                secureStream,
+                frame.SessionId,
+                frame.Sequence,
+                writeLock,
+                writeOptions,
+                cancellationToken);
         }
 
         _ = Task.Run(
@@ -177,7 +195,7 @@ public sealed partial class TunnelServer
             if (response.Content is not null)
             {
                 await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-                var buffer = new byte[16 * 1024];
+                var buffer = new byte[RelayChunkSize];
                 while (!cancellationToken.IsCancellationRequested)
                 {
                     var read = await stream.ReadAsync(buffer, cancellationToken);
@@ -188,7 +206,7 @@ public sealed partial class TunnelServer
 
                     await SendFrameLockedAsync(
                         secureStream,
-                        new ProtocolFrame(FrameType.Data, session.SessionId, session.TakeNextSendSequence(), buffer.AsMemory(0, read)),
+                        session.CreateTrackedOutboundFrame(FrameType.Data, buffer.AsMemory(0, read)),
                         writeLock,
                         writeOptions,
                         cancellationToken);
@@ -218,10 +236,11 @@ public sealed partial class TunnelServer
         finally
         {
             response?.Dispose();
+            var sendCloseToClient = !session.Cancellation.IsCancellationRequested;
             await CloseSessionAsync(
                 sessions,
                 session.SessionId,
-                sendCloseToClient: true,
+                sendCloseToClient: sendCloseToClient,
                 secureStream,
                 writeLock,
                 writeOptions,

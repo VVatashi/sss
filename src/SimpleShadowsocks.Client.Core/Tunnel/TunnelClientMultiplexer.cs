@@ -9,6 +9,8 @@ namespace SimpleShadowsocks.Client.Tunnel;
 
 public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
 {
+    private const int RelayChunkSize = 64 * 1024;
+
     private readonly Action<Socket>? _configureTcpSocket;
     private readonly string _remoteHost;
     private readonly int _remotePort;
@@ -36,6 +38,25 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
     private long _lastIncomingUtcTicks;
     private long _controlSendSequence;
     private volatile bool _disposing;
+
+    internal int ActiveHttpSessionCount
+    {
+        get
+        {
+            var total = 0;
+            foreach (var state in _sessions.Values)
+            {
+                if (state.IsHttp)
+                {
+                    total++;
+                }
+            }
+
+            return total;
+        }
+    }
+
+    internal int ActiveReverseHttpSessionCount => _incomingReverseHttpSessions.Count;
 
     public TunnelClientMultiplexer(
         string remoteHost,
@@ -97,6 +118,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
             {
                 _sessions.TryRemove(sessionId, out _);
                 state.ReaderWriter.Writer.TryComplete();
+                state.Dispose();
                 StructuredLog.Warn("tunnel-client", "TUNNEL/TCP", $"session open rejected reply={replyCode}", sessionId);
             }
             else
@@ -110,6 +132,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         {
             _sessions.TryRemove(sessionId, out _);
             state.ReaderWriter?.Writer.TryComplete();
+            state.Dispose();
             throw;
         }
     }
@@ -138,6 +161,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
             {
                 _sessions.TryRemove(sessionId, out _);
                 state.UdpReaderWriter?.Writer.TryComplete();
+                state.Dispose();
                 StructuredLog.Warn("tunnel-client", "TUNNEL/UDP", $"session open rejected reply={replyCode}", sessionId);
             }
 
@@ -157,6 +181,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         {
             _sessions.TryRemove(sessionId, out _);
             state.UdpReaderWriter?.Writer.TryComplete();
+            state.Dispose();
             throw;
         }
     }
@@ -187,7 +212,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
 
         try
         {
-            state.BeginConnectAttempt();
+            state.BeginConnectAttempt(sessionId, preservePendingFrames: false);
             await SendFrameAsync(
                 new ProtocolFrame(
                     FrameType.HttpRequest,
@@ -196,11 +221,10 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
                     ProtocolPayloadSerializer.SerializeHttpRequestStart(requestStart)),
                 cancellationToken);
 
-            const int chunkSize = 16 * 1024;
             var offset = 0;
             while (offset < body.Length)
             {
-                var length = Math.Min(chunkSize, body.Length - offset);
+                var length = Math.Min(RelayChunkSize, body.Length - offset);
                 await SendPendingSessionFrameAsync(
                     sessionId,
                     state,
@@ -230,6 +254,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         {
             _sessions.TryRemove(sessionId, out _);
             state.ReaderWriter?.Writer.TryComplete();
+            state.Dispose();
             throw;
         }
     }
@@ -249,13 +274,17 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
     {
         if (_sessions.TryRemove(sessionId, out var state))
         {
+            var closeSequence = state.TakeNextSendSequence();
             state.MarkClosed();
             state.FailConnect(new IOException("Session is closed."));
-            var sequence = state.TakeNextSendSequence();
             try
             {
                 await SendFrameAsync(
-                    new ProtocolFrame(FrameType.Close, sessionId, sequence, ProtocolPayloadSerializer.SerializeClose(reasonCode)),
+                    new ProtocolFrame(
+                        FrameType.Close,
+                        sessionId,
+                        closeSequence,
+                        ProtocolPayloadSerializer.SerializeClose(reasonCode)),
                     cancellationToken);
             }
             catch
@@ -264,6 +293,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
 
             state.ReaderWriter?.Writer.TryComplete();
             state.UdpReaderWriter?.Writer.TryComplete();
+            state.Dispose();
             StructuredLog.Info(
                 "tunnel-client",
                 state.IsUdp ? "TUNNEL/UDP" : state.IsHttp ? "TUNNEL/HTTP" : "TUNNEL/TCP",

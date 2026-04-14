@@ -106,19 +106,45 @@ public sealed partial class TunnelClientMultiplexer
 
     private async Task SendFrameAsync(ProtocolFrame frame, CancellationToken cancellationToken)
     {
+        await SendFrameAsync(new OutboundFrame(
+            frame,
+            new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+            OwnedPayload.Empty),
+            cancellationToken);
+    }
+
+    private async Task SendOwnedFrameAsync(
+        FrameType frameType,
+        uint sessionId,
+        ulong sequence,
+        ReadOnlyMemory<byte> payload,
+        CancellationToken cancellationToken)
+    {
+        var ownedPayload = OwnedPayload.Create(payload);
+        await SendFrameAsync(
+            new OutboundFrame(
+                new ProtocolFrame(frameType, sessionId, sequence, ownedPayload.AsMemory()),
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously),
+                ownedPayload),
+            cancellationToken);
+    }
+
+    private async Task SendFrameAsync(OutboundFrame outboundFrame, CancellationToken cancellationToken)
+    {
         var outboundFrames = _outboundFrames;
         if (outboundFrames is null || _connectionCts is null || _connectionCts.IsCancellationRequested)
         {
+            outboundFrame.Dispose();
             throw new InvalidOperationException("Tunnel is not connected.");
         }
 
-        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!outboundFrames.Writer.TryWrite(new OutboundFrame(frame, completion)))
+        if (!outboundFrames.Writer.TryWrite(outboundFrame))
         {
+            outboundFrame.Dispose();
             throw new IOException("Failed to enqueue outbound frame.");
         }
 
-        await completion.Task.WaitAsync(cancellationToken);
+        await outboundFrame.Completion.Task.WaitAsync(cancellationToken);
     }
 
     private async Task HandleConnectionFaultAsync(bool preserveSessions, int? expectedGeneration = null)
@@ -139,6 +165,7 @@ public sealed partial class TunnelClientMultiplexer
             while (outboundFrames.Reader.TryRead(out var pending))
             {
                 pending.Completion.TrySetException(new IOException("Tunnel connection fault."));
+                pending.Dispose();
             }
         }
 
@@ -170,6 +197,7 @@ public sealed partial class TunnelClientMultiplexer
                     state.MarkClosed();
                     state.FailConnect(error);
                     state.ReaderWriter?.Writer.TryComplete(error);
+                    state.Dispose();
                     _sessions.TryRemove(sessionId, out _);
                     continue;
                 }
@@ -202,6 +230,8 @@ public sealed partial class TunnelClientMultiplexer
             {
                 state.FailConnect(new IOException("Tunnel connection closed."));
             }
+
+            state.Dispose();
             _sessions.TryRemove(sessionId, out _);
         }
     }

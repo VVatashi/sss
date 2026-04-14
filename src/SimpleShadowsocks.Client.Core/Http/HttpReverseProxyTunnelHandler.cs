@@ -7,6 +7,7 @@ namespace SimpleShadowsocks.Client.Http;
 
 public sealed class HttpReverseProxyTunnelHandler : ITunnelReverseHttpHandler
 {
+    private static readonly TimeSpan UpstreamConnectTimeout = TimeSpan.FromSeconds(10);
     private static readonly HttpClient SharedHttpClient = CreateHttpClient();
     private static readonly HashSet<string> HopByHopHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -195,10 +196,14 @@ public sealed class HttpReverseProxyTunnelHandler : ITunnelReverseHttpHandler
             UseProxy = false,
             UseCookies = false,
             AllowAutoRedirect = false,
-            AutomaticDecompression = DecompressionMethods.None
+            AutomaticDecompression = DecompressionMethods.None,
+            ConnectTimeout = UpstreamConnectTimeout
         };
 
-        return new HttpClient(handler, disposeHandler: false);
+        return new HttpClient(handler, disposeHandler: false)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
     }
 
     private static string ExtractHost(string authority)

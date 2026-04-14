@@ -1,4 +1,5 @@
 using System.Net;
+using System.Runtime.InteropServices;
 using SimpleShadowsocks.Protocol;
 
 namespace SimpleShadowsocks.Client.Tests;
@@ -130,6 +131,60 @@ public sealed class ProtocolFrameCodecTests
         Assert.True((decoded.Value.Flags & ProtocolFlags.CompressionEnabled) != 0);
         Assert.Equal(algorithm, ProtocolFrameCodec.GetCompressionAlgorithm(decoded.Value.Flags));
         Assert.Equal(payload, decoded.Value.Frame.Payload.ToArray());
+    }
+
+    [Fact]
+    public async Task FrameCodec_LeasedRead_UncompressedPayload_PreservesFields()
+    {
+        var payload = System.Text.Encoding.ASCII.GetBytes(new string('C', 1024));
+        var frame = new ProtocolFrame(FrameType.Data, 9, 15, payload);
+
+        await using var stream = new MemoryStream();
+        await ProtocolFrameCodec.WriteAsync(stream, frame, default, new ProtocolWriteOptions
+        {
+            Version = ProtocolConstants.Version,
+            EnableCompression = false
+        });
+
+        stream.Position = 0;
+        var leased = await ProtocolFrameCodec.ReadDetailedLeasedAsync(stream);
+
+        Assert.True(leased.HasValue);
+        using var lease = leased.Value;
+        Assert.Equal(ProtocolConstants.Version, lease.Version);
+        Assert.Equal(frame.Type, lease.Frame.Type);
+        Assert.Equal(frame.SessionId, lease.Frame.SessionId);
+        Assert.Equal(frame.Sequence, lease.Frame.Sequence);
+        Assert.True(MemoryMarshal.TryGetArray(lease.Frame.Payload, out var segment));
+        Assert.NotNull(segment.Array);
+        Assert.Equal(payload.Length, segment.Count);
+
+        var materialized = lease.Materialize();
+        Assert.Equal(payload, materialized.Frame.Payload.ToArray());
+    }
+
+    [Fact]
+    public async Task FrameCodec_LeasedRead_CompressedPayload_PreservesFields()
+    {
+        var payload = System.Text.Encoding.ASCII.GetBytes(new string('D', 4096));
+        var frame = new ProtocolFrame(FrameType.Data, 10, 16, payload);
+
+        await using var stream = new MemoryStream();
+        await ProtocolFrameCodec.WriteAsync(stream, frame, default, new ProtocolWriteOptions
+        {
+            Version = ProtocolConstants.Version,
+            EnableCompression = true,
+            CompressionMinBytes = 64,
+            CompressionMinSavingsBytes = 1
+        });
+
+        stream.Position = 0;
+        var leased = await ProtocolFrameCodec.ReadDetailedLeasedAsync(stream);
+
+        Assert.True(leased.HasValue);
+        using var lease = leased.Value;
+        Assert.Equal(ProtocolConstants.Version, lease.Version);
+        Assert.Equal(payload, lease.Frame.Payload.ToArray());
     }
 
     [Fact]

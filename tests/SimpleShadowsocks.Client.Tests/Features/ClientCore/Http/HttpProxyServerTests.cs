@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using SimpleShadowsocks.Client.Socks5;
+using SimpleShadowsocks.Client.Tunnel;
 using SimpleShadowsocks.Protocol;
 
 namespace SimpleShadowsocks.Client.Tests;
@@ -160,6 +161,150 @@ public sealed class HttpProxyServerTests
             "Connection: close\r\n\r\n");
 
         Assert.Contains("HTTP/1.1 501 Not Implemented", response.Head, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task HttpProxy_ViaTunnel_RelaysLongLivedChunkedStream_WithoutTimingOut()
+    {
+        await using var origin = await TestNetwork.StartStreamingHttpOriginServerAsync(_ =>
+            new TestNetwork.HttpStreamingOriginResponse(
+                200,
+                "OK",
+                [new HttpHeader("Content-Type", "text/event-stream")],
+                [
+                    new TestNetwork.HttpStreamingChunk(Encoding.UTF8.GetBytes(": keep-alive\n\n")),
+                    new TestNetwork.HttpStreamingChunk(Encoding.UTF8.GetBytes("data: one\n\n"), 2200),
+                    new TestNetwork.HttpStreamingChunk(Encoding.UTF8.GetBytes("data: two\n\n"), 2200),
+                    new TestNetwork.HttpStreamingChunk(Encoding.UTF8.GetBytes("data: three\n\n"), 2200)
+                ]));
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var proxy = await TestNetwork.StartHttpProxyServerAsync(
+            tunnel.Port,
+            connectionPolicy: new TunnelConnectionPolicy
+            {
+                HeartbeatIntervalSeconds = 1,
+                IdleTimeoutSeconds = 5,
+                ReconnectBaseDelayMs = 100,
+                ReconnectMaxDelayMs = 200,
+                ReconnectMaxAttempts = 5
+            });
+        await using var response = await TestNetwork.OpenStreamingHttpConnectionAsync(
+            proxy.Port,
+            $"GET http://127.0.0.1:{origin.Port}/events HTTP/1.1\r\n" +
+            "Host: stream.local\r\n" +
+            "Accept: text/event-stream\r\n" +
+            "Connection: close\r\n\r\n");
+
+        Assert.Contains("HTTP/1.1 200 OK", response.Head, StringComparison.Ordinal);
+        Assert.Contains("Content-Type: text/event-stream", response.Head, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(": keep-alive\n\n", await response.ReadUntilTextAsync(": keep-alive\n\n", CancellationToken.None), StringComparison.Ordinal);
+        Assert.Contains("data: one\n\n", await response.ReadUntilTextAsync("data: one\n\n", CancellationToken.None), StringComparison.Ordinal);
+        Assert.Contains("data: two\n\n", await response.ReadUntilTextAsync("data: two\n\n", CancellationToken.None), StringComparison.Ordinal);
+        Assert.Contains("data: three\n\n", await response.ReadUntilTextAsync("data: three\n\n", CancellationToken.None), StringComparison.Ordinal);
+        await response.ReadToEndTextAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task HttpProxy_ViaTunnel_CleansUpStreamingSession_WhenDownstreamDisconnects()
+    {
+        await using var origin = await TestNetwork.StartStreamingHttpOriginServerAsync(_ =>
+            new TestNetwork.HttpStreamingOriginResponse(
+                200,
+                "OK",
+                [new HttpHeader("Content-Type", "text/event-stream")],
+                [
+                    new TestNetwork.HttpStreamingChunk(Encoding.UTF8.GetBytes("data: first\n\n")),
+                    new TestNetwork.HttpStreamingChunk(Encoding.UTF8.GetBytes("data: second\n\n"), 2000),
+                    new TestNetwork.HttpStreamingChunk(Encoding.UTF8.GetBytes("data: third\n\n"), 2000)
+                ]));
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var proxy = await TestNetwork.StartHttpProxyServerAsync(tunnel.Port);
+        await using (var response = await TestNetwork.OpenStreamingHttpConnectionAsync(
+            proxy.Port,
+            $"GET http://127.0.0.1:{origin.Port}/cleanup HTTP/1.1\r\n" +
+            "Host: cleanup.local\r\n" +
+            "Connection: close\r\n\r\n"))
+        {
+            Assert.Contains("HTTP/1.1 200 OK", response.Head, StringComparison.Ordinal);
+            Assert.Contains("data: first\n\n", await response.ReadUntilTextAsync("data: first\n\n", CancellationToken.None), StringComparison.Ordinal);
+        }
+
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await TestNetwork.WaitForTunnelConnectionsAsync(() => proxy.Server.ActiveTunnelHttpSessionCount == 0, timeoutCts.Token);
+    }
+
+    [Fact]
+    public async Task HttpProxy_ViaTunnel_CleansUpStreamingSession_AfterTunnelFault()
+    {
+        await using var origin = await TestNetwork.StartStreamingHttpOriginServerAsync(_ =>
+            new TestNetwork.HttpStreamingOriginResponse(
+                200,
+                "OK",
+                [new HttpHeader("Content-Type", "text/event-stream")],
+                [
+                    new TestNetwork.HttpStreamingChunk(Encoding.UTF8.GetBytes("data: first\n\n")),
+                    new TestNetwork.HttpStreamingChunk(Encoding.UTF8.GetBytes("data: second\n\n"), 5000)
+                ]));
+        var tunnel = await TestNetwork.StartTunnelServerAsync();
+        var tunnelDisposed = false;
+        try
+        {
+            await using var proxy = await TestNetwork.StartHttpProxyServerAsync(
+                tunnel.Port,
+                connectionPolicy: new TunnelConnectionPolicy
+                {
+                    HeartbeatIntervalSeconds = 1,
+                    IdleTimeoutSeconds = 5,
+                    ReconnectBaseDelayMs = 100,
+                    ReconnectMaxDelayMs = 200,
+                    ReconnectMaxAttempts = 3
+                });
+            await using var response = await TestNetwork.OpenStreamingHttpConnectionAsync(
+                proxy.Port,
+                $"GET http://127.0.0.1:{origin.Port}/fault HTTP/1.1\r\n" +
+                "Host: fault.local\r\n" +
+                "Connection: close\r\n\r\n");
+
+            Assert.Contains("HTTP/1.1 200 OK", response.Head, StringComparison.Ordinal);
+            Assert.Contains("data: first\n\n", await response.ReadUntilTextAsync("data: first\n\n", CancellationToken.None), StringComparison.Ordinal);
+
+            await tunnel.DisposeAsync();
+            tunnelDisposed = true;
+
+            using var readTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var exception = await Record.ExceptionAsync(() => response.ReadUntilTextAsync("data: second\n\n", readTimeoutCts.Token));
+            Assert.NotNull(exception);
+
+            using var cleanupTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await TestNetwork.WaitForTunnelConnectionsAsync(() => proxy.Server.ActiveTunnelHttpSessionCount == 0, cleanupTimeoutCts.Token);
+        }
+        finally
+        {
+            if (!tunnelDisposed)
+            {
+                await tunnel.DisposeAsync();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task HttpProxy_RejectsWebSocketUpgradeRequest()
+    {
+        await using var origin = await TestNetwork.StartHttpOriginServerAsync();
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var proxy = await TestNetwork.StartHttpProxyServerAsync(tunnel.Port);
+
+        var response = await SendRawHttpRequestAsync(
+            proxy.Port,
+            $"GET http://127.0.0.1:{origin.Port}/socket HTTP/1.1\r\n" +
+            "Host: ws.local\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Sec-WebSocket-Version: 13\r\n" +
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+
+        Assert.Contains("HTTP/1.1 501 WebSocket Not Supported", response.Head, StringComparison.Ordinal);
+        Assert.Empty(origin.Requests);
     }
 
     private static async Task<(string Head, string BodyText)> SendRawHttpRequestAsync(int proxyPort, string requestText)
