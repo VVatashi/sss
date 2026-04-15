@@ -93,6 +93,29 @@ public sealed class HttpReverseProxyServerTests
     }
 
     [Fact]
+    public async Task HttpReverseProxy_ViaTunnel_TreatsOriginFormJsonLikeQuery_AsOriginForm()
+    {
+        await using var origin = await TestNetwork.StartHttpOriginServerAsync(request =>
+            new TestNetwork.HttpOriginResponse(200, "OK", [], Encoding.UTF8.GetBytes(request.PathAndQuery)));
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var reverseClient = await TestNetwork.StartHttpReverseProxyClientAsync(
+            tunnel,
+            [
+                new HttpReverseProxyTunnelHandler.Route("stream.local", "/connection", new Uri($"http://127.0.0.1:{origin.Port}/"), true)
+            ]);
+        await using var reverseProxy = await TestNetwork.StartHttpReverseProxyServerAsync(tunnel.Server);
+
+        var response = await TestNetwork.SendRawHttpRequestAsync(
+            reverseProxy.Port,
+            "GET /connection/sse?cf_connect=%7B%22connect%22:%7B%22token%22:%22abc.def%22,%22name%22:%22js%22%7D,%22id%22:47%7D HTTP/1.1\r\nHost: stream.local\r\nConnection: close\r\n\r\n");
+
+        Assert.Contains("HTTP/1.1 200 OK", response.Head, StringComparison.Ordinal);
+        var request = Assert.Single(origin.Requests);
+        Assert.StartsWith("/sse?cf_connect=", request.PathAndQuery, StringComparison.Ordinal);
+        Assert.DoesNotContain("%3F", request.PathAndQuery, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task HttpReverseProxy_ViaTunnel_DecodesDoubleEncodedRequestTarget()
     {
         await using var origin = await TestNetwork.StartHttpOriginServerAsync(request =>

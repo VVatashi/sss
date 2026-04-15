@@ -565,7 +565,8 @@ public sealed class HttpReverseProxyServer
 
         private static ParsedRequestTarget ParseRequestTarget(string decodedTarget, string? hostHeader)
         {
-            if (Uri.TryCreate(decodedTarget, UriKind.Absolute, out var absoluteUri))
+            if (IsAbsoluteFormTarget(decodedTarget)
+                && Uri.TryCreate(decodedTarget, UriKind.Absolute, out var absoluteUri))
             {
                 var absolutePath = string.IsNullOrEmpty(absoluteUri.AbsolutePath) ? "/" : absoluteUri.AbsolutePath;
                 var absoluteQuery = absoluteUri.Query;
@@ -589,6 +590,23 @@ public sealed class HttpReverseProxyServer
                 path,
                 query,
                 path + query);
+        }
+
+        private static bool IsAbsoluteFormTarget(string target)
+        {
+            if (string.IsNullOrWhiteSpace(target) || target[0] == '/' || target[0] == '*')
+            {
+                return false;
+            }
+
+            var schemeSeparatorIndex = target.IndexOf("://", StringComparison.Ordinal);
+            if (schemeSeparatorIndex <= 0)
+            {
+                return false;
+            }
+
+            var scheme = target[..schemeSeparatorIndex];
+            return Uri.CheckSchemeName(scheme);
         }
 
         private static void SplitPathAndQuery(string target, out string path, out string query)
