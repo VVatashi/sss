@@ -9,7 +9,7 @@ namespace SimpleShadowsocks.Client.Tests;
 public sealed class HttpReverseProxyServerTests
 {
     [Fact]
-    public async Task HttpReverseProxy_ViaTunnel_RelaysGetRequest_WithoutProxyDisclosureHeaders()
+    public async Task HttpReverseProxy_ViaTunnel_PreservesForwardingAndCustomHeaders()
     {
         await using var origin = await TestNetwork.StartHttpOriginServerAsync(request =>
             new TestNetwork.HttpOriginResponse(
@@ -33,6 +33,8 @@ public sealed class HttpReverseProxyServerTests
             "Via: should-be-stripped\r\n" +
             "Forwarded: for=1.2.3.4\r\n" +
             "X-Forwarded-For: 1.2.3.4\r\n" +
+            "X-Forwarded-Proto: https\r\n" +
+            "X-Custom-Reverse: keep-me\r\n" +
             "Connection: close\r\n\r\n");
 
         Assert.Contains("HTTP/1.1 200 OK", response.Head, StringComparison.Ordinal);
@@ -41,9 +43,11 @@ public sealed class HttpReverseProxyServerTests
         Assert.Equal("/hello", request.PathAndQuery);
         Assert.Equal("app.local", request.GetHeader("Host"));
         Assert.Equal("reverse-tests", request.GetHeader("User-Agent"));
-        Assert.Null(request.GetHeader("Via"));
-        Assert.Null(request.GetHeader("Forwarded"));
-        Assert.Null(request.GetHeader("X-Forwarded-For"));
+        Assert.Equal("should-be-stripped", request.GetHeader("Via"));
+        Assert.Equal("for=1.2.3.4", request.GetHeader("Forwarded"));
+        Assert.Equal("1.2.3.4", request.GetHeader("X-Forwarded-For"));
+        Assert.Equal("https", request.GetHeader("X-Forwarded-Proto"));
+        Assert.Equal("keep-me", request.GetHeader("X-Custom-Reverse"));
     }
 
     [Fact]

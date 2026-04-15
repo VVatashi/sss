@@ -20,12 +20,7 @@ public sealed class HttpReverseProxyTunnelHandler : ITunnelReverseHttpHandler
         "Trailer",
         "Transfer-Encoding",
         "Upgrade",
-        "Expect",
-        "Via",
-        "Forwarded",
-        "X-Forwarded-For",
-        "X-Forwarded-Host",
-        "X-Forwarded-Proto"
+        "Expect"
     };
 
     private readonly IReadOnlyList<Route> _routes;

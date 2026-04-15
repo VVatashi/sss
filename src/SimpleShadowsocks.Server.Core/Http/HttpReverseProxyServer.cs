@@ -21,12 +21,7 @@ public sealed class HttpReverseProxyServer
         "Trailer",
         "Transfer-Encoding",
         "Upgrade",
-        "Expect",
-        "Via",
-        "Forwarded",
-        "X-Forwarded-For",
-        "X-Forwarded-Host",
-        "X-Forwarded-Proto"
+        "Expect"
     };
 
     private readonly TcpListener _listener;

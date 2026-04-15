@@ -80,7 +80,7 @@ CLI-клиент, который:
 - применяет `TrafficRoutingRules` для SOCKS5 `CONNECT`, `UDP ASSOCIATE` и HTTP target host;
 - поддерживает локальную SOCKS5-аутентификацию;
 - для HTTP proxy использует server-side `HttpClient` и не добавляет `Via`/`Forwarded`/`X-Forwarded-*`.
-- для HTTP reverse proxy матчится по allowlist (`Host` и/или `PathPrefix`) и тоже не добавляет `Via`/`Forwarded`/`X-Forwarded-*`.
+- для HTTP reverse proxy матчится по allowlist (`Host` и/или `PathPrefix`), не синтезирует proxy disclosure headers самостоятельно и сохраняет входящие end-to-end headers, включая `Forwarded`, `Via`, `X-Forwarded-*` и кастомные заголовки.
 - на Windows поставляется вместе с `run-full-tunnel.ps1`, `wintun.dll` и `hev-socks5-tunnel.exe`.
 
 #### 3. `SimpleShadowsocks.Client.Maui`
@@ -560,7 +560,7 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 - HTTP proxy в `Direct` и `Tunnel` режимах;
 - HTTP reverse proxy server -> client -> local origin для `GET` и `POST`;
 - allowlist routing reverse proxy по `Host` и `PathPrefix`;
-- `POST`/body relay и отсутствие disclosure-заголовков (`Via`, `Forwarded`, `X-Forwarded-*`) на origin;
+- `POST`/body relay и сохранение входящих end-to-end headers (`Via`, `Forwarded`, `X-Forwarded-*`, кастомные заголовки) на origin для HTTP reverse proxy;
 - `403` при выключенном client reverse proxy и `404` при отсутствии matching reverse-route;
 - явные `501` для HTTP `CONNECT` и `https://` absolute-form;
 - long-lived chunked/SSE stream через HTTP forward и reverse proxy без premature timeout;
