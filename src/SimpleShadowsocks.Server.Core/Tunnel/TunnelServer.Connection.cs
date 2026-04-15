@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using SimpleShadowsocks.Protocol;
 using SimpleShadowsocks.Protocol.Crypto;
@@ -13,20 +12,7 @@ public sealed partial class TunnelServer
 {
     private const int RelayChunkSize = 64 * 1024;
 
-    private static byte[] DetachPayload(ReadOnlyMemory<byte> payload)
-    {
-        if (MemoryMarshal.TryGetArray(payload, out var segment)
-            && segment.Array is not null
-            && segment.Offset == 0
-            && segment.Count == segment.Array.Length)
-        {
-            return segment.Array;
-        }
-
-        return payload.ToArray();
-    }
-
-    public async Task<(uint SessionId, HttpResponseStart Response, ChannelReader<byte[]> Reader, Func<Task> CloseAsync)> ExecuteReverseHttpRequestAsync(
+    public async Task<(uint SessionId, HttpResponseStart Response, ChannelReader<OwnedPayloadChunk> Reader, Func<Task> CloseAsync)> ExecuteReverseHttpRequestAsync(
         HttpRequestStart requestStart,
         ReadOnlyMemory<byte> body,
         CancellationToken cancellationToken)
@@ -87,7 +73,7 @@ public sealed partial class TunnelServer
                 {
                     break;
                 }
-                using var leasedFrame = leasedFrameResult.Value;
+                using var leasedFrame = leasedFrameResult;
                 var frame = leasedFrame.Frame;
 
                 if (connectionVersion is null)
@@ -114,23 +100,8 @@ public sealed partial class TunnelServer
                 activeConnection.SetWriteOptions(writeOptions);
 
                 if (activeConnection.HasReverseHttpSession(frame.SessionId)
-                    && await TryHandleReverseHttpFrameAsync(activeConnection, leasedFrame.Materialize().Frame, cancellationToken))
+                    && await TryHandleReverseHttpFrameAsync(activeConnection, leasedFrame, cancellationToken))
                 {
-                    continue;
-                }
-
-                if (frame.Type is FrameType.Connect or FrameType.UdpAssociate or FrameType.HttpRequest)
-                {
-                    var materializedFrame = leasedFrame.Materialize().Frame;
-                    await HandleFrameAsync(
-                        secureStream,
-                        writeLock,
-                        sessions,
-                        pendingConnectSessions,
-                        materializedFrame,
-                        writeOptions,
-                        serverPolicy,
-                        cancellationToken);
                     continue;
                 }
 
@@ -177,9 +148,10 @@ public sealed partial class TunnelServer
 
     private async Task<bool> TryHandleReverseHttpFrameAsync(
         ActiveTunnelConnection connection,
-        ProtocolFrame frame,
+        ProtocolReadLease frameLease,
         CancellationToken cancellationToken)
     {
+        var frame = frameLease.Frame;
         if (!connection.TryGetReverseHttpSession(frame.SessionId, out var session))
         {
             return false;
@@ -214,7 +186,7 @@ public sealed partial class TunnelServer
 
                 if (!frame.Payload.IsEmpty)
                 {
-                    await session.ReaderWriter.Writer.WriteAsync(DetachPayload(frame.Payload), cancellationToken);
+                    await session.ReaderWriter.Writer.WriteAsync(frameLease.TransferPayload(), cancellationToken);
                 }
 
                 return true;
@@ -409,7 +381,7 @@ public sealed partial class TunnelServer
 
                 if (!frame.Payload.IsEmpty)
                 {
-                    await httpSession.RequestBody.WriteAsync(frame.Payload, cancellationToken);
+                    httpSession.RequestBody.Write(frame.Payload.Span);
                 }
 
                 if (ProtocolConstants.SupportsSelectiveRecovery(writeOptions.Version))
@@ -820,7 +792,7 @@ public sealed partial class TunnelServer
             _writeOptionsReady.TrySetResult(writeOptions);
         }
 
-        public async Task<(uint SessionId, HttpResponseStart Response, ChannelReader<byte[]> Reader)> ExecuteReverseHttpRequestAsync(
+        public async Task<(uint SessionId, HttpResponseStart Response, ChannelReader<OwnedPayloadChunk> Reader)> ExecuteReverseHttpRequestAsync(
             HttpRequestStart requestStart,
             ReadOnlyMemory<byte> body,
             CancellationToken cancellationToken)
@@ -943,6 +915,7 @@ public sealed partial class TunnelServer
             state.MarkClosed();
             state.Fail(error);
             state.ReaderWriter.Writer.TryComplete(error);
+            DisposePendingReverseHttpPayloads(state);
         }
 
         public void FailAllReverseHttpSessions(Exception error)
@@ -950,6 +923,14 @@ public sealed partial class TunnelServer
             foreach (var sessionId in _reverseHttpSessions.Keys.ToArray())
             {
                 FailReverseHttpSession(sessionId, error);
+            }
+        }
+
+        public void DisposePendingReverseHttpPayloads(ReverseHttpSessionState state)
+        {
+            while (state.ReaderWriter.Reader.TryRead(out var chunk))
+            {
+                chunk.Dispose();
             }
         }
     }
@@ -966,7 +947,7 @@ public sealed partial class TunnelServer
 
         public ReverseHttpSessionState()
         {
-            ReaderWriter = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(256)
+            ReaderWriter = Channel.CreateBounded<OwnedPayloadChunk>(new BoundedChannelOptions(256)
             {
                 SingleReader = true,
                 SingleWriter = true,
@@ -974,7 +955,7 @@ public sealed partial class TunnelServer
             });
         }
 
-        public Channel<byte[]> ReaderWriter { get; }
+        public Channel<OwnedPayloadChunk> ReaderWriter { get; }
 
         public ulong TakeNextSendSequence()
         {

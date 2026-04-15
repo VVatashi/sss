@@ -268,15 +268,19 @@ public sealed partial class TunnelServer
         };
 
         ByteArrayContent? content = null;
-        var bodyBytes = session.RequestBody.ToArray();
-        if (bodyBytes.Length > 0)
+        if (TryGetWrittenBuffer(session.RequestBody, out var bodySegment))
         {
-            content = new ByteArrayContent(bodyBytes);
+            content = new ByteArrayContent(bodySegment.Array!, bodySegment.Offset, bodySegment.Count);
             request.Content = content;
         }
 
         foreach (var header in SanitizeHeaders(start.Headers))
         {
+            if (header.Name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             if (header.Name.Equals("Host", StringComparison.OrdinalIgnoreCase))
             {
                 request.Headers.Host = header.Value;
@@ -291,6 +295,18 @@ public sealed partial class TunnelServer
         }
 
         return request;
+    }
+
+    private static bool TryGetWrittenBuffer(MemoryStream stream, out ArraySegment<byte> buffer)
+    {
+        if (stream.TryGetBuffer(out buffer) && buffer.Count > 0)
+        {
+            buffer = new ArraySegment<byte>(buffer.Array!, buffer.Offset, (int)stream.Length);
+            return true;
+        }
+
+        buffer = default;
+        return false;
     }
 
     private static HttpResponseStart BuildHttpResponseStart(HttpResponseMessage response)

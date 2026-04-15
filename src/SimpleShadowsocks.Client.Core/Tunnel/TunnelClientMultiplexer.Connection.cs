@@ -197,6 +197,7 @@ public sealed partial class TunnelClientMultiplexer
                     state.MarkClosed();
                     state.FailConnect(error);
                     state.ReaderWriter?.Writer.TryComplete(error);
+                    DisposePayloadChannel(state.ReaderWriter);
                     state.Dispose();
                     _sessions.TryRemove(sessionId, out _);
                     continue;
@@ -222,6 +223,7 @@ public sealed partial class TunnelClientMultiplexer
             state.MarkClosed();
             state.ReaderWriter?.Writer.TryComplete();
             state.UdpReaderWriter?.Writer.TryComplete();
+            DisposePayloadChannel(state.ReaderWriter);
             if (_connectionError is not null)
             {
                 state.FailConnect(_connectionError);

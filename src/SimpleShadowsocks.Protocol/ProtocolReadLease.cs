@@ -1,23 +1,37 @@
-using System.Buffers;
-using System.Runtime.InteropServices;
-
 namespace SimpleShadowsocks.Protocol;
 
-internal readonly struct ProtocolReadLease : IDisposable
+internal sealed class ProtocolReadLease : IDisposable
 {
-    private readonly byte[]? _pooledPayload;
+    private OwnedPayloadChunk? _ownedPayload;
 
-    public ProtocolReadLease(ProtocolFrame frame, byte version, byte flags, byte[]? pooledPayload)
+    public ProtocolReadLease(ProtocolFrame frame, byte version, byte flags, OwnedPayloadChunk? ownedPayload)
     {
         Frame = frame;
         Version = version;
         Flags = flags;
-        _pooledPayload = pooledPayload;
+        _ownedPayload = ownedPayload;
     }
 
     public ProtocolFrame Frame { get; }
     public byte Version { get; }
     public byte Flags { get; }
+
+    public OwnedPayloadChunk TransferPayload()
+    {
+        if (Frame.Payload.IsEmpty)
+        {
+            return OwnedPayloadChunk.Empty;
+        }
+
+        if (_ownedPayload is not null)
+        {
+            var ownedPayload = _ownedPayload;
+            _ownedPayload = null;
+            return ownedPayload;
+        }
+
+        return OwnedPayloadChunk.CopyFrom(Frame.Payload);
+    }
 
     public ProtocolReadResult Materialize()
     {
@@ -29,10 +43,8 @@ internal readonly struct ProtocolReadLease : IDisposable
 
     public void Dispose()
     {
-        if (_pooledPayload is not null)
-        {
-            ArrayPool<byte>.Shared.Return(_pooledPayload);
-        }
+        _ownedPayload?.Dispose();
+        _ownedPayload = null;
     }
 
     private byte[] MaterializePayload()
@@ -40,19 +52,6 @@ internal readonly struct ProtocolReadLease : IDisposable
         if (Frame.Payload.IsEmpty)
         {
             return Array.Empty<byte>();
-        }
-
-        if (_pooledPayload is not null)
-        {
-            return Frame.Payload.ToArray();
-        }
-
-        if (MemoryMarshal.TryGetArray(Frame.Payload, out var segment)
-            && segment.Array is not null
-            && segment.Offset == 0
-            && segment.Count == segment.Array.Length)
-        {
-            return segment.Array;
         }
 
         return Frame.Payload.ToArray();

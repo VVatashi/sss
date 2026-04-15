@@ -131,7 +131,7 @@ public sealed partial class TunnelClientMultiplexer
 
         if (!frame.Payload.IsEmpty)
         {
-            await session.RequestBody.WriteAsync(frame.Payload, cancellationToken);
+            session.RequestBody.Write(frame.Payload.Span);
         }
     }
 
@@ -163,7 +163,7 @@ public sealed partial class TunnelClientMultiplexer
         {
             response = _reverseHttpHandler is null
                 ? CreateSyntheticReverseHttpResponse(HttpStatusCode.Forbidden, "Forbidden")
-                : await _reverseHttpHandler.SendAsync(session.RequestStart, session.RequestBody.ToArray(), cancellationToken);
+                : await _reverseHttpHandler.SendAsync(session.RequestStart, GetWrittenMemory(session.RequestBody), cancellationToken);
 
             await SendFrameAsync(
                 new ProtocolFrame(
@@ -308,6 +308,16 @@ public sealed partial class TunnelClientMultiplexer
     private IncomingReverseHttpSession? RemoveIncomingReverseHttpSession(uint sessionId)
     {
         return _incomingReverseHttpSessions.TryRemove(sessionId, out var session) ? session : null;
+    }
+
+    private static ReadOnlyMemory<byte> GetWrittenMemory(MemoryStream stream)
+    {
+        if (stream.TryGetBuffer(out var buffer) && buffer.Array is not null && stream.Length > 0)
+        {
+            return buffer.Array.AsMemory(buffer.Offset, (int)stream.Length);
+        }
+
+        return stream.Length == 0 ? ReadOnlyMemory<byte>.Empty : stream.ToArray();
     }
 
     private static HttpResponseStart BuildHttpResponseStart(HttpResponseMessage response)

@@ -539,6 +539,18 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
 dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj --filter "Category=Performance"
 ```
 
+Целевой short perf-smoke для hot path без полного matrix:
+
+```powershell
+$env:SS_PERF_TOTAL_MB='16'
+$env:SS_PERF_CHUNK_KB='64'
+$env:SS_PERF_STREAMS='2'
+$env:SS_PERF_PAYLOAD_VARIANTS='64'
+$env:SS_PERF_CIPHERS='ChaCha20Poly1305'
+$env:SS_PERF_COMPRESSIONS='off'
+dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.csproj --filter "FullyQualifiedName~PerformanceMeasurementsTests.Measure_Throughput_And_Allocations_Matrix_MixedNoisePayload"
+```
+
 Что покрыто тестами:
 
 - SOCKS5 `CONNECT` в standalone и tunnel-режимах;
@@ -586,6 +598,8 @@ dotnet test tests\SimpleShadowsocks.Client.Tests\SimpleShadowsocks.Client.Tests.
    - `SimpleShadowsocks.Client`
    - `SimpleShadowsocks.Server`
    - `SimpleShadowsocks.Client.Maui`
+
+Внутренние streaming-path API для TCP и HTTP теперь используют `OwnedPayloadChunk` вместо сырых `byte[]` в `ChannelReader`. Это нужно для leased/pool-aware обработки payload без лишних копий. Любой consumer такого reader должен вызывать `Dispose()` на каждом chunk сразу после записи/обработки.
 
 Ключевые директории:
 

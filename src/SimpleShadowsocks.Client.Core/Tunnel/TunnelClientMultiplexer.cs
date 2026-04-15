@@ -88,7 +88,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         TouchIncoming();
     }
 
-    public async Task<(uint SessionId, byte ReplyCode, ChannelReader<byte[]> Reader)> OpenSessionAsync(
+    public async Task<(uint SessionId, byte ReplyCode, ChannelReader<OwnedPayloadChunk> Reader)> OpenSessionAsync(
         ConnectRequest connectRequest,
         CancellationToken cancellationToken)
     {
@@ -118,6 +118,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
             {
                 _sessions.TryRemove(sessionId, out _);
                 state.ReaderWriter.Writer.TryComplete();
+                DisposePayloadChannel(state.ReaderWriter);
                 state.Dispose();
                 StructuredLog.Warn("tunnel-client", "TUNNEL/TCP", $"session open rejected reply={replyCode}", sessionId);
             }
@@ -132,6 +133,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         {
             _sessions.TryRemove(sessionId, out _);
             state.ReaderWriter?.Writer.TryComplete();
+            DisposePayloadChannel(state.ReaderWriter);
             state.Dispose();
             throw;
         }
@@ -186,7 +188,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         }
     }
 
-    public async Task<(uint SessionId, HttpResponseStart Response, ChannelReader<byte[]> Reader)> ExecuteHttpRequestAsync(
+    public async Task<(uint SessionId, HttpResponseStart Response, ChannelReader<OwnedPayloadChunk> Reader)> ExecuteHttpRequestAsync(
         HttpRequestStart requestStart,
         ReadOnlyMemory<byte> body,
         CancellationToken cancellationToken)
@@ -254,6 +256,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
         {
             _sessions.TryRemove(sessionId, out _);
             state.ReaderWriter?.Writer.TryComplete();
+            DisposePayloadChannel(state.ReaderWriter);
             state.Dispose();
             throw;
         }
@@ -293,6 +296,7 @@ public sealed partial class TunnelClientMultiplexer : IAsyncDisposable
 
             state.ReaderWriter?.Writer.TryComplete();
             state.UdpReaderWriter?.Writer.TryComplete();
+            DisposePayloadChannel(state.ReaderWriter);
             state.Dispose();
             StructuredLog.Info(
                 "tunnel-client",

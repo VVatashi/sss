@@ -79,10 +79,10 @@ public sealed partial class TunnelIntegrationTests
             cts.Token);
         Assert.Equal((byte)0x00, replyCode);
 
-        var first = await reader.ReadAsync(cts.Token);
-        var second = await reader.ReadAsync(cts.Token);
-        Assert.Equal("hello", Encoding.ASCII.GetString(first));
-        Assert.Equal("world", Encoding.ASCII.GetString(second));
+        using var first = await reader.ReadAsync(cts.Token);
+        using var second = await reader.ReadAsync(cts.Token);
+        Assert.Equal("hello", Encoding.ASCII.GetString(first.Memory.Span));
+        Assert.Equal("world", Encoding.ASCII.GetString(second.Memory.Span));
 
         await serverTask;
         listener.Stop();
@@ -127,8 +127,8 @@ public sealed partial class TunnelIntegrationTests
         await multiplexer.SendDataAsync(sessionId, Encoding.ASCII.GetBytes("replay-me"), cts.Token);
         await replayObserved.Task.WaitAsync(cts.Token);
 
-        var echoed = await reader.ReadAsync(cts.Token);
-        Assert.Equal("replayed-ok", Encoding.ASCII.GetString(echoed));
+        using var echoed = await reader.ReadAsync(cts.Token);
+        Assert.Equal("replayed-ok", Encoding.ASCII.GetString(echoed.Memory.Span));
 
         cts.Cancel();
         try

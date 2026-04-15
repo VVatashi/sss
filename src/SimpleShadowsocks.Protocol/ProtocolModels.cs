@@ -1,3 +1,5 @@
+using System.Buffers;
+
 namespace SimpleShadowsocks.Protocol;
 
 public static class ProtocolConstants
@@ -94,4 +96,77 @@ public sealed class ProtocolWriteOptions
     public PayloadCompressionAlgorithm CompressionAlgorithm { get; init; } = PayloadCompressionAlgorithm.Deflate;
     public int CompressionMinBytes { get; init; } = 256;
     public int CompressionMinSavingsBytes { get; init; } = 16;
+}
+
+public sealed class OwnedPayloadChunk : IDisposable
+{
+    public static OwnedPayloadChunk Empty { get; } = new(Array.Empty<byte>(), 0, 0, pooled: false);
+
+    private byte[]? _buffer;
+    private readonly int _offset;
+
+    private OwnedPayloadChunk(byte[] buffer, int offset, int length, bool pooled)
+    {
+        _buffer = buffer;
+        _offset = offset;
+        Length = length;
+        IsPooled = pooled;
+    }
+
+    public int Length { get; }
+    public bool IsPooled { get; }
+    public bool IsEmpty => Length == 0;
+    public ReadOnlyMemory<byte> Memory => _buffer is null ? ReadOnlyMemory<byte>.Empty : _buffer.AsMemory(_offset, Length);
+
+    public static OwnedPayloadChunk CopyFrom(ReadOnlyMemory<byte> payload)
+    {
+        if (payload.IsEmpty)
+        {
+            return Empty;
+        }
+
+        var rented = ArrayPool<byte>.Shared.Rent(payload.Length);
+        payload.Span.CopyTo(rented.AsSpan(0, payload.Length));
+        return new OwnedPayloadChunk(rented, 0, payload.Length, pooled: true);
+    }
+
+    internal static OwnedPayloadChunk Wrap(byte[] buffer, int length, bool pooled)
+    {
+        return Wrap(buffer, 0, length, pooled);
+    }
+
+    internal static OwnedPayloadChunk Wrap(byte[] buffer, int offset, int length, bool pooled)
+    {
+        if (length == 0)
+        {
+            if (pooled)
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+
+            return Empty;
+        }
+
+        return new OwnedPayloadChunk(buffer, offset, length, pooled);
+    }
+
+    public byte[] ToArray()
+    {
+        return Memory.ToArray();
+    }
+
+    public void Dispose()
+    {
+        if (!IsPooled)
+        {
+            _buffer = null;
+            return;
+        }
+
+        var buffer = Interlocked.Exchange(ref _buffer, null);
+        if (buffer is not null)
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
 }

@@ -26,7 +26,7 @@ internal abstract class StreamPayloadCompressionCodec : IPayloadCompressionCodec
         }
     }
 
-    public byte[] Decompress(byte[] compressed, int compressedLength, int maxOutputLength)
+    public OwnedPayloadChunk Decompress(byte[] compressed, int compressedLength, int maxOutputLength)
     {
         var rented = ArrayPool<byte>.Shared.Rent(maxOutputLength);
         try
@@ -42,13 +42,16 @@ internal abstract class StreamPayloadCompressionCodec : IPayloadCompressionCodec
                 throw new InvalidDataException("Compressed payload cannot be decompressed.");
             }
 
-            var result = new byte[bytesWritten];
-            Buffer.BlockCopy(rented, 0, result, 0, bytesWritten);
+            var result = OwnedPayloadChunk.Wrap(rented, bytesWritten, pooled: true);
+            rented = null!;
             return result;
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rented);
+            if (rented is not null)
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
         }
     }
 

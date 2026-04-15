@@ -18,17 +18,19 @@ public sealed partial class TunnelClientMultiplexer
                     return;
                 }
 
-                var frameResult = await ProtocolFrameCodec.ReadDetailedAsync(_secureStream, cancellationToken);
-                if (frameResult is null)
+                var leasedFrame = await ProtocolFrameCodec.ReadDetailedLeasedAsync(_secureStream, cancellationToken);
+                if (leasedFrame is null)
                 {
                     break;
                 }
-                var frame = frameResult.Value.Frame;
 
-                if (frameResult.Value.Version != _protocolVersion)
+                using var frameLease = leasedFrame;
+                var frame = frameLease.Frame;
+
+                if (frameLease.Version != _protocolVersion)
                 {
                     throw new InvalidDataException(
-                        $"Protocol version mismatch: client expects v{_protocolVersion}, server replied with v{frameResult.Value.Version}.");
+                        $"Protocol version mismatch: client expects v{_protocolVersion}, server replied with v{frameLease.Version}.");
                 }
 
                 TouchIncoming();
@@ -136,7 +138,7 @@ public sealed partial class TunnelClientMultiplexer
                     case FrameType.Data:
                         if (state.ReaderWriter is not null)
                         {
-                            await state.ReaderWriter.Writer.WriteAsync(DetachPayload(frame.Payload), cancellationToken);
+                            await state.ReaderWriter.Writer.WriteAsync(frameLease.TransferPayload(), cancellationToken);
                         }
                         break;
 
@@ -177,6 +179,7 @@ public sealed partial class TunnelClientMultiplexer
                         state.ReaderWriter?.Writer.TryComplete();
                         state.UdpReaderWriter?.Writer.TryComplete();
                         _sessions.TryRemove(frame.SessionId, out _);
+                        state.Dispose();
                         StructuredLog.Info(
                             "tunnel-client",
                             state.IsUdp ? "TUNNEL/UDP" : state.IsHttp ? "TUNNEL/HTTP" : "TUNNEL/TCP",

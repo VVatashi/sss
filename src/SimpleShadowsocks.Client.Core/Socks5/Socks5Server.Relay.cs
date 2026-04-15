@@ -53,7 +53,7 @@ public sealed partial class Socks5Server
 
             uint sessionId;
             byte replyCode;
-            ChannelReader<byte[]> reader;
+            ChannelReader<OwnedPayloadChunk> reader;
             try
             {
                 (sessionId, replyCode, reader) = await multiplexer.OpenSessionAsync(connectRequest, cancellationToken);
@@ -119,7 +119,7 @@ public sealed partial class Socks5Server
     private static async Task RelayViaTunnelAsync(
         NetworkStream clientStream,
         TunnelClientMultiplexer multiplexer,
-        ChannelReader<byte[]> reader,
+        ChannelReader<OwnedPayloadChunk> reader,
         uint sessionId,
         CancellationToken cancellationToken)
     {
@@ -148,9 +148,12 @@ public sealed partial class Socks5Server
         {
             await foreach (var data in reader.ReadAllAsync(relayToken))
             {
-                if (data.Length > 0)
+                using (data)
                 {
-                    await clientStream.WriteAsync(data, relayToken);
+                    if (data.Length > 0)
+                    {
+                        await clientStream.WriteAsync(data.Memory, relayToken);
+                    }
                 }
             }
         }, relayToken);

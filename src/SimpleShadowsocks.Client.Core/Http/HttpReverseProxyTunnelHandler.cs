@@ -102,6 +102,11 @@ public sealed class HttpReverseProxyTunnelHandler : ITunnelReverseHttpHandler
 
         foreach (var header in SanitizeHeaders(requestStart.Headers))
         {
+            if (header.Name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             if (header.Name.Equals("Host", StringComparison.OrdinalIgnoreCase))
             {
                 message.Headers.Host = header.Value;

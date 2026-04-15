@@ -44,7 +44,7 @@ public sealed partial class TunnelClientMultiplexer
         public bool IsResumable => !IsHttp;
         public ConnectRequest? ConnectRequest { get; }
         public HttpRequestStart? HttpRequestStart { get; }
-        public Channel<byte[]>? ReaderWriter { get; }
+        public Channel<OwnedPayloadChunk>? ReaderWriter { get; }
         public Channel<UdpDatagram>? UdpReaderWriter { get; }
 
         public SessionState(ConnectRequest connectRequest, int receiveChannelCapacity)
@@ -52,7 +52,7 @@ public sealed partial class TunnelClientMultiplexer
             Kind = SessionKind.Tcp;
             IsUdp = false;
             ConnectRequest = connectRequest;
-            ReaderWriter = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(receiveChannelCapacity)
+            ReaderWriter = Channel.CreateBounded<OwnedPayloadChunk>(new BoundedChannelOptions(receiveChannelCapacity)
             {
                 SingleReader = true,
                 SingleWriter = true,
@@ -77,7 +77,7 @@ public sealed partial class TunnelClientMultiplexer
             Kind = SessionKind.Http;
             IsUdp = false;
             HttpRequestStart = httpRequestStart;
-            ReaderWriter = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(receiveChannelCapacity)
+            ReaderWriter = Channel.CreateBounded<OwnedPayloadChunk>(new BoundedChannelOptions(receiveChannelCapacity)
             {
                 SingleReader = true,
                 SingleWriter = true,
@@ -528,6 +528,19 @@ public sealed partial class TunnelClientMultiplexer
             {
                 ArrayPool<byte>.Shared.Return(_buffer);
             }
+        }
+    }
+
+    private static void DisposePayloadChannel(Channel<OwnedPayloadChunk>? channel)
+    {
+        if (channel is null)
+        {
+            return;
+        }
+
+        while (channel.Reader.TryRead(out var chunk))
+        {
+            chunk.Dispose();
         }
     }
 }

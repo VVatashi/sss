@@ -238,20 +238,23 @@ public sealed class HttpReverseProxyServer
 
         await foreach (var chunk in response.ReadBodyAsync(cancellationToken))
         {
-            if (chunk.IsEmpty)
+            using (chunk)
             {
-                continue;
-            }
+                if (chunk.IsEmpty)
+                {
+                    continue;
+                }
 
-            if (useChunked)
-            {
-                await stream.WriteAsync(Encoding.ASCII.GetBytes($"{chunk.Length:X}\r\n"), cancellationToken);
-            }
+                if (useChunked)
+                {
+                    await stream.WriteAsync(Encoding.ASCII.GetBytes($"{chunk.Length:X}\r\n"), cancellationToken);
+                }
 
-            await stream.WriteAsync(chunk, cancellationToken);
-            if (useChunked)
-            {
-                await stream.WriteAsync("\r\n"u8.ToArray(), cancellationToken);
+                await stream.WriteAsync(chunk.Memory, cancellationToken);
+                if (useChunked)
+                {
+                    await stream.WriteAsync("\r\n"u8.ToArray(), cancellationToken);
+                }
             }
         }
 
@@ -275,7 +278,7 @@ public sealed class HttpReverseProxyServer
 
     private sealed class ProxyExecutionResponse : IAsyncDisposable
     {
-        private readonly Func<CancellationToken, IAsyncEnumerable<ReadOnlyMemory<byte>>> _bodyFactory;
+        private readonly Func<CancellationToken, IAsyncEnumerable<OwnedPayloadChunk>> _bodyFactory;
         private readonly Func<ValueTask> _disposeAsync;
 
         private ProxyExecutionResponse(
@@ -283,7 +286,7 @@ public sealed class HttpReverseProxyServer
             string reasonPhrase,
             IReadOnlyList<HttpHeader> headers,
             bool closeConnection,
-            Func<CancellationToken, IAsyncEnumerable<ReadOnlyMemory<byte>>> bodyFactory,
+            Func<CancellationToken, IAsyncEnumerable<OwnedPayloadChunk>> bodyFactory,
             Func<ValueTask> disposeAsync)
         {
             StatusCode = statusCode;
@@ -312,7 +315,7 @@ public sealed class HttpReverseProxyServer
 
         public static ProxyExecutionResponse ForTunnel(
             HttpResponseStart response,
-            ChannelReader<byte[]> reader,
+            ChannelReader<OwnedPayloadChunk> reader,
             Func<Task> closeAsync)
         {
             return new ProxyExecutionResponse(
@@ -324,7 +327,7 @@ public sealed class HttpReverseProxyServer
                 () => new ValueTask(closeAsync()));
         }
 
-        public async IAsyncEnumerable<ReadOnlyMemory<byte>> ReadBodyAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+        public async IAsyncEnumerable<OwnedPayloadChunk> ReadBodyAsync([EnumeratorCancellation] CancellationToken cancellationToken)
         {
             await foreach (var chunk in _bodyFactory(cancellationToken).WithCancellation(cancellationToken))
             {
@@ -364,8 +367,8 @@ public sealed class HttpReverseProxyServer
 
         public ValueTask DisposeAsync() => _disposeAsync();
 
-        private static async IAsyncEnumerable<ReadOnlyMemory<byte>> ReadChannelBodyAsync(
-            ChannelReader<byte[]> reader,
+        private static async IAsyncEnumerable<OwnedPayloadChunk> ReadChannelBodyAsync(
+            ChannelReader<OwnedPayloadChunk> reader,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             await foreach (var chunk in reader.ReadAllAsync(cancellationToken))
@@ -374,7 +377,7 @@ public sealed class HttpReverseProxyServer
             }
         }
 
-        private static async IAsyncEnumerable<ReadOnlyMemory<byte>> EmptyBodyAsync()
+        private static async IAsyncEnumerable<OwnedPayloadChunk> EmptyBodyAsync()
         {
             await Task.CompletedTask;
             yield break;

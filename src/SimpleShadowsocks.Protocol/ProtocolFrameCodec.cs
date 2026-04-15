@@ -171,106 +171,15 @@ public static class ProtocolFrameCodec
         Stream stream,
         CancellationToken cancellationToken = default)
     {
-        if (stream is null)
+        var leased = await ReadDetailedLeasedAsync(stream, cancellationToken);
+        if (leased is null)
         {
-            throw new ArgumentNullException(nameof(stream));
+            return null;
         }
 
-        var header = ArrayPool<byte>.Shared.Rent(ProtocolConstants.HeaderSize);
-        try
+        using (leased)
         {
-            var versionRead = await ReadExactlyOrToEndAsync(stream, header, 1, cancellationToken);
-            if (versionRead == 0)
-            {
-                return null;
-            }
-
-            var version = header[0];
-            int expectedHeaderLength;
-            if (version == ProtocolConstants.LegacyVersion)
-            {
-                expectedHeaderLength = ProtocolConstants.HeaderSizeV1;
-            }
-            else if (ProtocolConstants.UsesExtendedHeader(version))
-            {
-                expectedHeaderLength = ProtocolConstants.HeaderSizeV2;
-            }
-            else
-            {
-                throw new InvalidDataException($"Unsupported frame version: {version}.");
-            }
-
-            var headerRead = await ReadExactlyOrToEndAsync(
-                stream,
-                header,
-                offset: 1,
-                length: expectedHeaderLength - 1,
-                cancellationToken);
-            if (headerRead != expectedHeaderLength - 1)
-            {
-                throw new EndOfStreamException("Unexpected end of stream while reading frame header.");
-            }
-
-            var headerSpan = header.AsSpan(0, expectedHeaderLength);
-            var frameType = (FrameType)headerSpan[1];
-            if (!Enum.IsDefined(frameType))
-            {
-                throw new InvalidDataException($"Unsupported frame type: {(byte)frameType}.");
-            }
-
-            byte flags;
-            uint sessionId;
-            ulong sequence;
-            uint payloadLength;
-            if (version == ProtocolConstants.LegacyVersion)
-            {
-                flags = ProtocolFlags.None;
-                sessionId = BinaryPrimitives.ReadUInt32BigEndian(headerSpan.Slice(2, 4));
-                sequence = BinaryPrimitives.ReadUInt64BigEndian(headerSpan.Slice(6, 8));
-                payloadLength = BinaryPrimitives.ReadUInt32BigEndian(headerSpan.Slice(14, 4));
-            }
-            else
-            {
-                flags = headerSpan[2];
-                sessionId = BinaryPrimitives.ReadUInt32BigEndian(headerSpan.Slice(3, 4));
-                sequence = BinaryPrimitives.ReadUInt64BigEndian(headerSpan.Slice(7, 8));
-                payloadLength = BinaryPrimitives.ReadUInt32BigEndian(headerSpan.Slice(15, 4));
-            }
-
-            if (payloadLength > ProtocolConstants.MaxPayloadLength)
-            {
-                throw new InvalidDataException($"Frame payload too large: {payloadLength}.");
-            }
-
-            byte[] payload;
-            if (payloadLength == 0)
-            {
-                payload = Array.Empty<byte>();
-            }
-            else if ((flags & ProtocolFlags.PayloadCompressed) != 0)
-            {
-                var compressed = ArrayPool<byte>.Shared.Rent((int)payloadLength);
-                try
-                {
-                    await ReadExactlyAsync(stream, compressed, (int)payloadLength, cancellationToken);
-                    payload = DecompressPayload(compressed, (int)payloadLength, flags);
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(compressed);
-                }
-            }
-            else
-            {
-                payload = new byte[payloadLength];
-                await ReadExactlyAsync(stream, payload, cancellationToken);
-            }
-
-            return new ProtocolReadResult(new ProtocolFrame(frameType, sessionId, sequence, payload), version, flags);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(header);
+            return leased.Materialize();
         }
     }
 
@@ -349,7 +258,7 @@ public static class ProtocolFrameCodec
                 throw new InvalidDataException($"Frame payload too large: {payloadLength}.");
             }
 
-            byte[]? pooledPayload = null;
+            OwnedPayloadChunk? ownedPayload = null;
             ReadOnlyMemory<byte> payload;
             if (payloadLength == 0)
             {
@@ -361,7 +270,8 @@ public static class ProtocolFrameCodec
                 try
                 {
                     await ReadExactlyAsync(stream, compressed, (int)payloadLength, cancellationToken);
-                    payload = DecompressPayload(compressed, (int)payloadLength, flags);
+                    ownedPayload = DecompressPayload(compressed, (int)payloadLength, flags);
+                    payload = ownedPayload.Memory;
                 }
                 finally
                 {
@@ -370,11 +280,12 @@ public static class ProtocolFrameCodec
             }
             else
             {
-                pooledPayload = ArrayPool<byte>.Shared.Rent((int)payloadLength);
+                var pooledPayload = ArrayPool<byte>.Shared.Rent((int)payloadLength);
                 try
                 {
                     await ReadExactlyAsync(stream, pooledPayload, (int)payloadLength, cancellationToken);
-                    payload = pooledPayload.AsMemory(0, (int)payloadLength);
+                    ownedPayload = OwnedPayloadChunk.Wrap(pooledPayload, (int)payloadLength, pooled: true);
+                    payload = ownedPayload.Memory;
                 }
                 catch
                 {
@@ -387,7 +298,7 @@ public static class ProtocolFrameCodec
                 new ProtocolFrame(frameType, sessionId, sequence, payload),
                 version,
                 flags,
-                pooledPayload);
+                ownedPayload);
         }
         finally
         {
@@ -490,7 +401,7 @@ public static class ProtocolFrameCodec
         return EncodedPayload.FromPooled(rented, bytesWritten, flags);
     }
 
-    private static byte[] DecompressPayload(byte[] compressed, int compressedLength, byte flags)
+    private static OwnedPayloadChunk DecompressPayload(byte[] compressed, int compressedLength, byte flags)
     {
         var algorithm = PayloadCompressionCodecFactory.FromFlags(flags);
         var codec = PayloadCompressionCodecFactory.Resolve(algorithm);

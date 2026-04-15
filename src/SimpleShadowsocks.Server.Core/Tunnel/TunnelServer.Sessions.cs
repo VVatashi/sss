@@ -26,7 +26,7 @@ public sealed partial class TunnelServer
     {
         return SendFrameLockedAsync(
             stream,
-            new ProtocolFrame(FrameType.Connect, sessionId, 0, new[] { replyCode }),
+            new ProtocolFrame(FrameType.Connect, sessionId, 0, ProtocolPayloadSerializer.SerializeSingleByte(replyCode)),
             writeLock,
             writeOptions,
             cancellationToken);
@@ -42,7 +42,7 @@ public sealed partial class TunnelServer
     {
         return SendFrameLockedAsync(
             stream,
-            new ProtocolFrame(FrameType.UdpAssociate, sessionId, 0, new[] { replyCode }),
+            new ProtocolFrame(FrameType.UdpAssociate, sessionId, 0, ProtocolPayloadSerializer.SerializeSingleByte(replyCode)),
             writeLock,
             writeOptions,
             cancellationToken);

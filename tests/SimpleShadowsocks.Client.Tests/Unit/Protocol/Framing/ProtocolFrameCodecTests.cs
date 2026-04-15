@@ -149,8 +149,8 @@ public sealed class ProtocolFrameCodecTests
         stream.Position = 0;
         var leased = await ProtocolFrameCodec.ReadDetailedLeasedAsync(stream);
 
-        Assert.True(leased.HasValue);
-        using var lease = leased.Value;
+        Assert.NotNull(leased);
+        using var lease = leased;
         Assert.Equal(ProtocolConstants.Version, lease.Version);
         Assert.Equal(frame.Type, lease.Frame.Type);
         Assert.Equal(frame.SessionId, lease.Frame.SessionId);
@@ -181,10 +181,66 @@ public sealed class ProtocolFrameCodecTests
         stream.Position = 0;
         var leased = await ProtocolFrameCodec.ReadDetailedLeasedAsync(stream);
 
-        Assert.True(leased.HasValue);
-        using var lease = leased.Value;
+        Assert.NotNull(leased);
+        using var lease = leased;
         Assert.Equal(ProtocolConstants.Version, lease.Version);
         Assert.Equal(payload, lease.Frame.Payload.ToArray());
+    }
+
+    [Fact]
+    public async Task FrameCodec_LeasedRead_TransferPayload_PreservesData()
+    {
+        var payload = System.Text.Encoding.ASCII.GetBytes(new string('E', 1024));
+
+        await using var stream = new MemoryStream();
+        await ProtocolFrameCodec.WriteAsync(stream, new ProtocolFrame(FrameType.Data, 11, 17, payload), default, new ProtocolWriteOptions
+        {
+            Version = ProtocolConstants.Version,
+            EnableCompression = false
+        });
+
+        stream.Position = 0;
+        var lease = await ProtocolFrameCodec.ReadDetailedLeasedAsync(stream);
+
+        Assert.NotNull(lease);
+        using (lease)
+        {
+            var transferred = lease.TransferPayload();
+            using (transferred)
+            {
+                Assert.Equal(payload, transferred.Memory.ToArray());
+                var materialized = lease.Materialize();
+                Assert.Equal(payload, materialized.Frame.Payload.ToArray());
+            }
+        }
+    }
+
+    [Fact]
+    public async Task FrameCodec_LeasedRead_TransferPayload_CompressedPayload_PreservesData()
+    {
+        var payload = System.Text.Encoding.ASCII.GetBytes(new string('F', 4096));
+
+        await using var stream = new MemoryStream();
+        await ProtocolFrameCodec.WriteAsync(stream, new ProtocolFrame(FrameType.Data, 12, 18, payload), default, new ProtocolWriteOptions
+        {
+            Version = ProtocolConstants.Version,
+            EnableCompression = true,
+            CompressionMinBytes = 64,
+            CompressionMinSavingsBytes = 1
+        });
+
+        stream.Position = 0;
+        var lease = await ProtocolFrameCodec.ReadDetailedLeasedAsync(stream);
+
+        Assert.NotNull(lease);
+        using (lease)
+        {
+            var transferred = lease.TransferPayload();
+            using (transferred)
+            {
+                Assert.Equal(payload, transferred.Memory.ToArray());
+            }
+        }
     }
 
     [Fact]

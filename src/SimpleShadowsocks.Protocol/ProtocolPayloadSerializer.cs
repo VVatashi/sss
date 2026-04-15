@@ -44,7 +44,9 @@ public static class ProtocolPayloadSerializer
         return new ConnectRequest(addressType, address, port);
     }
 
-    public static byte[] SerializeClose(byte reasonCode) => SingleBytePayloadCache[reasonCode];
+    public static byte[] SerializeSingleByte(byte value) => SingleBytePayloadCache[value];
+
+    public static byte[] SerializeClose(byte reasonCode) => SerializeSingleByte(reasonCode);
 
     public static byte DeserializeClose(ReadOnlySpan<byte> payload)
     {

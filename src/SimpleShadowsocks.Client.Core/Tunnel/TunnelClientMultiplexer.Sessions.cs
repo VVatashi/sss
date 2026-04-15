@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using SimpleShadowsocks.Protocol;
 
@@ -6,26 +5,6 @@ namespace SimpleShadowsocks.Client.Tunnel;
 
 public sealed partial class TunnelClientMultiplexer
 {
-    private static byte[] DetachPayload(ReadOnlyMemory<byte> payload)
-    {
-        return TryGetWholeArray(payload, out var array) ? array : payload.ToArray();
-    }
-
-    private static bool TryGetWholeArray(ReadOnlyMemory<byte> payload, out byte[] array)
-    {
-        if (MemoryMarshal.TryGetArray(payload, out var segment)
-            && segment.Array is not null
-            && segment.Offset == 0
-            && segment.Count == segment.Array.Length)
-        {
-            array = segment.Array;
-            return true;
-        }
-
-        array = Array.Empty<byte>();
-        return false;
-    }
-
     private async Task<byte> ConnectSessionAsync(
         uint sessionId,
         SessionState state,
@@ -80,6 +59,8 @@ public sealed partial class TunnelClientMultiplexer
                 state.FailConnect(new IOException("HTTP session cannot be resumed after reconnect."));
                 state.ReaderWriter?.Writer.TryComplete(new IOException("HTTP session cannot be resumed after reconnect."));
                 _sessions.TryRemove(sessionId, out _);
+                DisposePayloadChannel(state.ReaderWriter);
+                state.Dispose();
                 continue;
             }
 
@@ -105,6 +86,8 @@ public sealed partial class TunnelClientMultiplexer
                 state.UdpReaderWriter?.Writer.TryComplete(
                     new IOException($"Session resume failed with remote reply code {replyCode}."));
                 _sessions.TryRemove(sessionId, out _);
+                DisposePayloadChannel(state.ReaderWriter);
+                state.Dispose();
                 continue;
             }
 
