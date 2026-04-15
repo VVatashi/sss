@@ -70,6 +70,29 @@ public sealed class HttpReverseProxyServerTests
     }
 
     [Fact]
+    public async Task HttpReverseProxy_ViaTunnel_RelaysSseQuery_WithoutEncodingQuerySeparator()
+    {
+        await using var origin = await TestNetwork.StartHttpOriginServerAsync(request =>
+            new TestNetwork.HttpOriginResponse(200, "OK", [], Encoding.UTF8.GetBytes(request.PathAndQuery)));
+        await using var tunnel = await TestNetwork.StartTunnelServerAsync();
+        await using var reverseClient = await TestNetwork.StartHttpReverseProxyClientAsync(
+            tunnel,
+            [
+                new HttpReverseProxyTunnelHandler.Route("stream.local", "/connection", new Uri($"http://127.0.0.1:{origin.Port}/"), true)
+            ]);
+        await using var reverseProxy = await TestNetwork.StartHttpReverseProxyServerAsync(tunnel.Server);
+
+        var response = await TestNetwork.SendRawHttpRequestAsync(
+            reverseProxy.Port,
+            "GET /connection/sse?cf_connect=%7B%22connect%22%3A1%7D HTTP/1.1\r\nHost: stream.local\r\nConnection: close\r\n\r\n");
+
+        Assert.Contains("HTTP/1.1 200 OK", response.Head, StringComparison.Ordinal);
+        Assert.Equal("/sse?cf_connect=%7B%22connect%22:1%7D", response.BodyText);
+        var request = Assert.Single(origin.Requests);
+        Assert.Equal("/sse?cf_connect=%7B%22connect%22:1%7D", request.PathAndQuery);
+    }
+
+    [Fact]
     public async Task HttpReverseProxy_ViaTunnel_DecodesDoubleEncodedRequestTarget()
     {
         await using var origin = await TestNetwork.StartHttpOriginServerAsync(request =>

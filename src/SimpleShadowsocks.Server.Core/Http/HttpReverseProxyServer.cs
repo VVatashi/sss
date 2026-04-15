@@ -118,7 +118,7 @@ public sealed class HttpReverseProxyServer
             StructuredLog.Info(
                 "http-reverse-proxy",
                 "HTTP",
-                $"{request.Method} rawTarget={request.RawTarget} decodedTarget={request.DecodedTarget} parsedPathAndQuery={request.PathAndQuery} hostHeader={request.HostHeader ?? "<none>"} scheme={request.Scheme} authority={request.Authority}");
+                $"{request.Method} rawTarget={SummarizeForLog(request.RawTarget)} decodedTarget={SummarizeForLog(request.DecodedTarget)} parsedPath={request.Path} hasQuery={request.HasQuery} queryLength={request.Query.Length} queryPreview={SummarizeForLog(request.Query, 96)} hostHeader={request.HostHeader ?? "<none>"} scheme={request.Scheme} authority={request.Authority}");
             if (request.IsConnect || string.Equals(request.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
             {
                 await WriteSimpleResponseAsync(stream, 501, "Not Implemented", closeConnection: true, cancellationToken);
@@ -279,6 +279,16 @@ public sealed class HttpReverseProxyServer
         await stream.WriteAsync(payload, cancellationToken);
     }
 
+    private static string SummarizeForLog(string value, int maxLength = 160)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return $"{value[..maxLength]}...(len={value.Length})";
+    }
+
     private sealed class ProxyExecutionResponse : IAsyncDisposable
     {
         private readonly Func<CancellationToken, IAsyncEnumerable<OwnedPayloadChunk>> _bodyFactory;
@@ -395,6 +405,8 @@ public sealed class HttpReverseProxyServer
             string decodedTarget,
             string scheme,
             string authority,
+            string path,
+            string query,
             string pathAndQuery,
             string? hostHeader,
             Version version,
@@ -410,6 +422,8 @@ public sealed class HttpReverseProxyServer
             DecodedTarget = decodedTarget;
             Scheme = scheme;
             Authority = authority;
+            Path = path;
+            Query = query;
             PathAndQuery = pathAndQuery;
             HostHeader = hostHeader;
             Version = version;
@@ -426,6 +440,9 @@ public sealed class HttpReverseProxyServer
         public string DecodedTarget { get; }
         public string Scheme { get; }
         public string Authority { get; }
+        public string Path { get; }
+        public string Query { get; }
+        public bool HasQuery => Query.Length > 0;
         public string PathAndQuery { get; }
         public string? HostHeader { get; }
         public Version Version { get; }
@@ -484,29 +501,9 @@ public sealed class HttpReverseProxyServer
             var version = Version.Parse(requestLine[2][5..]);
             var headers = ParseHeaders(lines.Skip(1).TakeWhile(static line => line.Length > 0));
             var host = headers.FirstOrDefault(static h => h.Name.Equals("Host", StringComparison.OrdinalIgnoreCase)).Value;
+            var parsedTarget = ParseRequestTarget(normalizedTargetText, host);
 
-            string scheme;
-            string authority;
-            string pathAndQuery;
-            if (Uri.TryCreate(normalizedTargetText, UriKind.Absolute, out var absoluteUri))
-            {
-                scheme = absoluteUri.Scheme;
-                authority = absoluteUri.Authority;
-                pathAndQuery = string.IsNullOrEmpty(absoluteUri.PathAndQuery) ? "/" : absoluteUri.PathAndQuery;
-            }
-            else
-            {
-                if (string.IsNullOrWhiteSpace(host))
-                {
-                    throw new InvalidDataException("Reverse proxy requires Host header.");
-                }
-
-                scheme = Uri.UriSchemeHttp;
-                authority = host;
-                pathAndQuery = string.IsNullOrWhiteSpace(normalizedTargetText) ? "/" : normalizedTargetText;
-            }
-
-            var sanitizedHeaders = SanitizeHeaders(headers, authority);
+            var sanitizedHeaders = SanitizeHeaders(headers, parsedTarget.Authority);
             var isWebSocketUpgrade = IsWebSocketUpgradeRequest(headers);
             var expectContinue = headers.Any(static h => h.Name.Equals("Expect", StringComparison.OrdinalIgnoreCase)
                 && h.Value.Contains("100-continue", StringComparison.OrdinalIgnoreCase));
@@ -520,9 +517,11 @@ public sealed class HttpReverseProxyServer
                 method,
                 targetText,
                 normalizedTargetText,
-                scheme,
-                authority,
-                pathAndQuery,
+                parsedTarget.Scheme,
+                parsedTarget.Authority,
+                parsedTarget.Path,
+                parsedTarget.Query,
+                parsedTarget.PathAndQuery,
                 host,
                 version,
                 headers,
@@ -563,6 +562,56 @@ public sealed class HttpReverseProxyServer
 
             return decodedTarget;
         }
+
+        private static ParsedRequestTarget ParseRequestTarget(string decodedTarget, string? hostHeader)
+        {
+            if (Uri.TryCreate(decodedTarget, UriKind.Absolute, out var absoluteUri))
+            {
+                var absolutePath = string.IsNullOrEmpty(absoluteUri.AbsolutePath) ? "/" : absoluteUri.AbsolutePath;
+                var absoluteQuery = absoluteUri.Query;
+                return new ParsedRequestTarget(
+                    absoluteUri.Scheme,
+                    absoluteUri.Authority,
+                    absolutePath,
+                    absoluteQuery,
+                    absolutePath + absoluteQuery);
+            }
+
+            if (string.IsNullOrWhiteSpace(hostHeader))
+            {
+                throw new InvalidDataException("Reverse proxy requires Host header.");
+            }
+
+            SplitPathAndQuery(decodedTarget, out var path, out var query);
+            return new ParsedRequestTarget(
+                Uri.UriSchemeHttp,
+                hostHeader,
+                path,
+                query,
+                path + query);
+        }
+
+        private static void SplitPathAndQuery(string target, out string path, out string query)
+        {
+            var normalizedTarget = string.IsNullOrWhiteSpace(target) ? "/" : target;
+            var queryIndex = normalizedTarget.IndexOf('?');
+            if (queryIndex < 0)
+            {
+                path = normalizedTarget;
+                query = string.Empty;
+                return;
+            }
+
+            path = queryIndex == 0 ? "/" : normalizedTarget[..queryIndex];
+            query = normalizedTarget[queryIndex..];
+        }
+
+        private readonly record struct ParsedRequestTarget(
+            string Scheme,
+            string Authority,
+            string Path,
+            string Query,
+            string PathAndQuery);
 
         private static bool IsWebSocketUpgradeRequest(IReadOnlyList<HttpHeader> headers)
         {

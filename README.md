@@ -345,10 +345,10 @@ SimpleShadowsocks.Client.exe [listenPort] [remoteHost] [remotePort] [sharedKey]
 - long-lived HTTP streaming и `SSE` поддерживаются; для очень длинных idle-period origin лучше отправлять периодические heartbeat-комментарии (`: ping\n\n`);
 - активный long-lived HTTP stream не мигрирует через reconnect туннеля: текущее соединение завершается, клиент/приложение должны открыть его заново;
 - WebSocket upgrade (`101 Switching Protocols`) не поддерживается и отклоняется на входе;
-- серверный reverse-listener логирует `rawTarget`, `decodedTarget`, `parsedPathAndQuery`, `hostHeader`, `scheme` и `authority`, чтобы было видно, если upstream прислал перекодированный request-target;
+- серверный reverse-listener логирует `rawTarget`, `decodedTarget`, `parsedPath`, `hasQuery`, `queryLength`, `queryPreview`, `hostHeader`, `scheme` и `authority`, чтобы длинные query вроде SSE token не терялись в обрезанном логе;
 - если маршрут не найден, клиент возвращает `404 Not Found`;
 - если на клиенте reverse proxy не включён, сервер получит `403 Forbidden`;
-- если перед `SimpleShadowsocks.Server` стоит внешний reverse proxy / ingress и он шлёт double-encoded request-target, серверный reverse-listener теперь безусловно декодирует весь target до двух проходов перед маршрутизацией и отправкой в tunnel;
+- для origin-form request-target серверный reverse-listener сначала делает до двух проходов URL decode, затем явно разделяет `path` и `query` по первому реальному `?` и только после этого формирует canonical `PathAndQuery` для туннеля;
 - текущая реализация рассчитана на один активный reverse-proxy клиент на сервер.
 
 #### Windows: system-wide tunnel через Wintun
