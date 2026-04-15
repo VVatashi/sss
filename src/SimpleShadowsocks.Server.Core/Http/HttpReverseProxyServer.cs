@@ -115,7 +115,10 @@ public sealed class HttpReverseProxyServer
                 return;
             }
 
-            StructuredLog.Info("http-reverse-proxy", "HTTP", $"{request.Method} {request.PathAndQuery}");
+            StructuredLog.Info(
+                "http-reverse-proxy",
+                "HTTP",
+                $"{request.Method} rawTarget={request.RawTarget} decodedTarget={request.DecodedTarget} parsedPathAndQuery={request.PathAndQuery} hostHeader={request.HostHeader ?? "<none>"} scheme={request.Scheme} authority={request.Authority}");
             if (request.IsConnect || string.Equals(request.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
             {
                 await WriteSimpleResponseAsync(stream, 501, "Not Implemented", closeConnection: true, cancellationToken);
@@ -388,9 +391,12 @@ public sealed class HttpReverseProxyServer
     {
         private ParsedHttpRequest(
             string method,
+            string rawTarget,
+            string decodedTarget,
             string scheme,
             string authority,
             string pathAndQuery,
+            string? hostHeader,
             Version version,
             IReadOnlyList<HttpHeader> headers,
             IReadOnlyList<HttpHeader> sanitizedHeaders,
@@ -400,9 +406,12 @@ public sealed class HttpReverseProxyServer
             bool isWebSocketUpgrade)
         {
             Method = method;
+            RawTarget = rawTarget;
+            DecodedTarget = decodedTarget;
             Scheme = scheme;
             Authority = authority;
             PathAndQuery = pathAndQuery;
+            HostHeader = hostHeader;
             Version = version;
             Headers = headers;
             SanitizedHeaders = sanitizedHeaders;
@@ -413,9 +422,12 @@ public sealed class HttpReverseProxyServer
         }
 
         public string Method { get; }
+        public string RawTarget { get; }
+        public string DecodedTarget { get; }
         public string Scheme { get; }
         public string Authority { get; }
         public string PathAndQuery { get; }
+        public string? HostHeader { get; }
         public Version Version { get; }
         public IReadOnlyList<HttpHeader> Headers { get; }
         public IReadOnlyList<HttpHeader> SanitizedHeaders { get; }
@@ -462,6 +474,7 @@ public sealed class HttpReverseProxyServer
 
             var method = requestLine[0].Trim();
             var targetText = requestLine[1].Trim();
+            var normalizedTargetText = DecodeRequestTarget(targetText);
             var isConnect = method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase);
             if (!requestLine[2].StartsWith("HTTP/", StringComparison.OrdinalIgnoreCase))
             {
@@ -475,7 +488,7 @@ public sealed class HttpReverseProxyServer
             string scheme;
             string authority;
             string pathAndQuery;
-            if (Uri.TryCreate(targetText, UriKind.Absolute, out var absoluteUri))
+            if (Uri.TryCreate(normalizedTargetText, UriKind.Absolute, out var absoluteUri))
             {
                 scheme = absoluteUri.Scheme;
                 authority = absoluteUri.Authority;
@@ -490,7 +503,7 @@ public sealed class HttpReverseProxyServer
 
                 scheme = Uri.UriSchemeHttp;
                 authority = host;
-                pathAndQuery = string.IsNullOrWhiteSpace(targetText) ? "/" : targetText;
+                pathAndQuery = string.IsNullOrWhiteSpace(normalizedTargetText) ? "/" : normalizedTargetText;
             }
 
             var sanitizedHeaders = SanitizeHeaders(headers, authority);
@@ -505,9 +518,12 @@ public sealed class HttpReverseProxyServer
             var body = await ReadBodyAsync(reader, headers, cancellationToken);
             return new ParsedHttpRequest(
                 method,
+                targetText,
+                normalizedTargetText,
                 scheme,
                 authority,
                 pathAndQuery,
+                host,
                 version,
                 headers,
                 sanitizedHeaders,
@@ -515,6 +531,37 @@ public sealed class HttpReverseProxyServer
                 DetermineKeepAlive(version, headers),
                 isConnect,
                 isWebSocketUpgrade);
+        }
+
+        private static string DecodeRequestTarget(string targetText)
+        {
+            if (string.IsNullOrWhiteSpace(targetText) || targetText.IndexOf('%') < 0)
+            {
+                return targetText;
+            }
+
+            var decodedTarget = targetText;
+            for (var pass = 0; pass < 2; pass++)
+            {
+                string nextTarget;
+                try
+                {
+                    nextTarget = Uri.UnescapeDataString(decodedTarget);
+                }
+                catch (UriFormatException)
+                {
+                    break;
+                }
+
+                if (string.Equals(nextTarget, decodedTarget, StringComparison.Ordinal))
+                {
+                    break;
+                }
+
+                decodedTarget = nextTarget;
+            }
+
+            return decodedTarget;
         }
 
         private static bool IsWebSocketUpgradeRequest(IReadOnlyList<HttpHeader> headers)

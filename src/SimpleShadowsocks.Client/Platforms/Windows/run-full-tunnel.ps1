@@ -235,8 +235,7 @@ function Get-PreferredDefaultRoute {
 
 function Resolve-UpstreamAddresses {
     param(
-        [Parameter(Mandatory)]
-        [string[]]$Hosts
+        [string[]]$Hosts = @()
     )
 
     $resolved = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -263,7 +262,12 @@ function Resolve-UpstreamAddresses {
         }
     }
 
-    return @($resolved)
+    $addresses = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($address in $resolved) {
+        $addresses.Add($address) | Out-Null
+    }
+
+    return ,$addresses.ToArray()
 }
 
 function Wait-TunnelInterface {
